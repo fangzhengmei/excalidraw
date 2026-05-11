@@ -1068,6 +1068,615 @@ Step 4: 判定可见变化跳过（P6）
 
 ---
 
+## 组合冲突反例库（8 个多条件同时命中场景）
+
+### 说明
+
+以下场景展示**多条规则同时命中**时的判定过程，重点关注：
+- 命中链路：哪些规则被触发
+- 被淘汰规则：哪些规则因优先级被压制
+- 最终裁决：实际生效的结果
+
+---
+
+### 组合冲突 1：远程删除 + 同属性冲突
+
+**场景描述：**
+- 本地：创建矩形 → 设置 `backgroundColor=red`
+- 远程：删除矩形，同时设置 `backgroundColor=yellow`
+- undoStack: [创建, 改颜色]
+
+**命中规则：** P1（远程删除跳过）+ P3（同属性冲突覆盖）
+
+**逐步判定：**
+
+```
+历史记录（改颜色）= { updated: { rect: { backgroundColor: red → transparent } } }
+
+Step 1: 判定远程删除（P1，最高优先级）
+  → rect.isDeleted = true
+  → 历史记录不恢复 rect (partial.isDeleted = undefined ≠ false)
+  → checkForVisibleDifference = false（跳过可见变更）
+  → [被命中] P1 生效
+
+Step 2: 判定属性类别（P3）
+  → backgroundColor 是普通属性
+  → 历史记录包含该属性
+  → 应用 deleted 值: transparent
+  → 远程的 yellow 被覆盖
+  → [被命中] P3 生效
+  → [被淘汰] 但 P1 决定了整体可见性
+
+Step 3: 判定关系后处理
+  → 无绑定关系
+  → 继续
+
+Step 4: 判定可见变化跳过（P6）
+  → containsVisibleDifference = false（由 P1 决定）
+  → 继续撤销下一条
+
+Step 5: 弹出下一条历史记录（创建矩形）
+  → H = { added: { rect: { isDeleted: false } } }
+
+Step 1: 判定远程删除（P1）
+  → rect.isDeleted = true
+  → 历史记录要删除 rect (partial.isDeleted = true)
+  → 已删除元素再删除？
+  → 实际：containsVisibleDifference = true（删除已删除元素也算可见变化）
+  → 停止
+
+最终裁决：
+  → rect.isDeleted = true（保持删除，P1 主导）
+  → rect.backgroundColor = transparent（P3 生效，属性被修改）
+  → undoStack 从 2 → 0（P1 导致跳过了改颜色，直接处理创建）
+
+被淘汰规则：
+  → P3 虽命中并修改了属性，但 P1 决定了整体无可见变化（第一轮）
+```
+
+**测试用例佐证：** `history.test.tsx:2584-2636`
+
+---
+
+### 组合冲突 2：Frame 删除 + 绑定恢复
+
+**场景描述：**
+- 本地：矩形在 Frame 内 → 移出 Frame → 删除矩形
+- 远程：删除 Frame
+- undoStack: [创建Frame+矩形, 放入Frame, 移出Frame, 删除矩形]
+- 当前：rect.isDeleted=true, frame.isDeleted=true
+
+**命中规则：** P1（远程删除跳过）+ P4（绑定关系保留）+ P5（Frame 从属判定）
+
+**逐步判定：**
+
+```
+用户执行重做两次（恢复矩形 + 放入 Frame）
+
+Step 0: 弹出历史记录（删除矩形 → 恢复矩形）
+  → H = { added: { rect: { isDeleted: false, frameId: null } } }
+
+Step 1: 判定远程删除（P1）
+  → rect.isDeleted = true
+  → 历史记录恢复 rect (partial.isDeleted = false)
+  → 正常恢复，继续
+
+Step 2: 判定属性类别
+  → frameId 是普通属性
+  → 历史记录包含 frameId: null
+  → 应用后 frameId = null
+
+Step 3: 判定关系后处理（P5）
+  → Frame.isDeleted = true（被远程删除）
+  → 不重新绑定（即使有 frameId）
+  → rect.frameId 保持 null
+  → [被淘汰] P4（绑定恢复）因 P1（Frame 删除）被压制
+
+Step 4: 判定可见变化跳过
+  → 元素恢复，可见
+  → 停止
+
+Step 5: 弹出下一条历史记录（移出 Frame → 放入 Frame）
+  → H = { updated: { rect: { frameId: null → frame.id } } }
+
+Step 3: 判定关系后处理（P5）
+  → Frame.isDeleted = true
+  → 不重新绑定
+  → rect.frameId = null（即使历史记录有 frame.id）
+
+最终裁决：
+  → rect.isDeleted = false（恢复）
+  → rect.frameId = null（不绑定到已删除的 Frame）
+  → [被淘汰] P4/P5 的绑定恢复因 P1（Frame 删除）被压制
+```
+
+**测试用例佐证：** `history.test.tsx:5221-5304`
+
+---
+
+### 组合冲突 3：数组覆盖 + AppState 过滤
+
+**场景描述：**
+- 本地：创建两个矩形 → 加入分组 A → 选中分组
+- 远程：加入分组 B → 删除两个矩形
+- undoStack: [创建, 分组A, 选中分组]
+- 当前：rect.groupIds=["A", "B"], rect.isDeleted=true, selectedElementIds={rect1, rect2}
+
+**命中规则：** P1（远程删除跳过）+ P2（数组属性覆盖）+ P6（AppState 过滤）
+
+**逐步判定：**
+
+```
+Step 0: 弹出历史记录（选中分组）
+  → H = { appState: { selectedElementIds: {rect1, rect2} → {} } }
+
+Step 1: 判定远程删除（P1）
+  → 不涉及元素变化
+  → 继续
+
+Step 2: 判定属性类别
+  → 无元素属性
+  → 继续
+
+Step 3: 判定关系后处理
+  → 无绑定关系
+  → 继续
+
+Step 4: 判定可见变化跳过（P6）
+  → filterSelectedElements 过滤
+  → rect1.isDeleted = true → 过滤
+  → rect2.isDeleted = true → 过滤
+  → containsVisibleDifference = false
+  → 继续撤销下一条
+  → [被命中] P6 生效
+
+Step 5: 弹出下一条历史记录（分组A）
+  → H = { updated: { rect1: { groupIds: ["A"] → [] },
+                     rect2: { groupIds: ["A"] → [] } } }
+
+Step 1: 判定远程删除（P1）
+  → rect1.isDeleted = true, rect2.isDeleted = true
+  → 历史记录不恢复元素 (partial.isDeleted = undefined ≠ false)
+  → checkForVisibleDifference = false（跳过可见变更）
+  → [被命中] P1 生效
+
+Step 2: 判定属性类别（P2）
+  → groupIds 是数组属性
+  → 直接用历史值覆盖当前值
+  → ["A", "B"] → []
+  → [被命中] P2 生效
+  → [被淘汰] 但 P1 决定了整体可见性
+
+Step 4: 判定可见变化跳过（P6）
+  → containsVisibleDifference = false（由 P1 决定）
+  → 继续撤销下一条
+
+最终裁决：
+  → rect.isDeleted = true（保持删除，P1 主导）
+  → rect.groupIds = []（P2 生效，远程的 B 被覆盖）
+  → selectedElementIds = {}（P6 导致跳过选中分组状态）
+  → undoStack 从 3 → 0（跳过了选中分组和分组A，直接处理创建）
+
+被淘汰规则：
+  → P2 虽命中并覆盖了 groupIds，但 P1 决定了整体无可见变化
+  → P6 导致 AppState 状态被跳过
+```
+
+**测试用例佐证：** 可组合 `history.test.tsx:2638-2713` 和 `history.test.tsx:2371-2423`
+
+---
+
+### 组合冲突 4：绑定恢复 + 同属性冲突
+
+**场景描述：**
+- 本地：创建容器 → 绑定文本 A
+- 远程：绑定文本 A → 解绑文本 A → 绑定新文本 B
+- undoStack: [创建容器, 绑定A]
+- 用户 A 撤销两次（容器删除 + 文本解绑）
+- 远程：绑定文本 B 到容器，恢复容器
+- redoStack: [删除容器, 解绑A]
+- 用户 A 重做
+
+**命中规则：** P3（同属性冲突）+ P4（绑定关系保留）
+
+**逐步判定：**
+
+```
+Step 0: 弹出历史记录（删除容器 → 恢复容器）
+  → H = { added: { container: { isDeleted: false,
+                                 boundElements: [文本A] } } }
+
+Step 1: 判定远程删除
+  → container.isDeleted = false（已被远程恢复）
+  → 继续
+
+Step 2: 判定属性类别（P3）
+  → boundElements: 不更新 inserted 端，保留历史值 [文本A]
+  → 当前 boundElements = [文本B]
+
+Step 3: 判定关系后处理（P4）
+  → added 元素触发 rebindAffected
+  → mergeArrays 合并 boundElements
+  → 历史记录: [文本A]
+  → 当前值: [文本B]
+  → mergeArrays 结果: [文本A, 文本B] 去重排序
+  → 实际测试: [文本A]（历史记录恢复）
+  → [被命中] P4 生效
+  → [被淘汰] P3（不更新 inserted）被 P4（后处理合并）覆盖
+
+Step 3 子步骤：文本容器双向绑定
+  → container.boundElements = [文本A]
+  → 文本 A.containerId = container.id（恢复）
+  → 文本 B.containerId = null（被解绑）
+  → [被淘汰] P3（同属性冲突：远程的文本 B 绑定）被 P4 压制
+
+最终裁决：
+  → container 恢复
+  → 文本 A 的绑定恢复（P4 优先）
+  → 文本 B 的绑定被覆盖（P3 被淘汰）
+
+被淘汰规则：
+  → P3（同属性冲突：文本 B 的绑定）被 P4（后处理双向绑定恢复）压制
+```
+
+**测试用例佐证：** `history.test.tsx:3673-3773`（容器绑定冲突）、`history.test.tsx:3776-3882`（文本容器冲突）
+
+---
+
+### 组合冲突 5：远程删除 + 绑定关系
+
+**场景描述：**
+- 本地：创建容器
+- 远程：绑定文本 A 到容器 → 删除文本 A
+- undoStack: [创建容器]
+- 用户 A 撤销（容器删除）
+- 远程：删除文本 A（同时保持容器绑定）
+- redoStack: [删除容器]
+- 用户 A 重做
+
+**命中规则：** P1（远程删除跳过）+ P4（绑定关系保留）
+
+**逐步判定：**
+
+```
+Step 0: 弹出历史记录（删除容器 → 恢复容器）
+  → H = { added: { container: { isDeleted: false,
+                                 boundElements: [文本A] } } }
+
+Step 1: 判定远程删除（P1）
+  → 文本 A.isDeleted = true（被远程删除）
+  → 容器.isDeleted = false（已被远程恢复）
+  → 继续
+
+Step 2: 判定属性类别
+  → boundElements = [文本A]
+
+Step 3: 判定关系后处理（P4）
+  → added 元素触发 rebindAffected
+  → 文本 A.isDeleted = true
+  → 检查：非删除元素才能重新绑定
+  → 文本 A 不绑定到容器
+  → [被命中] P1 生效（元素被删除）
+  → [被淘汰] P4（绑定恢复）因 P1（文本删除）被压制
+
+Step 3 子步骤：resolveConflicts 后处理
+  → container.boundElements 应该更新
+  → 实际测试: container.boundElements = []
+  → [被淘汰] P4 的绑定恢复被 P1 压制
+
+最终裁决：
+  → container 恢复
+  → container.boundElements = []（文本 A 已删除，不绑定）
+  → 文本 A.containerId = null（保持解绑）
+
+被淘汰规则：
+  → P4（绑定恢复）因 P1（文本被远程删除）被压制
+```
+
+**测试用例佐证：** `history.test.tsx:4217-4272`（删除绑定文本）、`history.test.tsx:4274-4329`（删除容器）
+
+---
+
+### 组合冲突 6：数组覆盖 + 绑定恢复
+
+**场景描述：**
+- 本地：创建两个矩形 → 加入分组 A → 绑定箭头到两个矩形
+- 远程：加入分组 B → 移动目标矩形
+- undoStack: [创建, 分组A, 绑定箭头]
+- 当前：rect.groupIds=["A", "B"], rect2.x=500
+
+**命中规则：** P2（数组属性覆盖）+ P4（绑定关系保留）
+
+**逐步判定：**
+
+```
+用户执行撤销分组 A
+
+Step 0: 弹出历史记录（分组A）
+  → H = { updated: { rect1: { groupIds: ["A"] → [] },
+                     rect2: { groupIds: ["A"] → [] } } }
+
+Step 1: 判定远程删除
+  → rect1.isDeleted = false, rect2.isDeleted = false
+  → 继续
+
+Step 2: 判定属性类别（P2）
+  → groupIds 是数组属性
+  → 直接用历史值覆盖当前值
+  → ["A", "B"] → []
+  → 远程的 B 被覆盖
+  → [被命中] P2 生效
+
+Step 3: 判定关系后处理（P4）
+  → updated 元素检查是否有绑定属性变化
+  → groupIds 不是绑定属性
+  → 不触发 rebindAffected
+  → 箭头绑定不受影响
+  → [被命中] P4 生效（绑定保留）
+
+最终裁决：
+  → rect.groupIds = []（P2 覆盖远程的 B）
+  → 箭头绑定保持不变（P4 保留）
+
+被淘汰规则：
+  → 无冲突，P2 和 P4 各自生效
+```
+
+**测试用例佐证：** 可组合 `history.test.tsx:2371-2423`（groupIds 覆盖）和 `history.test.tsx:5106-5195`（箭头绑定）
+
+---
+
+### 组合冲突 7：AppState 过滤 + 绑定恢复
+
+**场景描述：**
+- 本地：创建容器 → 绑定文本 → 选中容器
+- 远程：删除容器（文本随之被远程删除？）
+- undoStack: [创建容器, 绑定文本, 选中容器]
+- 当前：container.isDeleted=true, text.isDeleted=true, selectedElementIds={container}
+
+**命中规则：** P1（远程删除跳过）+ P4（绑定关系保留）+ P6（AppState 过滤）
+
+**逐步判定：**
+
+```
+用户执行撤销选中容器
+
+Step 0: 弹出历史记录（选中容器）
+  → H = { appState: { selectedElementIds: {container} → {} } }
+
+Step 1: 判定远程删除（P1）
+  → 不涉及元素变化
+  → 继续
+
+Step 2: 判定属性类别
+  → 无元素属性
+  → 继续
+
+Step 3: 判定关系后处理
+  → 无绑定关系变化
+  → 继续
+
+Step 4: 判定可见变化跳过（P6）
+  → filterSelectedElements 过滤
+  → container.isDeleted = true → 过滤
+  → containsVisibleDifference = false
+  → 继续撤销下一条
+  → [被命中] P6 生效
+
+Step 5: 弹出下一条历史记录（绑定文本）
+  → H = { updated: { container: { boundElements: [文本] },
+                     text: { containerId: container.id } } }
+
+Step 1: 判定远程删除（P1）
+  → container.isDeleted = true
+  → text.isDeleted = true
+  → 历史记录不恢复元素 (partial.isDeleted = undefined)
+  → checkForVisibleDifference = false
+  → [被命中] P1 生效
+
+Step 2: 判定属性类别（P4）
+  → boundElements: 保留历史值
+  → 但元素已删除
+  → [被淘汰] P4（绑定恢复）因 P1 被压制
+
+Step 4: 判定可见变化跳过（P6）
+  → containsVisibleDifference = false（由 P1 决定）
+  → 继续撤销下一条
+
+最终裁决：
+  → 撤销了创建容器（container.isDeleted = true 保持不变？）
+  → 实际：继续直到找到可见变化
+  → [被淘汰] P4（绑定恢复）和 P6 都被 P1 压制
+
+被淘汰规则：
+  → P6（AppState 过滤）被 P1 主导
+  → P4（绑定恢复）因 P1（元素删除）被压制
+```
+
+**测试用例佐证：** 可组合 `history.test.tsx:2715-2803`（AppState 过滤）和 `history.test.tsx:4217-4272`（删除绑定文本）
+
+---
+
+### 组合冲突 8：远程恢复 + 数组覆盖 + 绑定关系
+
+**场景描述：**
+- 本地：创建矩形 → 删除矩形
+- 远程：恢复矩形 → 加入分组 B → 绑定箭头
+- undoStack: [创建矩形, 删除矩形]
+- redoStack: [删除矩形]
+- 当前：rect.isDeleted=false, rect.groupIds=["B"], arrow.boundElements=[rect]
+
+**命中规则：** P1（远程恢复，特殊情况）+ P2（数组属性覆盖）+ P4（绑定关系保留）
+
+**逐步判定：**
+
+```
+用户执行撤销删除矩形（即恢复矩形）
+
+Step 0: 弹出历史记录（删除矩形 → 恢复矩形）
+  → H = { removed: { rect: { isDeleted: true } } }
+
+Step 1: 判定远程删除（P1 反向）
+  → rect.isDeleted = false（已被远程恢复）
+  → 历史记录要恢复 rect (partial.isDeleted = false)
+  → 当前值已恢复
+  → 检查：isDeleted 相同 → Delta 重新分发
+  → removed → updated
+  → [特殊情况] P1 反向（远程恢复）
+
+Step 2: 判定属性类别（P2）
+  → 历史记录中没有 groupIds
+  → 远程的 ["B"] 保留
+  → [被命中] P2 不生效（历史记录不包含该属性）
+
+Step 3: 判定关系后处理（P4）
+  → added 元素（实际现在是 updated）触发 rebindAffected
+  → 检查是否有绑定属性变化
+  → 历史记录中没有绑定属性变化
+  → 不触发
+  → 箭头绑定保持不变
+  → [被命中] P4 生效（绑定保留）
+
+最终裁决：
+  → rect.isDeleted = false（保持恢复）
+  → rect.groupIds = ["B"]（远程分组保留，P2 不生效）
+  → 箭头绑定保持不变（P4 保留）
+
+被淘汰规则：
+  → P2（数组覆盖）因历史记录不包含该属性被淘汰
+```
+
+**测试用例佐证：** `history.test.tsx:2506-2582`（元素删除后被远程恢复）
+
+---
+
+### 组合冲突裁决总表
+
+| 组合冲突 | 命中规则 | 被淘汰规则 | 最终裁决 | 测试用例 |
+|---------|---------|-----------|---------|---------|
+| **1. 远程删除 + 同属性冲突** | P1 + P3 | P3（可见性被压制） | 元素保持删除，属性被修改 | `history.test.tsx:2584` |
+| **2. Frame 删除 + 绑定恢复** | P1 + P5 | P4/P5（绑定被压制） | 元素恢复但不绑定 Frame | `history.test.tsx:5221` |
+| **3. 数组覆盖 + AppState 过滤** | P1 + P2 + P6 | P2（可见性被压制） | 元素保持删除，groupIds 被修改 | 组合测试 |
+| **4. 绑定恢复 + 同属性冲突** | P4 | P3（同属性冲突被压制） | 历史绑定恢复，远程绑定被覆盖 | `history.test.tsx:3673` |
+| **5. 远程删除 + 绑定关系** | P1 | P4（绑定被压制） | 元素恢复但不绑定删除的文本 | `history.test.tsx:4217` |
+| **6. 数组覆盖 + 绑定恢复** | P2 + P4 | 无冲突 | groupIds 被覆盖，绑定保留 | 组合测试 |
+| **7. AppState 过滤 + 绑定恢复** | P1 + P6 | P4/P6（都被压制） | 继续下探直到可见变化 | 组合测试 |
+| **8. 远程恢复 + 数组覆盖 + 绑定** | P4 | P2（不生效） | 远程分组和绑定都保留 | `history.test.tsx:2506` |
+
+---
+
+## 判定终止条件与最小证据集
+
+### 判定终止条件
+
+根据 `history.ts:178-218`，撤销/重做的判定在以下任一条件满足时终止：
+
+```
+终止条件 1: containsVisibleChange = true（命中规则 P1/P2/P3/P4/P5）
+  ↓
+  原因：产生了用户可见的变化
+  ↓
+  判定：充分，可以停止
+
+终止条件 2: 历史栈为空（undoStack 或 redoStack 为空）
+  ↓
+  原因：没有更多历史记录可撤销/重做
+  ↓
+  判定：充分，停止
+```
+
+### containsVisibleChange 的判定逻辑
+
+根据 `delta.ts:1711-1732` 和 `delta.ts:770-837`：
+
+```
+Elements 可见性判定：
+  ├── 元素从删除 → 恢复 → true
+  ├── 元素从存在 → 删除 → true
+  ├── 元素已删除且不恢复 → false（跳过）
+  └── 可见元素的任何属性变化 → true
+
+AppState 可见性判定：
+  ├── 独立状态变化 → true
+  └── 元素引用变化：
+      ├── 至少一个引用元素存在 → true
+      └── 所有引用元素被删除 → false（跳过）
+```
+
+### 最小证据集
+
+在以下情况可以**停止继续下探**并认为结论充分：
+
+| 证据类型 | 最小证据集 | 判定依据 |
+|---------|-----------|---------|
+| **元素级可见变化** | 至少一个元素从删除→恢复，或存在→删除 | `delta.ts:1711-1732` |
+| **属性级可见变化** | 至少一个可见元素的任意属性变化 | `delta.ts:1731` |
+| **AppState 可见变化** | 独立状态变化，或至少一个引用元素存在 | `delta.ts:770-837` |
+| **历史栈耗尽** | undoStack 或 redoStack 为空 | `history.ts:164-168` |
+
+### 不需要继续下探的场景
+
+| 场景 | 终止条件 | 最小证据集 |
+|-----|---------|-----------|
+| 本地修改可见元素的属性 | containsVisibleChange = true | 属性级可见变化 |
+| 本地创建/删除元素 | containsVisibleChange = true | 元素级可见变化 |
+| 选中元素全部存在 | containsVisibleChange = true | AppState 可见变化 |
+| undoStack 为空 | 历史栈耗尽 | 无历史记录 |
+
+### 需要继续下探的场景
+
+| 场景 | 继续下探原因 | 终止条件 |
+|-----|-------------|---------|
+| 选中元素被远程删除 | containsVisibleChange = false | 找到存在元素的选中状态 |
+| 分组元素被远程删除 | containsVisibleChange = false | 找到存在元素的分组选择 |
+| 编辑组元素被远程删除 | containsVisibleChange = false | 找到存在元素的编辑组 |
+| 元素被远程删除 | containsVisibleChange = false | 找到可见变化或栈空 |
+
+### 下探深度限制
+
+代码中没有显式的下探深度限制，但有安全机制：
+
+```
+根据 `delta.ts:1437-1440`，异常情况时默认返回 containsVisibleChange = true：
+
+// should not really happen, but just in case we cannot apply deltas, let's return the previous elements with visible change set to `true`
+// even though there is obviously no visible change, returning `false` could be dangerous, as i.e.:
+// in the worst case, it could lead into iterating through the whole stack with no possibility to redo
+// instead, the worst case when returning `true` is an empty undo / redo
+```
+
+**实际行为：**
+- 正常情况：持续下探直到 `containsVisibleChange = true` 或栈空
+- 异常情况：强制返回 `true`，避免无限循环
+
+### 结论充分性判定
+
+给定一个协作撤销场景，判定结论充分的条件：
+
+```
+结论充分 = （存在可见变化证据）OR（历史栈耗尽）
+
+可见变化证据 = 
+  （元素从删除→恢复）OR
+  （元素从存在→删除）OR
+  （可见元素属性变化）OR
+  （AppState 独立状态变化）OR
+  （至少一个 AppState 引用元素存在）
+```
+
+### 典型充分/不充分判定
+
+| 场景 | 证据 | 结论充分？ |
+|-----|------|-----------|
+| 修改可见元素颜色 | 可见元素属性变化 | ✅ 充分 |
+| 选中元素全部被删除 | 无可见变化 | ❌ 不充分，继续下探 |
+| 恢复已删除元素 | 元素从删除→恢复 | ✅ 充分 |
+| 元素被删除且属性被修改 | 属性变化但元素不可见 | ❌ 不充分，继续下探 |
+| 远程恢复元素且改属性 | 元素从删除→恢复（即使已恢复） | ✅ 充分（Delta 重新分发后可能有变化） |
+| undoStack 为空 | 历史栈耗尽 | ✅ 充分 |
+
+---
+
 ## 常见误判清单
 
 ### ❌ 误判 1：远程修改都会保留
