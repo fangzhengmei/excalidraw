@@ -215,13 +215,15 @@ Excalidraw 的多人协作同步采用了 **三层架构** 设计，通过三条
 #### 4.2.2 消息广播与接收
 1. **发送消息** (`excalidraw-app/collab/Portal.tsx:85-102`)
    - `_broadcastSocketData(data, volatile, roomId?)`
-   - 两种发送模式：
-     - **可靠消息** (`volatile: false`)：`server-broadcast` 事件
+   - 两种发送模式的送达语义区别：
+     - **普通消息** (`volatile: false`)：`server-broadcast` 事件
        - 用于：`SCENE_INIT`、`SCENE_UPDATE`
-       - Socket.IO 保证送达和顺序
+       - Socket.IO 会在**连接保持期间**尝试重传和确认，但若用户断开连接后重连，之前未送达的消息会丢失
+       - **不是绝对保证送达**：在网络抖动、服务器重启等极端情况下仍可能丢包
      - **易失消息** (`volatile: true`)：`server-volatile-broadcast` 事件
        - 用于：`MOUSE_LOCATION`、`IDLE_STATUS`、`USER_VISIBLE_SCENE_BOUNDS`
-       - 不保证送达，但延迟更低
+       - 完全不保证送达：发送即"fire-and-forget"，如果接收方暂时不可达则直接丢弃
+       - 延迟更低，适合高频、可丢失的感知数据
 
 2. **接收消息** (`excalidraw-app/collab/Collab.tsx:568-677`)
    - 统一监听 `client-broadcast` 事件
@@ -303,12 +305,12 @@ Excalidraw 的多人协作同步采用了 **三层架构** 设计，通过三条
 
 ### 5.2 数据流总结
 
-| 链路 | 触发源 | 传输类型 | 加密 | 保证送达 | 频率 |
-|------|--------|----------|------|----------|------|
-| 文档状态同步 | `onChange` 回调 | `SCENE_UPDATE` / `SCENE_INIT` | AES-GCM | ✅ 可靠 | 实时 + 20s全量 |
-| 光标位置 | `onPointerUpdate` 回调 | `MOUSE_LOCATION` | AES-GCM | ❌ 易失 | ~30fps (节流33ms) |
-| 用户状态 | 指针移动/页面可见性 | `IDLE_STATUS` | AES-GCM | ❌ 易失 | 状态变化时 |
-| 视口边界 | 滚动/缩放变化 | `USER_VISIBLE_SCENE_BOUNDS` | AES-GCM | ❌ 易失 | 视口变化时 |
+| 链路 | 触发源 | 传输类型 | 加密 | 送达语义 | 频率 | 一致性回补 |
+|------|--------|----------|------|----------|------|-----------|
+| 文档状态同步 | `onChange` 回调 | `SCENE_UPDATE` / `SCENE_INIT` | AES-128-GCM | 普通传输（连接保持期内重传） | 实时 + 20s全量 | 全量同步 + Firebase持久化 |
+| 光标位置 | `onPointerUpdate` 回调 | `MOUSE_LOCATION` | AES-128-GCM | 易失传输（fire-and-forget） | ~30fps (节流33ms) | 后续更新自然覆盖 |
+| 用户状态 | 指针移动/页面可见性 | `IDLE_STATUS` | AES-128-GCM | 易失传输 | 状态变化时 | 心跳定时刷新 |
+| 视口边界 | 滚动/缩放变化 | `USER_VISIBLE_SCENE_BOUNDS` | AES-128-GCM | 易失传输 | 视口变化时 | 跟随者主动请求 |
 
 ### 5.3 关键衔接点
 
@@ -327,8 +329,13 @@ Excalidraw 的多人协作同步采用了 **三层架构** 设计，通过三条
    - 服务器无法看到明文内容
 
 4. **消息分类策略**
-   - 状态修改（元素）：可靠传输，保证一致性
+   - 状态修改（元素）：普通传输，连接保持期间有重传确认
    - 感知数据（光标、状态）：易失传输，追求低延迟
+
+5. **一致性保障机制**
+   - 由于 WebSocket 广播不是绝对保证送达，系统通过两层回补机制维持最终一致性：
+   - **定时全量同步**：每 20 秒 `SYNC_FULL_SCENE_INTERVAL_MS` 广播一次完整场景，覆盖可能丢失的增量更新
+   - **Firebase 持久化**：断网重连或新用户加入时，优先从 Firebase 加载完整场景数据
 
 ## 6. 关键文件索引
 
