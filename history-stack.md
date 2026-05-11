@@ -529,6 +529,545 @@ return ElementsDelta.create(added, removed, updated, {
 
 ---
 
+## 按事件顺序的判定流程
+
+### 代码执行顺序
+
+根据 `history.ts:24-45` 和 `delta.ts:1412-1452`，撤销/重做的执行顺序为：
+
+```
+HistoryDelta.applyTo(elements, appState, snapshot)
+    ↓
+1. ElementsDelta.applyTo()  ← 先处理元素
+    ├── createApplier() → 获取元素
+    ├── added 元素         ← 先恢复新增的元素
+    ├── removed 元素       ← 再删除已删除的元素
+    ├── updated 元素       ← 最后修改其他元素
+    │   └── 对每个元素：
+    │       ├── applyDelta() → 应用属性变化
+    │       │   ├── 直接属性（跳过 boundElements, version）
+    │       │   ├── mergeArrays(boundElements) → 合并绑定
+    │       │   └── checkForVisibleDifference → 判断可见性
+    │       └── 包含 groupIds/points 直接替换
+    │
+    ├── resolveConflicts() ← 后处理绑定关系
+    │   ├── unbindAffected(removed)   → 被删除元素解绑
+    │   ├── rebindAffected(added)     → 恢复元素重新绑定
+    │   └── rebindAffected(updated)   → 修改元素重新绑定（含绑定属性）
+    │
+    ├── reorderElements()  ← z-index 排序
+    └── redrawElements()   ← 重新绘制（文本框、箭头等）
+    ↓
+2. AppStateDelta.applyTo()  ← 后处理 AppState
+    ├── 独立状态直接恢复
+    ├── 元素引用过滤（selectedElementIds 等）
+    └── containsVisibleDifference 累计
+    ↓
+3. containsVisibleChange = elements || appState
+    └── false → 继续找下一条历史记录
+```
+
+### 分步判定流程
+
+```
+给定：用户 A 执行撤销，当前历史记录 = H
+
+┌─────────────────────────────────────────────────────────────────┐
+│ Step 1: 判定远程删除（最高优先级）                               │
+│                                                                  │
+│ 对 H 中涉及的每个元素 E：                                         │
+│   ├── E 被远程删除 (isDeleted=true)                              │
+│   │   └── 且 H 不恢复 E (partial.isDeleted ≠ false)              │
+│   │       └── → 跳过可见变更，属性变化仍应用                      │
+│   │                                                                  │
+│   └── E 被远程删除                                               │
+│       └── 且 H 恢复 E (partial.isDeleted = false)                │
+│           └── → 正常恢复，继续后续判定                            │
+└─────────────────────────────────────────────────────────────────┘
+                                ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ Step 2: 判定属性类别（普通属性 vs 数组属性）                      │
+│                                                                  │
+│ 对 H 中涉及的每个属性 P：                                         │
+│   ├── P 是普通标量属性                                           │
+│   │   ├── 历史记录包含 P → 应用 deleted 值（可能覆盖远程）       │
+│   │   └── 历史记录不包含 P → 远程修改保留                         │
+│   │                                                                  │
+│   ├── P = boundElements                                          │
+│   │   └── 不更新 inserted 端，保留历史值                          │
+│   │                                                                  │
+│   └── P 是数组属性 (groupIds, points)                            │
+│       └── 直接用历史值覆盖当前值（远程修改丢失，重做时恢复）       │
+└─────────────────────────────────────────────────────────────────┘
+                                ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ Step 3: 判定关系后处理（绑定关系、Frame）                        │
+│                                                                  │
+│ resolveConflicts 阶段：                                          │
+│   ├── removed 元素 → unbindAffected → 关联元素解绑               │
+│   ├── added 元素 → rebindAffected → 恢复绑定                     │
+│   │   └── 远程新增的绑定优先，旧绑定可能被覆盖                    │
+│   │                                                                  │
+│   └── updated 元素（含绑定属性）→ rebindAffected                  │
+│       └── 文本重新绑定，箭头 TODO 未处理                           │
+│                                                                  │
+│ Frame 从属：                                                      │
+│   ├── Frame 存在且未删除 → frameId 正常恢复                       │
+│   └── Frame 被远程删除 → 子元素恢复时 frameId = null              │
+└─────────────────────────────────────────────────────────────────┘
+                                ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ Step 4: 判定可见变化跳过                                         │
+│                                                                  │
+│ containsVisibleDifference 判断：                                 │
+│   ├── 元素从删除 → 恢复 → true                                   │
+│   ├── 元素从存在 → 删除 → true                                   │
+│   ├── 元素已删除且不恢复 → false（跳过）                         │
+│   ├── AppState 元素引用全部指向已删除元素 → false（跳过）         │
+│   └── 其他属性变化 → true                                        │
+│                                                                  │
+│ false → 继续撤销下一条历史记录                                    │
+│ true → 停止，返回结果                                             │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 规则冲突优先级表
+
+### 优先级说明
+
+当同一轮撤销中多条规则同时命中时，按以下优先级判定：
+
+| 优先级 | 规则类型 | 描述 | 覆盖范围 | 典型冲突场景 |
+|-------|---------|------|---------|-------------|
+| **P1（最高）** | 远程删除跳过 | `element.isDeleted=true` 且不恢复 | 所有元素级操作 | 元素被删除后，任何属性变化都不产生可见变化 |
+| **P2** | 数组属性覆盖 | `groupIds`, `points` 直接替换 | 有序数组属性 | 本地分组 `["A"]`，远程加 `["B"]` → 撤销后 `[]` |
+| **P3** | 普通属性判定 | 按属性独立处理 | 所有标量属性 | 同属性冲突 → 覆盖；不同属性 → 保留 |
+| **P4** | 绑定关系保留 | `boundElements` 不更新，后处理合并 | 容器↔文本绑定 | 远程新绑定优先，旧绑定不恢复 |
+| **P5** | Frame 从属判定 | Frame 存在则绑定，否则跳过 | `frameId` | Frame 删除后，子元素不重新绑定 |
+| **P6（最低）** | AppState 过滤 | 元素引用过滤 | `selectedElementIds` 等 | 选中元素被删除 → 跳过该状态 |
+
+### 优先级图示
+
+```
+P1: 远程删除跳过 (最高)
+  ↓ 覆盖
+P2: 数组属性覆盖 (groupIds, points)
+  ↓ 覆盖
+P3: 普通属性判定 (按属性独立)
+  ↓ 覆盖
+P4: 绑定关系保留 (boundElements 不更新)
+  ↓ 覆盖
+P5: Frame 从属判定
+  ↓ 覆盖
+P6: AppState 元素引用过滤 (最低)
+```
+
+### 典型冲突场景解析
+
+#### 冲突场景 1：P1 vs P3（远程删除 vs 属性修改）
+
+```
+元素 X 被远程删除 (isDeleted=true)
+同时用户 A 的历史记录包含 X.backgroundColor 的修改
+
+Step 1 (P1): 元素已删除且不恢复
+  → checkForVisibleDifference = false（跳过可见变更）
+  → 但 backgroundColor 从 yellow → transparent 仍应用
+
+Step 3 (P3): 历史记录包含 backgroundColor
+  → 应该覆盖远程修改
+
+结果：属性值被修改，但元素保持删除 → 协作者看不到变化（已删除）
+```
+
+**代码依据：** `delta.ts:1715-1717`
+
+```typescript
+if (element.isDeleted && partial.isDeleted !== false) {
+  return false;  // 跳过可见变更
+}
+```
+
+#### 冲突场景 2：P2 vs P3（数组属性 vs 普通属性）
+
+```
+元素 X:
+  - 本地历史记录: groupIds=["A"], backgroundColor=red
+  - 远程修改: groupIds=["A", "B"], backgroundColor=yellow
+
+Step 2 (P2): groupIds 是数组属性
+  → 直接用历史值覆盖 → groupIds=[]（远程的 B 丢失）
+
+Step 3 (P3): backgroundColor 是普通属性
+  → 历史记录包含 → 应用 deleted 值 → transparent（覆盖远程的 yellow）
+
+结果：groupIds 和 backgroundColor 都被覆盖
+```
+
+**代码依据：** `delta.ts:1340-1341`
+
+```typescript
+for (const key of Object.keys(partial)) {
+  default:
+    latestPartial[key] = element[key];  // 直接替换
+}
+```
+
+#### 冲突场景 3：P4 vs P3（绑定关系 vs 普通属性）
+
+```
+容器 C:
+  - 本地历史记录: boundElements=[文本A], backgroundColor=red
+  - 远程修改: boundElements=[文本A, 文本B], backgroundColor=yellow
+
+Step 2 (P3 用于 backgroundColor):
+  → 历史记录包含 → 恢复为 transparent（覆盖远程的 yellow）
+
+Step 2 (P4 用于 boundElements):
+  → 不更新 inserted 端，保留历史值 [文本A]
+
+Step 3 (后处理 mergeArrays):
+  → 合并 boundElements → [文本A, 文本B]（远程的文本B 保留）
+
+结果：backgroundColor 被覆盖，boundElements 保留远程新增
+```
+
+**代码依据：** `delta.ts:1337-1339`
+
+```typescript
+case "boundElements":
+  latestPartial[key] = partial[key];  // 不更新，保留历史值
+  break;
+```
+
+`delta.ts:1677-1686`
+
+```typescript
+const mergedBoundElements = Delta.mergeArrays(
+  element.boundElements,
+  delta.inserted.boundElements,
+  delta.deleted.boundElements,
+  (x) => x.id,
+);
+```
+
+#### 冲突场景 4：P5 vs P2（Frame 从属 vs groupIds）
+
+```
+元素 X 在 Frame F 内：
+  - 本地历史记录: frameId=F.id, groupIds=["A"]
+  - 远程修改: frameId=null (Frame 被删除), groupIds=["A", "B"]
+
+Step 2 (P2): groupIds 直接覆盖 → []
+
+Step 3 (P5): Frame 被远程删除
+  → frameId 恢复但 Frame 不存在
+  → 后处理？（实际测试显示不重新绑定）
+
+结果：groupIds 被覆盖，frameId 可能恢复但 Frame 已删除
+```
+
+**测试用例：** `history.test.tsx:5221-5304`
+
+---
+
+## 6 个典型输入场景的逐步判定演示
+
+### 场景 1：同元素不同属性（保留远程）
+
+**输入：**
+- 本地操作：创建矩形 → 设置 `backgroundColor=red`
+- 远程操作：设置同一矩形 `strokeColor=yellow`
+- undoStack: [创建, 改颜色]
+- 当前选中状态：无
+
+**逐步判定：**
+
+```
+Step 0: 弹出历史记录（改颜色）
+  → H = { updated: { rect: { backgroundColor: red → transparent } } }
+
+Step 1: 判定远程删除（P1）
+  → rect.isDeleted = false
+  → 继续
+
+Step 2: 判定属性类别（P2/P3）
+  → backgroundColor 是普通属性
+  → 历史记录包含该属性
+  → 应用 deleted 值: transparent
+  → strokeColor 不在历史记录中
+  → 远程修改保留: yellow
+
+Step 3: 判定关系后处理（P4/P5）
+  → 无绑定关系，无 Frame
+  → 继续
+
+Step 4: 判定可见变化跳过（P6）
+  → 可见元素属性变化
+  → containsVisibleDifference = true
+  → 停止
+
+最终结果：
+  - backgroundColor = transparent（本地撤销生效）
+  - strokeColor = yellow（远程修改保留）
+  → 判定：保留远程（不同属性）
+```
+
+**测试用例佐证：** `history.test.tsx:2169-2203`
+
+---
+
+### 场景 2：同元素同一属性（覆盖远程）
+
+**输入：**
+- 本地操作：创建矩形 → 设置 `backgroundColor=red`
+- 远程操作：设置同一矩形 `backgroundColor=yellow`
+- undoStack: [创建, 改颜色]
+
+**逐步判定：**
+
+```
+Step 0: 弹出历史记录（改颜色）
+  → H = { updated: { rect: { backgroundColor: red → transparent } } }
+
+Step 1: 判定远程删除（P1）
+  → rect.isDeleted = false
+  → 继续
+
+Step 2: 判定属性类别（P2/P3）
+  → backgroundColor 是普通属性
+  → 历史记录包含该属性
+  → 应用 deleted 值: transparent
+  → 远程的 yellow 被覆盖
+
+Step 3: 判定关系后处理（P4/P5）
+  → 无绑定关系
+  → 继续
+
+Step 4: 判定可见变化跳过（P6）
+  → 可见元素属性变化
+  → containsVisibleDifference = true
+  → 停止
+
+最终结果：
+  - backgroundColor = transparent（覆盖远程的 yellow）
+  → 判定：覆盖远程（同属性冲突）
+```
+
+**测试用例佐证：** `history.test.tsx:2205-2367`
+
+---
+
+### 场景 3：groupIds 覆盖
+
+**输入：**
+- 本地操作：创建两个矩形 → 加入分组 A
+- 远程操作：加入分组 B
+- undoStack: [创建, 分组A]
+- 当前：rect.groupIds = ["A", "B"]
+
+**逐步判定：**
+
+```
+Step 0: 弹出历史记录（分组A）
+  → H = { updated: { rect1: { groupIds: ["A"] → [] },
+                     rect2: { groupIds: ["A"] → [] } } }
+
+Step 1: 判定远程删除（P1）
+  → rect1.isDeleted = false, rect2.isDeleted = false
+  → 继续
+
+Step 2: 判定属性类别（P2/P3）
+  → groupIds 是数组属性（P2 优先级高于 P3）
+  → 直接用历史值覆盖当前值
+  → 当前 ["A", "B"] → []（远程的 B 被覆盖）
+
+Step 3: 判定关系后处理（P4/P5）
+  → 无绑定关系
+  → 继续
+
+Step 4: 判定可见变化跳过（P6）
+  → 可见元素属性变化
+  → containsVisibleDifference = true
+  → 停止
+
+最终结果：
+  - groupIds = []（远程的 B 被覆盖）
+  → 判定：覆盖远程（数组属性）
+```
+
+**测试用例佐证：** `history.test.tsx:2371-2423`
+
+---
+
+### 场景 4：绑定关系保留
+
+**输入：**
+- 本地操作：创建容器
+- 远程操作：绑定文本 A 到容器
+- undoStack: [创建容器]
+- 用户 A 撤销（容器删除）
+- 远程操作：绑定新文本 B 到容器，恢复容器
+- redoStack: [删除容器]
+- 用户 A 重做
+
+**逐步判定：**
+
+```
+Step 0: 弹出历史记录（删除容器 → 即恢复容器）
+  → H = { added: { container: { isDeleted: false,
+                                 boundElements: [文本A] } } }
+
+Step 1: 判定远程删除（P1）
+  → container.isDeleted = false（已被远程恢复）
+  → 继续
+
+Step 2: 判定属性类别（P2/P3）
+  → boundElements: 不更新 inserted 端，保留历史值 [文本A]
+  → 当前 boundElements = [文本B]
+
+Step 3: 判定关系后处理（P4/P5）
+  → added 元素触发 rebindAffected
+  → mergeArrays 合并 boundElements
+  → [文本A] + [文本B] = [文本B]（最新绑定优先）
+  → 文本 A 不重新绑定
+
+Step 4: 判定可见变化跳过（P6）
+  → 元素从删除 → 恢复
+  → containsVisibleDifference = true
+  → 停止
+
+最终结果：
+  - container 恢复
+  - 文本 B 的绑定保留（远程新增的）
+  - 文本 A 不重新绑定
+  → 判定：保留远程（绑定关系）
+```
+
+**测试用例佐证：** `history.test.tsx:4005-4109`
+
+---
+
+### 场景 5：远程删除元素跳过
+
+**输入：**
+- 本地操作：创建矩形 → 设置 `backgroundColor=red`
+- 远程操作：删除矩形，同时设置 `backgroundColor=yellow`
+- undoStack: [创建, 改颜色]
+- 当前：rect.isDeleted = true, backgroundColor = yellow
+
+**逐步判定：**
+
+```
+Step 0: 弹出历史记录（改颜色）
+  → H = { updated: { rect: { backgroundColor: red → transparent } } }
+
+Step 1: 判定远程删除（P1，最高优先级）
+  → rect.isDeleted = true
+  → H 不恢复 rect (partial.isDeleted = undefined ≠ false)
+  → checkForVisibleDifference = false（跳过可见变更）
+  → 但 backgroundColor 仍从 yellow → transparent 应用
+
+Step 2: 判定属性类别（P2/P3）
+  → backgroundColor 是普通属性
+  → 历史记录包含
+  → 应用 deleted 值: transparent
+
+Step 3: 判定关系后处理（P4/P5）
+  → 无绑定关系
+  → 继续
+
+Step 4: 判定可见变化跳过（P6）
+  → containsVisibleDifference = false（P1 决定）
+  → 继续撤销下一条历史记录
+
+Step 5: 弹出下一条历史记录（创建矩形 → 即删除矩形）
+  → H = { added: { rect: { isDeleted: false } } }
+
+Step 1: 判定远程删除（P1）
+  → rect.isDeleted = true
+  → H 要删除 rect (partial.isDeleted = true)
+  → 已删除元素再删除？
+  → 实际测试：继续找可见变化...
+
+最终结果（按一次 Ctrl+Z 后）：
+  - rect.isDeleted = true（保持删除）
+  - rect.backgroundColor = transparent（被修改）
+  - undoStack 从 2 → 0（跳过了改颜色）
+  → 判定：跳过（远程删除）
+```
+
+**测试用例佐证：** `history.test.tsx:2584-2636`
+
+---
+
+### 场景 6：选中元素被远程删除（跳过 AppState）
+
+**输入：**
+- 本地操作：创建 rect1 → 创建 rect2 → 创建 rect3 → 选中 rect1 → 选中 [rect2, rect3]
+- 远程操作：删除 rect2, rect3
+- undoStack: [创建3个, 选中rect1, 选中rect2/rect3]
+- 当前选中：rect2, rect3
+
+**逐步判定：**
+
+```
+Step 0: 弹出历史记录（选中 rect2/rect3）
+  → H = { appState: { selectedElementIds: {rect2, rect3} → {rect1} } }
+
+Step 1: 判定远程删除（P1）
+  → 不涉及元素变化
+  → 继续
+
+Step 2: 判定属性类别（P2/P3）
+  → 不涉及元素属性
+  → 继续
+
+Step 3: 判定关系后处理（P4/P5）
+  → 无绑定关系
+  → 继续
+
+Step 4: 判定可见变化跳过（P6）
+  → filterSelectedElements 过滤
+  → rect2.isDeleted = true → 过滤
+  → rect3.isDeleted = true → 过滤
+  → 剩下空的选中状态
+  → containsVisibleDifference = false
+  → 继续撤销下一条
+
+Step 5: 弹出历史记录（选中 rect1）
+  → H = { appState: { selectedElementIds: {rect1} → {} } }
+
+Step 4: 判定可见变化跳过（P6）
+  → rect1.isDeleted = false
+  → containsVisibleDifference = true
+  → 停止
+
+最终结果（按一次 Ctrl+Z 后）：
+  - 选中状态：rect1
+  - undoStack 从 3 → 1（跳过了 2 条）
+  → 判定：跳过（AppState 元素引用）
+```
+
+**测试用例佐证：** `history.test.tsx:2715-2803`
+
+---
+
+## 6 个场景汇总表
+
+| 场景 | 本地操作 | 远程操作 | Step 1 远程删除 | Step 2 属性类别 | Step 3 关系后处理 | Step 4 可见跳过 | 最终判定 |
+|-----|---------|---------|---------------|----------------|-----------------|----------------|---------|
+| **场景 1** | 改 `backgroundColor` | 改 `strokeColor` | 否 | 普通属性，历史包含 | 无 | 否 | ✅ 保留远程 |
+| **场景 2** | 改 `backgroundColor` | 改同一属性 | 否 | 普通属性，历史包含 | 无 | 否 | ❌ 覆盖远程 |
+| **场景 3** | 加 `groupIds=["A"]` | 加 `groupIds=["B"]` | 否 | 数组属性，直接覆盖 | 无 | 否 | ❌ 覆盖远程 |
+| **场景 4** | 创建容器 | 绑定新文本 B | 否 | boundElements 不更新 | mergeArrays 保留 B | 否 | ✅ 保留远程 |
+| **场景 5** | 改颜色 | 删除元素 | **是** → 跳过 | 普通属性（仍应用） | 无 | **是** → 继续 | ⏭️ 跳过 |
+| **场景 6** | 选中 rect2/rect3 | 删除 rect2/rect3 | 否 | 无 | 无 | **是** → 继续 | ⏭️ 跳过 |
+
+---
+
 ## 常见误判清单
 
 ### ❌ 误判 1：远程修改都会保留
