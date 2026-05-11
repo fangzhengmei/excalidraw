@@ -33,29 +33,62 @@ Excalidraw 的导出系统是一个精心设计的模块化架构，支持 PNG�
         └─────────────┬─────────────┘
                       ▼
               ┌───────────────────┐
-              │  元素形状缓存    │
+              │  元素形状生成    │
               │  ShapeCache       │
               └───────────────────┘
 ```
 
-### 1.2 核心复用策略
+### 1.2 形状缓存的实际行为
 
-**ShapeCache 形状缓存**
-- 元素形状计算结果被缓存，避免在 Canvas 和 SVG 渲染时重复计算
-- 缓存 key 基于元素属性和渲染配置（包括主题）生成
-- 同一元素在不同导出格式中共享相同的形状数据
+**ShapeCache 核心机制（shape.ts:81-164）**
 
 ```typescript
-// 在 Canvas 和 SVG 渲染中复用相同的形状生成逻辑
-const shape = ShapeCache.generateElementShape(element, renderConfig);
+public static generateElementShape = (element, renderConfig) => {
+  // ⚠️ 导出时总是重新生成，绕过缓存读取
+  const cachedShape = renderConfig?.isExporting
+    ? undefined
+    : ShapeCache.get(element, renderConfig?.theme || null);
+
+  if (cachedShape !== undefined) {
+    return cachedShape;
+  }
+
+  const shape = _generateElementShape(element, ...);
+
+  // ⚠️ 导出时不写入缓存
+  if (!renderConfig?.isExporting) {
+    ShapeCache.cache.set(element, { shape, theme: renderConfig?.theme });
+  }
+
+  return shape;
+};
 ```
 
+**导出阶段缓存行为分析**
+
+| 场景 | 缓存读取 | 缓存写入 | 行为模式 |
+|-----|---------|---------|---------|
+| 编辑器渲染 (isExporting=false) | ✅ 优先读取缓存 | ✅ 生成后写入 | 正常缓存复用 |
+| PNG 导出 (isExporting=true) | ❌ 强制绕过 | ❌ 不写入缓存 | 每次完整重算 |
+| SVG 导出 (isExporting=true) | ❌ 强制绕过 | ❌ 不写入缓存 | 每次完整重算 |
+
+**重算触发原因（代码注释）**
+
+> "when exporting, always regenerated to guarantee the latest shape"
+
+设计意图：
+1. 规避编辑器交互过程中可能出现的缓存与实际状态不一致问题
+2. 确保导出结果反映元素的最新属性（位置、颜色、样式等）
+3. 导出通常是低频操作，性能开销可接受
+
 **渲染配置标准化**
+
 - `StaticCanvasRenderConfig` 和 `SVGRenderConfig` 共享相同的主题配置接口
 - 两种渲染器使用相同的 `THEME` 枚举和 `applyDarkModeFilter` 函数
 - 坐标变换逻辑（平移、旋转、缩放）在两个渲染器中保持一致
 
 **字体处理统一**
+
 - 导出前统一通过 `Fonts.loadElementsFonts()` 加载字体
 - SVG 导出通过 `Fonts.generateFontFaceDeclarations()` 内联字体声明
 - Canvas 渲染依赖浏览器字体加载完成后的测量结果
@@ -286,7 +319,9 @@ exportToBlob()
     │    └─> renderStaticScene()
     │         ├─> 渲染背景
     │         ├─> 应用暗色主题滤镜 (如需要)
-    │         └─> 遍历渲染每个元素
+    │         ├─> ⚠️ 遍历元素，每个元素完整重算形状
+    │         │    (isExporting=true 绕过 ShapeCache)
+    │         └─> 绘制元素
     └─> canvas.toBlob()
          └─> (可选) 嵌入场景数据到 PNG metadata
     ↓
@@ -314,6 +349,8 @@ exportToSvg()
     ├─> 渲染背景（应用反色如需要）
     └─> renderSceneToSvg()
          └─> 遍历调用 renderElementToSvg()
+              ├─> ⚠️ 每个元素完整重算形状
+              │    (isExporting=true 绕过 ShapeCache)
               ├─> 对每个颜色应用 applyDarkModeFilter
               ├─> 使用 Rough.js 绘制手绘风格
               └─> 处理框架裁剪、链接、图片嵌入
@@ -330,7 +367,7 @@ copyTextToSystemClipboard(svg.outerHTML)
 | 决策点 | 选择方案 | 权衡考量 |
 |-------|---------|---------|
 | 反色算法 | invert(93%) + hue-rotate(180°) | 视觉舒适度 vs 精确反转 |
-| 渲染复用 | ShapeCache + 统一渲染配置 | 代码复用 vs 格式特化需求 |
+| **形状缓存** | **导出时强制绕过，编辑器内正常复用** | **导出结果准确性 vs 导出性能** |
 | 剪贴板策略 | 三级 Fallback 机制 | 兼容性 vs 功能完整性 |
 | 颜色缓存 | Map<string, string> 浏览器端缓存 | 性能 vs 内存占用 |
 | 主题切换 | 渲染时动态反色 | 实现简单 vs 导出性能 |
@@ -338,10 +375,11 @@ copyTextToSystemClipboard(svg.outerHTML)
 ## 6. 性能优化要点
 
 1. **颜色缓存**：避免重复计算相同颜色的暗色模式值
-2. **形状缓存**：相同元素在不同导出格式间复用形状数据
-3. **图片去重**：SVG 导出中使用 `<symbol>` 复用相同图片
-4. **字体预加载**：导出前确保所有字体加载完成
-5. **边界计算优化**：一次性计算所有元素的公共边界
+2. **编辑器内形状缓存**：交互渲染时复用 ShapeCache，提升流畅度
+3. **导出时重算保证准确性**：虽牺牲性能，但确保导出结果与编辑器一致
+4. **图片去重**：SVG 导出中使用 `<symbol>` 复用相同图片
+5. **字体预加载**：导出前确保所有字体加载完成
+6. **边界计算优化**：一次性计算所有元素的公共边界
 
 ---
 
@@ -355,3 +393,4 @@ copyTextToSystemClipboard(svg.outerHTML)
 | 剪贴板处理 | `packages/excalidraw/clipboard.ts` |
 | 导出工具函数 | `packages/utils/src/export.ts` |
 | 颜色反色算法 | `packages/common/src/colors.ts` |
+| 形状缓存实现 | `packages/element/src/shape.ts` |
