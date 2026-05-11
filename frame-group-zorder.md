@@ -215,6 +215,231 @@ export const getElementsInGroup = (
 - 组内只要有一个元素在 Frame 内，整个组都可能被剪裁
 - 拖拽组时，所有成员的 Frame 归属会统一更新
 
+### 2.5 解组联动链路
+
+解组操作由 `actionUngroup` 触发（`packages/excalidraw/actions/actionGroup.tsx:214-320`），是一个涉及 groupIds 更新、绑定文本处理、Frame 内成员重排和选区变化的复杂联动过程。
+
+#### 2.5.1 解组触发入口
+
+```typescript
+export const actionUngroup = register({
+  name: "ungroup",
+  label: "labels.ungroup",
+  keyTest: (event) =>
+    event.shiftKey &&
+    event[KEYS.CTRL_OR_CMD] &&
+    event.key === KEYS.G.toUpperCase(),
+  predicate: (elements, appState) => getSelectedGroupIds(appState).length > 0,
+  // ...
+});
+```
+
+**触发条件**：
+- 键盘快捷键：Ctrl+Shift+G (Cmd+Shift+G on Mac)
+- 右键菜单或工具栏按钮
+- 前提：至少有一个选中的组（`getSelectedGroupIds(appState).length > 0`）
+
+#### 2.5.2 解组时序与核心函数作用
+
+```typescript
+perform: (elements, appState, _, app) => {
+  // 步骤1：获取当前选中的组ID
+  const groupIds = getSelectedGroupIds(appState);
+  const elementsMap = arrayToMap(elements);
+
+  if (groupIds.length === 0) {
+    return { appState, elements, captureUpdate: ... };
+  }
+
+  let nextElements = [...elements];
+  const boundTextElementIds: ExcalidrawTextElement["id"][] = [];
+
+  // 步骤2：遍历所有元素，更新 groupIds 并收集绑定文本
+  nextElements = nextElements.map((element) => {
+    // 2a: 收集绑定文本元素ID（后续要从选区中移除）
+    if (isBoundToContainer(element)) {
+      boundTextElementIds.push(element.id);
+    }
+    
+    // 2b: 从元素的 groupIds 中移除所有选中的组ID
+    const nextGroupIds = removeFromSelectedGroups(
+      element.groupIds,
+      appState.selectedGroupIds,
+    );
+    
+    if (nextGroupIds.length === element.groupIds.length) {
+      return element; // 组ID未变化，无需更新
+    }
+    return newElementWith(element, { groupIds: nextGroupIds });
+  });
+
+  // 步骤3：重新计算选区状态
+  const updateAppState = selectGroupsForSelectedElements(
+    appState,
+    getNonDeletedElements(nextElements),
+    appState,
+    null,
+  );
+
+  // 步骤4：获取选中元素所属的 Frame
+  const selectedElements = app.scene.getSelectedElements(appState);
+  const selectedElementFrameIds = new Set(
+    selectedElements
+      .filter((element) => element.frameId)
+      .map((element) => element.frameId!),
+  );
+
+  const targetFrames = getFrameLikeElements(elements).filter((frame) =>
+    selectedElementFrameIds.has(frame.id),
+  );
+
+  // 步骤5：对每个涉及的 Frame 重新排列内部元素
+  targetFrames.forEach((frame) => {
+    if (frame) {
+      nextElements = replaceAllElementsInFrame(
+        nextElements,
+        getElementsInResizingFrame(
+          nextElements,
+          frame,
+          appState,
+          elementsMap,
+        ),
+        frame,
+      );
+    }
+  });
+
+  // 步骤6：从选区中移除绑定文本元素（避免单独选中文本）
+  updateAppState.selectedElementIds = Object.entries(
+    updateAppState.selectedElementIds,
+  ).reduce(
+    (acc: { [key: ExcalidrawElement["id"]]: true }, [id, selected]) => {
+      if (selected && !boundTextElementIds.includes(id)) {
+        acc[id] = true;
+      }
+      return acc;
+    },
+    {},
+  );
+
+  return {
+    appState: { ...appState, ...updateAppState },
+    elements: nextElements,
+    captureUpdate: CaptureUpdateAction.IMMEDIATELY,
+  };
+};
+```
+
+**各核心函数的详细作用**：
+
+1. **`removeFromSelectedGroups`**（`groups.ts:319-322`）
+   ```typescript
+   export const removeFromSelectedGroups = (
+     groupIds: ExcalidrawElement["groupIds"],
+     selectedGroupIds: { [groupId: string]: boolean },
+   ) => groupIds.filter((groupId) => !selectedGroupIds[groupId]);
+   ```
+   - 作用：从元素的 `groupIds` 数组中过滤掉所有选中的组ID
+   - 支持嵌套组解组：只移除选中层级，保留其他层级
+   - 返回新的 `groupIds` 数组（空数组表示完全脱离组）
+
+2. **`boundTextElementIds` 收集与过滤**
+   - 用途：绑定文本元素应始终跟随其宿主元素，不允许单独选中
+   - 解组时先收集所有绑定文本ID，最后从选区中剔除
+   - 确保解组后只有图形元素被选中，绑定文本保持从属状态
+
+3. **`selectGroupsForSelectedElements`**（`groups.ts:65-198`）
+   - 解组后重新计算选区状态
+   - 如果剩余的 `groupIds` 仍形成有效组（元素数 ≥ 2），则保持该组选中
+   - 如果元素不再属于任何有效组，则只保留元素个体选中状态
+   - 更新 `selectedGroupIds` 和 `selectedElementIds`，确保状态一致性
+
+4. **`getElementsInResizingFrame`**（`frame.ts:278-370`）
+   - 获取 Frame 内当前所有有效成员元素
+   - 考虑组的整体归属：组内元素部分在 Frame 内时的边界判定
+   - 支持锁定元素过滤（锁定元素即使在 Frame 内也可能被排除）
+
+5. **`replaceAllElementsInFrame`**（`frame.ts:671-690`）
+   ```typescript
+   export const replaceAllElementsInFrame = <T extends ExcalidrawElement>(
+     allElements: readonly T[],
+     nextElementsInFrame: ExcalidrawElement[],
+     frame: ExcalidrawFrameLikeElement,
+   ): T[] => {
+     return addElementsToFrame(
+       removeAllElementsFromFrame(allElements, frame),
+       nextElementsInFrame,
+       frame,
+     ).slice();
+   };
+   ```
+   - 工作原理：先清空 Frame 所有成员，再重新添加
+   - 触发 `addElementsToFrame` 中的 z-index 重排序逻辑
+   - 将解组后的独立元素按正确顺序放置到 Frame 层级之下
+
+#### 2.5.3 解组与锁定过滤的联动
+
+锁定状态在解组过程中的影响节点：
+
+1. **`getElementsInResizingFrame` 阶段**
+   - 锁定元素（`element.locked === true`）在判定 Frame 成员时会被特殊处理
+   - 如果组内包含锁定元素，且该元素部分在 Frame 外，可能导致整组被排除
+   - 解锁状态下，组采用"整体包含"判定；锁定状态下可能采用"个体判定"
+
+2. **`replaceAllElementsInFrame` 阶段**
+   - 锁定元素的 `frameId` 不会被修改（除非整组被强制移出）
+   - 解组后锁定元素保留在原 Frame 层级，不会参与重新排序
+   - 这是为了防止意外修改锁定元素的层级关系
+
+3. **z-index 重排阶段**
+   - 解组调用 `addElementsToFrame` 时，会通过 `syncMovedIndices` 同步 fractional index
+   - 锁定元素的 index 不会被更新，保持原有层级
+   - 非锁定元素按几何位置重新分配 index，可能导致与锁定元素的层级交叉
+
+#### 2.5.4 解组对 z-index 结果的影响
+
+解组操作对元素叠层顺序的影响路径：
+
+**路径1：Frame 内解组 → 局部重排**
+```
+解组触发
+  → 收集选中组的所有元素
+  → removeFromSelectedGroups 清除 groupIds
+  → getElementsInResizingFrame 确定 Frame 内成员
+  → replaceAllElementsInFrame 触发 addElementsToFrame
+    → getFrameChildrenInsertionIndex 计算插入位置（Frame 之后或最高子元素之后）
+    → syncMovedIndices 同步 fractional index
+  → 结果：Frame 内元素保持在 Frame 层级下，相对顺序可能调整
+```
+
+**路径2：跨 Frame 解组 → 全局重排**
+```
+选中跨 Frame 的组（部分在 Frame 内，部分在外）
+  → 解组后元素变为独立
+  → 原组内绑定关系解除
+  → 每个元素独立判定 Frame 归属（基于几何重叠）
+  → 在各自 Frame 内（或根层级）重新计算 z-index
+  → 结果：可能打破原组的整体层级，元素按个体位置分层
+```
+
+**关键 z-index 行为**：
+- 解组前：组内元素作为整体移动，保持相对顺序
+- 解组后：元素可独立移动，相对顺序可被打破
+- Frame 约束从"组级"降为"元素级"，每个元素单独判定是否在 Frame 内
+- 绑定文本虽然从选区中移除，但其 z-index 仍跟随宿主元素保持一致
+
+#### 2.5.5 解组后的选区变化
+
+解组前后的选区状态转换：
+
+| 解组前状态 | 解组后状态 | 变化说明 |
+|-----------|-----------|---------|
+| 选中单个组 | 选中组内所有元素（非绑定文本） | 绑定文本ID从 `selectedElementIds` 中剔除 |
+| 选中嵌套组（外层） | 选中外层所有成员，内层组关系保留 | 只移除选中的外层 groupId，嵌套组内部保持 |
+| 选中多个组 | 所有组解组，所有元素独立选中 | 元素间的所有组绑定全部解除 |
+| 混合选中（组+独立元素） | 组解组，所有元素保持选中 | 独立元素不受影响 |
+| 包含锁定元素的组 | 锁定元素仍被选中，但不可编辑 | 锁定状态不影响选区，只影响后续操作 |
+
 ## 3. 锁定元素事件穿透机制
 
 ### 3.1 锁定状态过滤
