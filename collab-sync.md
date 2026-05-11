@@ -141,10 +141,10 @@ Excalidraw 的多人协作同步采用了 **三层架构** 设计，通过三条
    - `onPointerMove`: 清除空闲超时，设置活跃定时器
    - `onVisibilityChange`: 页面隐藏时标记为 AWAY，显示时恢复
 
-2. **状态定义** (`packages/common/src/constants.ts`)
-   - `ACTIVE`: 用户活跃（最近 60 秒内有操作）
-   - `IDLE`: 用户空闲（60-300 秒无操作）
-   - `AWAY`: 用户离开（页面不可见）
+2. **状态定义** (`packages/common/src/constants.ts:495-499, 307-310`)
+   - `ACTIVE`: 用户活跃（指针移动后每 3 秒 `ACTIVE_THRESHOLD` 报告一次）
+   - `IDLE`: 用户空闲（60 秒 `IDLE_THRESHOLD` 无操作后报告为空闲）
+   - `AWAY`: 用户离开（页面不可见时立即报告）
 
 3. **广播** (`excalidraw-app/collab/Collab.tsx:940-942`)
    - `onIdleStateChange(userState)` 调用 `portal.broadcastIdleChange(userState)`
@@ -183,9 +183,11 @@ Excalidraw 的多人协作同步采用了 **三层架构** 设计，通过三条
 1. **创建/加入房间** (`excalidraw-app/collab/Collab.tsx:471-506`)
    - `startCollaboration(existingRoomLinkData)`：
      - 已有链接：从 URL hash 解析 `roomId` 和 `roomKey`
-     - 新房间：调用 `generateCollaborationLinkData()` 生成随机的 `roomId`（10字节）和 `roomKey`（22字节，AES-256密钥）
+     - 新房间：调用 `generateCollaborationLinkData()` 生成随机的 `roomId`（10字节）和 `roomKey`（22字符的 Base64URL 编码字符串，对应 `ENCRYPTION_KEY_BITS = 128` 位的 AES-128-GCM 密钥）
    - 新房间会 `pushState` 更新 URL，链接格式：`#room={roomId},{roomKey}`
    - **端到端加密**：`roomKey` 只存在于 URL hash 中，不会发送到服务器
+
+> **参数说明**：加密强度（128位）和空闲阈值（60秒）的选择直接影响协作体验。128位密钥在安全与性能间取得平衡，加密/解密操作不会成为实时同步的瓶颈；60秒空闲阈值既能及时反映用户活跃度变化，又避免了过于频繁的状态切换带来的网络开销和渲染闪烁。
 
 2. **建立 Socket 连接** (`excalidraw-app/collab/Collab.tsx:508-536`)
    - 动态导入 `socket.io-client`
