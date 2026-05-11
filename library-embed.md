@@ -76,15 +76,17 @@ export const validateLibraryUrl = (
 };
 ```
 
-#### 2.2 跨实例安全校验
+#### 2.2 跨实例弹窗门控机制（非认证）
 
 ```typescript
-// library.ts:725-779
+// library.ts:741-779
 const importLibraryFromURL = async ({ libraryUrl, idToken }) => {
-  // 跨实例时需要用户确认
+  // 🎯 门控逻辑：idToken 仅用于判断是否需要弹窗确认
+  // idToken !== excalidrawAPI.id 表示从其他 Excalidraw 实例跳转而来
+  // 此机制仅用于触发用户确认弹窗，**不做任何认证或签名校验**
   const shouldPrompt = idToken !== excalidrawAPI.id;
-  
-  // 等待窗口聚焦后再提示用户
+
+  // 等待窗口聚焦后再弹窗，避免后台静默弹窗被拦截
   await (shouldPrompt && document.hidden
     ? new Promise<void>((resolve) => {
         window.addEventListener("focus", () => resolve(), { once: true });
@@ -93,13 +95,39 @@ const importLibraryFromURL = async ({ libraryUrl, idToken }) => {
 
   await excalidrawAPI.updateLibrary({
     libraryItems: libraryPromise,
-    prompt: shouldPrompt,  // 用户确认开关
+    prompt: shouldPrompt,  // 传递给 updateLibrary 决定是否弹窗
     merge: true,
     defaultStatus: "published",
     openLibraryMenu: true,
   });
 };
 ```
+
+**弹窗确认实现**：
+```typescript
+// library.ts:321-343
+if (
+  !prompt ||
+  window.confirm(
+    t("alerts.confirmAddLibrary", {
+      numShapes: nextItems.length,  // 显示将要导入的素材数量
+    }),
+  )
+) {
+  if (prompt) {
+    this.app.focusContainer();
+  }
+  if (merge) {
+    resolve(mergeLibraryItems(this.currLibraryItems, nextItems));
+  } else {
+    resolve(nextItems);
+  }
+} else {
+  reject(new AbortError());  // 用户点击取消：静默终止
+}
+```
+
+> **重要澄清**：`idToken` 仅作为"是否需要弹窗"的布尔开关，**不具备任何认证功能**，也不用于签名校验。这是纯 UX 门控，防止跨站链接静默注入素材库。
 
 ---
 
@@ -350,7 +378,78 @@ export const embeddableURLValidator = (url, validateEmbeddable) => {
 
 ---
 
-### 3. 拉取与 URL 规范化
+### 3. 两类嵌入错误的触发路径
+
+#### 3.1 `unableToEmbed` - 白名单校验失败
+
+**触发场景**：URL 不在支持的域名白名单内
+
+```typescript
+// Hyperlink.tsx:122-130
+if (!embeddableURLValidator(link, appProps.validateEmbeddable)) {
+  if (link) {
+    // ✅ 白名单校验失败：提示用户请求加入白名单
+    // 文案："Embedding this url is currently not allowed. Raise an issue on GitHub..."
+    setToast({ message: t("toast.unableToEmbed"), closable: true });
+  }
+  element.link && embeddableLinkCache.set(element.id, element.link);
+  scene.mutateElement(element, { link });
+  updateEmbedValidationStatus(element, false);  // 标记校验失败
+}
+```
+
+#### 3.2 `unrecognizedLinkFormat` - URL 格式解析失败
+
+**触发场景**：URL 在白名单内，但平台特定格式解析失败（如无效的 Vimeo 视频 ID）
+
+```typescript
+// Hyperlink.tsx:131-139
+else {
+  const { width, height } = element;
+  const embedLink = getEmbedLink(link);
+  
+  // ✅ 白名单校验通过，但平台特定解析失败
+  // 目前仅 Vimeo 会抛出 URIError，检查 video ID 是否合法数字
+  if (embedLink?.error instanceof URIError) {
+    // 文案："Unrecognized link format"
+    setToast({
+      message: t("toast.unrecognizedLinkFormat"),
+      closable: true,
+    });
+  }
+  // ... 继续设置尺寸
+}
+```
+
+**Vimeo 解析失败代码**：
+```typescript
+// embeddable.ts:225-249
+const vimeoLink = link.match(RE_VIMEO);
+if (vimeoLink?.[1]) {
+  const target = vimeoLink?.[1];
+  // 🎯 仅当 target 不是纯数字时抛出 URIError（触发 unrecognizedLinkFormat）
+  const error = !/^\d+$/.test(target)
+    ? new URIError("Invalid embed link format")
+    : undefined;
+  type = "video";
+  link = `https://player.vimeo.com/video/${target}?api=1`;
+  aspectRatio = { w: 560, h: 315 };
+  return { link, intrinsicSize: aspectRatio, type, error, sandbox: { allowSameOrigin } };
+}
+```
+
+---
+
+### 两类错误触发路径对比
+
+| 错误类型 | 触发条件 | 校验阶段 | 用户引导 |
+|---------|---------|---------|---------|
+| **unableToEmbed** | URL 不在白名单域名 | `embeddableURLValidator` | 请求在 GitHub 提 issue 加入白名单 |
+| **unrecognizedLinkFormat** | URL 在白名单内，但平台特定格式解析失败 | `getEmbedLink()` 解析阶段 | 提示链接格式不正确（仅 Vimeo 可能触发） |
+
+---
+
+### 4. 拉取与 URL 规范化
 
 ```typescript
 // embeddable.ts:171-400
@@ -386,7 +485,7 @@ export const getEmbedLink = (link: string): IframeDataWithSandbox | null => {
 
 ---
 
-### 4. 缓存机制
+### 5. 缓存机制
 
 ```typescript
 // embeddable.ts:23
@@ -401,7 +500,7 @@ const embeddedLinkCache = new Map<string, IframeDataWithSandbox>();
 
 ---
 
-### 5. iframe 渲染与沙箱隔离
+### 6. iframe 渲染与沙箱隔离
 
 ```typescript
 // App.tsx:1832-1854
@@ -452,20 +551,20 @@ const ALLOW_SAME_ORIGIN = new Set([
 
 ---
 
-### 6. 失败回退
+### 7. 失败回退
 
 | 失败场景 | 回退策略 | 代码位置 |
 |---------|---------|---------|
-| URL 不在白名单 | 显示错误提示"无法识别的链接格式" | `App.tsx:9139` |
+| URL 不在白名单 | `unableToEmbed` Toast，提示提 GitHub Issue | `Hyperlink.tsx:124` |
+| Vimeo 格式错误 | `unrecognizedLinkFormat` Toast，仅提示格式不识别 | `Hyperlink.tsx:136` |
 | iframe 加载失败 | 显示占位标签 "Empty Web-Embed" | `App.tsx:1409-411` |
-| 平台解析失败 | 返回原始 URL，尝试直接嵌入 | `embeddable.ts:388-399` |
-| Vimeo URL 无效 | 设置 error 字段，渲染错误状态 | `embeddable.ts:228-230` |
+| 其他平台解析失败 | 返回原始 URL，尝试直接嵌入 | `embeddable.ts:388-399` |
 
 ---
 
-## 第三部分：两条跨域消息链路分析
+## 第三部分：跨域消息通信机制
 
-### 跨域通信总览
+### 通信总览
 
 | 链路 | 通信方向 | 用途 | 安全级别 |
 |------|---------|------|---------|
@@ -476,20 +575,86 @@ const ALLOW_SAME_ORIGIN = new Set([
 
 ### 链路 1：视频播放器控制消息
 
-#### 来源校验
+#### 1.1 父页面主动发送控制消息的边界
+
+**触发条件**：用户点击 iframe 元素中心区域
+
+```typescript
+// App.tsx:1418-1470
+private handleEmbeddableClick(iframeLikeElement, event) {
+  // 1. 激活 iframe 元素
+  setTimeout(() => {
+    this.setState({
+      activeEmbeddable: { element: iframeLikeElement, state: "active" },
+      selectedElementIds: { [iframeLikeElement.id]: true },
+    });
+  }, 100);
+
+  const iframe = this.getHTMLIFrameElement(iframeLikeElement);
+  if (!iframe?.contentWindow) {
+    return true;
+  }
+
+  // 🎯 YouTube 控制边界
+  if (iframe.src.includes("youtube")) {
+    const state = YOUTUBE_VIDEO_STATES.get(iframeLikeElement.id);
+    
+    // 边界 1：首次点击 - 发送监听注册消息
+    if (!state) {
+      YOUTUBE_VIDEO_STATES.set(iframeLikeElement.id, YOUTUBE_STATES.UNSTARTED);
+      iframe.contentWindow.postMessage(
+        JSON.stringify({ event: "listening", id: iframeLikeElement.id }),
+        "*",
+      );
+    }
+
+    // 边界 2：状态切换 - 播放/暂停
+    switch (state) {
+      case YOUTUBE_STATES.PLAYING:
+      case YOUTUBE_STATES.BUFFERING:
+        // 播放中 → 发送暂停命令
+        iframe.contentWindow?.postMessage(
+          JSON.stringify({ event: "command", func: "pauseVideo", args: "" }),
+          "*",
+        );
+        break;
+      default:
+        // 其他状态 → 发送播放命令
+        iframe.contentWindow?.postMessage(
+          JSON.stringify({ event: "command", func: "playVideo", args: "" }),
+          "*",
+        );
+    }
+  }
+
+  // 🎯 Vimeo 控制边界
+  if (iframe.src.includes("player.vimeo.com")) {
+    // 仅发送 paused 命令，由 iframe 内部处理状态切换
+    // 注意：与 YouTube 不同，Vimeo 没有本地状态维护
+    iframe.contentWindow.postMessage(
+      JSON.stringify({ method: "paused" }),
+      "*",
+    );
+  }
+
+  return true;
+}
+```
+
+#### 1.2 来源校验（接收消息）
 
 ```typescript
 // App.tsx:869-875
 private onWindowMessage(event: MessageEvent) {
-  // 严格限制消息来源
+  // 严格限制消息来源：仅 YouTube 和 Vimeo 官方域名
   if (
     event.origin !== "https://player.vimeo.com" &&
     event.origin !== "https://www.youtube.com"
   ) {
-    return;  // 非白名单来源直接丢弃
+    return;  // 非白名单来源直接丢弃，不做任何处理
   }
 
-  // 验证消息格式
+  // 验证消息格式：必须是可解析的 JSON
   let data = null;
   try {
     data = JSON.parse(event.data);
@@ -500,19 +665,19 @@ private onWindowMessage(event: MessageEvent) {
 }
 ```
 
-#### 消息处理边界
+#### 1.3 消息处理边界
 
 | 平台 | 允许的消息类型 | 处理逻辑 | 响应边界 |
 |------|-------------|---------|---------|
-| **YouTube** | `infoDelivery` | 仅更新播放状态到本地 Map | **无响应**，仅更新内部状态 |
-| **Vimeo** | `paused` | 查找对应 iframe 后回发控制命令 | 仅回发给匹配的 iframe |
+| **YouTube** | `infoDelivery` | 仅更新本地 Map 状态，**不向外发消息** | 仅维护 `YOUTUBE_VIDEO_STATES` 状态机，无外发响应 |
+| **Vimeo** | `paused` | 1. 遍历所有 iframe 匹配 `event.source`<br>2. 仅向匹配的 iframe 回发控制命令 | 严格限制响应到来源 iframe |
 
 ```typescript
 // App.tsx:885-929
 switch (event.origin) {
   case "https://player.vimeo.com":
     if (data.method === "paused") {
-      // 查找匹配的 iframe
+      // 查找匹配的 iframe（遍历所有嵌入元素）
       let source: Window | null = null;
       const iframes = document.body.querySelectorAll("iframe.excalidraw__embeddable");
       for (const iframe of iframes) {
@@ -520,7 +685,7 @@ switch (event.origin) {
           source = iframe.contentWindow;
         }
       }
-      // 仅回发给来源 iframe
+      // ✅ 仅向来源 iframe 回发控制消息
       source?.postMessage(
         JSON.stringify({ method: data.value ? "play" : "pause", value: true }),
         "*",  // targetOrigin 宽松：来源已在校验阶段过滤
@@ -530,12 +695,27 @@ switch (event.origin) {
     
   case "https://www.youtube.com":
     if (data.event === "infoDelivery" && data.info?.playerState !== undefined) {
-      // 仅更新本地状态，**不向外发送任何消息**
+      // ✅ 仅更新本地状态，**不向外发送任何消息**
+      // infoDelivery 是 YouTube Player API 的状态回调
       YOUTUBE_VIDEO_STATES.set(data.id, data.info.playerState);
     }
     break;
 }
 ```
+
+#### 1.4 主动发送消息的边界总结
+
+| 触发动作 | 目标平台 | 允许的命令 | 安全措施 |
+|---------|---------|----------|---------|
+| 首次点击 iframe | YouTube | `listening`（注册监听） | 仅发送一次，后续不再重复注册 |
+| 点击播放/暂停 | YouTube | `playVideo` / `pauseVideo` | 基于本地状态机判断，不盲目发送 |
+| 点击播放/暂停 | Vimeo | `paused`（状态切换） | 无状态维护，直接发送 |
+| 任何其他动作 | 所有平台 | - | ❌ 禁止发送任何其他命令 |
+
+> **关键安全特性**：父页面主动发送的消息 **不携带任何敏感数据**，仅包含固定的播放器控制命令字符串。`targetOrigin` 设置为 `"*"` 是安全的，因为：
+> 1. 消息内容无敏感信息
+> 2. iframe 来源已通过白名单校验
+> 3. 仅向已渲染的 iframe 元素发送
 
 ---
 
@@ -546,19 +726,19 @@ switch (event.origin) {
 ```typescript
 // ExcalidrawPlusIframeExport.tsx:157-217
 const handleMessage = async (event: MessageEvent<MESSAGE_FROM_PLUS>) => {
-  // 🔒 第一层：严格的 Origin 校验
+  // 🔒 第一层：严格的 Origin 校验 - 仅接受来自 Plus 域名的消息
   if (event.origin !== EXCALIDRAW_PLUS_ORIGIN) {
     throw new ExcalidrawError("Invalid origin");
   }
 
   if (event.data.type === EVENT_REQUEST_SCENE) {
-    // 🔒 第二层：JWT 令牌存在性校验
+    // 🔒 第二层：JWT 令牌存在性校验（防止空请求攻击）
     if (!event.data.jwt) {
       throw new ExcalidrawError("JWT is missing");
     }
 
     try {
-      // 🔒 第三层：RSA-SHA256 签名验证
+      // 🔒 第三层：RSA-SHA256 签名验证（密码学校验）
       await verifyJWT({
         token: event.data.jwt,
         publicKey: import.meta.env.VITE_APP_PLUS_EXPORT_PUBLIC_KEY,
@@ -573,7 +753,7 @@ const handleMessage = async (event: MessageEvent<MESSAGE_FROM_PLUS>) => {
       rawElementsString: localStorage.getItem(STORAGE_KEYS.LOCAL_STORAGE_ELEMENTS),
     });
 
-    // 严格指定 targetOrigin 响应
+    // 严格指定 targetOrigin 响应：仅发送回 Plus 域名
     event.source!.postMessage(parsedSceneData, {
       targetOrigin: EXCALIDRAW_PLUS_ORIGIN,
     });
@@ -635,14 +815,14 @@ const verifyJWT = async ({ token, publicKey }) => {
 
 ### 1. 白名单 vs 安全校验 区别
 
-| 维度 | URL 白名单 | 安全校验 |
+| 维度 | URL 白名单 | 安全校验（JWT） |
 |------|-----------|---------|
 | **作用阶段** | 资源入口阶段，拒绝非法请求 | 通信/操作阶段，验证请求合法性 |
-| **匹配粒度** | 主机名 + 路径前缀 | Origin 精确匹配、密码学签名、过期时间 |
+| **匹配粒度** | 主机名 + 路径前缀 | Origin 精确匹配 + 密码学签名 + 过期时间 |
 | **容错性** | 宽松匹配（支持子域名、通配符） | 严格精确匹配，一点不符即拒绝 |
 | **扩展性** | 支持自定义验证函数/正则 | 固定算法，不可扩展 |
-| **性能开销** | 低（字符串匹配/正则） | 高（加密运算、网络 IO） |
-| **典型应用** | Library URL、iframe 嵌入源 | 跨域消息通信、API 授权 |
+| **性能开销** | 低（字符串匹配/正则） | 高（加密运算） |
+| **典型应用** | Library URL、iframe 嵌入源 | 跨域消息通信（Plus 导出） |
 
 ### 2. 限流机制总结
 
@@ -659,7 +839,7 @@ const verifyJWT = async ({ token, publicKey }) => {
 |------|-------------|------------|
 | **静默失败** | 用户取消导入时保持原状态 | - |
 | **降级渲染** | - | URL 解析失败时使用原始链接尝试嵌入 |
-| **错误提示** | 校验/持久化失败显示 Toast | 不支持的 URL 显示错误消息 |
+| **错误分级** | - | unableToEmbed（白名单失败）<br>unrecognizedLinkFormat（格式失败） |
 | **优雅回退** | 迁移失败回退到旧存储 | 加载失败显示占位标签 |
 
 ---
@@ -671,6 +851,7 @@ const verifyJWT = async ({ token, publicKey }) => {
 | Library 核心逻辑 | `packages/excalidraw/data/library.ts` |
 | Embeddable 解析 | `packages/element/src/embeddable.ts` |
 | iframe 渲染 | `packages/excalidraw/components/App.tsx:1832` |
+| 超链接与嵌入校验 | `packages/excalidraw/components/hyperlink/Hyperlink.tsx` |
 | 跨域消息处理器 | `packages/excalidraw/components/App.tsx:869` |
 | Plus 导出通信 | `excalidraw-app/ExcalidrawPlusIframeExport.tsx` |
 | Library SVG 缓存 | `packages/excalidraw/hooks/useLibraryItemSvg.ts` |
