@@ -313,17 +313,31 @@ ShapeCache.delete(element);
 
 **触发**：图片文件从缓存中删除时。
 
-#### 场景 7：全局主题切换
+#### 场景 7：窗口尺寸变化（显式遍历删除）
 
-**位置**：`packages/excalidraw/components/App.tsx:3247`
+**位置**：`packages/excalidraw/components/App.tsx:3244-3251`
 
 ```typescript
-this.scene
-  .getElementsIncludingDeleted()
-  .forEach((element) => ShapeCache.delete(element));
+private onResize = withBatchedUpdates(() => {
+  this.scene
+    .getElementsIncludingDeleted()
+    .forEach((element) => ShapeCache.delete(element));
+  this.refreshEditorInterface();
+  this.updateDOMRect();
+  this.setState({});
+});
 ```
 
-**原因**：主题切换时，所有元素的颜色需要重新应用暗色模式滤镜。
+**注册位置**：`App.tsx:3364`
+
+```typescript
+addEventListener(window, EVENT.RESIZE, this.onResize, false),
+```
+
+**原因**：
+- 窗口尺寸变化可能伴随 `window.devicePixelRatio` 变化（如移动窗口到不同 DPI 的显示器）
+- 离屏 Canvas 的物理尺寸计算公式：`width = elementWidth * window.devicePixelRatio + padding * 2`
+- DPI 变化时，离屏 Canvas 需要重新生成以保证清晰度
 
 #### 场景 8：图片文件更新
 
