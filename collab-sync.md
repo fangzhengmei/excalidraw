@@ -47,7 +47,7 @@ Excalidraw 的多人协作同步采用了 **三层架构** 设计，通过三条
 6. **加密与发送** (`excalidraw-app/collab/Portal.tsx:85-102`)
    - `_broadcastSocketData` 方法：
      - 将数据序列化为 JSON → 编码为 Uint8Array
-     - 使用 `roomKey` 进行 AES 加密，生成 `encryptedBuffer` 和 `iv`
+     - 使用 `roomKey` 进行 **AES-128-GCM** 加密，生成 `encryptedBuffer` 和 `iv`
      - 通过 Socket.IO 发送 `server-broadcast` 事件到指定房间
 
 #### 2.2.2 接收远程更新 → 本地应用
@@ -118,7 +118,7 @@ Excalidraw 的多人协作同步采用了 **三层架构** 设计，通过三条
      - `selectedElementIds`: 当前选中的元素 ID
      - `username`: 用户名
    - 使用 `volatile: true` 发送（`server-volatile-broadcast` 事件）
-     - Volatile 消息不保证送达，适合高频、可丢失的指针位置更新
+     - **易失消息**（fire-and-forget）不保证送达，适合高频、可丢失的指针位置更新
 
 4. **接收与显示** (`excalidraw-app/collab/Collab.tsx:610-627`)
    - 监听 `client-broadcast` 事件中的 `MOUSE_LOCATION` 子类型
@@ -285,8 +285,8 @@ Excalidraw 的多人协作同步采用了 **三层架构** 设计，通过三条
 │  │  • Socket.IO 连接管理                                          │  │
 │  │  • 房间加入/退出 (join-room)                                   │  │
 │  │  • 新用户初始化 (new-user → SCENE_INIT)                        │  │
-│  │  • 消息加密/解密 (AES-GCM)                                     │  │
-│  │  • 可靠 vs 易失消息路由                                        │  │
+│  │  • 消息加密/解密 (AES-128-GCM)                                     │  │
+│  │  • 普通 vs 易失消息路由（连接保持期内重传 vs fire-and-forget）      │  │
 │  │                                                               │  │
 │  └────────────────────────┬──────────────────────────────────────┘  │
 │                           │                                          │
@@ -352,9 +352,10 @@ Excalidraw 的多人协作同步采用了 **三层架构** 设计，通过三条
 
 ## 7. 核心技术点
 
-1. **端到端加密**：所有消息使用 AES-GCM 加密，密钥只在客户端通过 URL hash 分享
+1. **端到端加密**：所有消息使用 **AES-128-GCM** 加密，密钥只在客户端通过 URL hash 分享，服务器无法解密
 2. **增量 + 全量同步**：实时增量更新 + 定期全量同步（20秒），兼顾效率和一致性
 3. **版本向量**：每个元素有 `version` 字段，`reconcileElements` 基于版本号进行冲突解决
 4. **双重持久化**：WebSocket 实时同步 + Firebase 持久化存储，断网重连也能恢复
-5. **消息分类**：状态数据用可靠传输，感知数据用易失传输，平衡一致性和延迟
-6. **协作 API 抽象**：通过 Jotai atom 暴露协作能力，与 UI 层解耦
+5. **消息分类**：状态数据用**普通传输**（连接保持期内重传），感知数据用**易失传输**（fire-and-forget），平衡一致性和延迟
+6. **最终一致性模型**：由于网络传输无法保证绝对送达，通过定时全量同步和 Firebase 持久化实现**最终一致性**而非依赖"绝对送达"。选择最终一致性是因为：绝对送达需要复杂的消息队列、确认回执和重发机制，会大幅增加延迟和系统复杂度；而实时协作场景允许短暂的状态差异，通过周期性同步即可收敛到一致状态，在性能和一致性之间取得平衡
+7. **协作 API 抽象**：通过 Jotai atom 暴露协作能力，与 UI 层解耦
