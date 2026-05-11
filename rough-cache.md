@@ -364,7 +364,347 @@ ShapeCache.delete(element);
 | `containingFrameOpacity` 变化 | 所在帧的透明度变化 |
 | 带标签的箭头 `angle` 变化 | 箭头角度变化需要重新计算标签位置 |
 
-### 4.3 导出时的特殊处理
+### 4.3 主题切换完整链路追踪
+
+主题切换是最典型的"隐式失效"场景，不调用 `ShapeCache.delete()`，完全靠缓存命中时的 theme 检查来实现失效。
+
+#### 4.3.1 链路总览
+
+```
+用户点击切换主题 → actionToggleTheme 执行 → appState.theme 更新
+         │
+         ▼
+    React 重渲染 App.tsx
+         │
+         ▼
+    StaticCanvas 组件渲染
+         │
+         ▼
+    renderConfig 创建 (theme = this.state.theme)
+         │
+         ▼
+    renderStaticScene() → 遍历 visibleElements
+         │
+         ▼
+    renderElement(element, ..., renderConfig, appState)
+         │
+         ▼
+    ┌────────────────────────────────────────────────────┐
+    │  第一步：elementWithCanvasCache 检查               │
+    │  prevElementWithCanvas.theme !== appState.theme   │
+    │         │                                          │
+    │         ├─ true → 失效，重新生成 canvas            │
+    │         └─ false → 命中，直接使用                   │
+    └────────────────────────────────────────────────────┘
+         │
+         ▼
+    generateElementCanvas() 内部调用 drawElementOnCanvas()
+         │
+         ▼
+    ┌────────────────────────────────────────────────────┐
+    │  第二步：ShapeCache 检查                           │
+    │  ShapeCache.get(element, renderConfig.theme)      │
+    │  cached.theme !== renderConfig.theme              │
+    │         │                                          │
+    │         ├─ true → 失效，重新生成 shape             │
+    │         └─ false → 命中，直接使用                   │
+    └────────────────────────────────────────────────────┘
+         │
+         ▼
+    新生成的 canvas/shape 用新 theme 写入缓存
+```
+
+#### 4.3.2 步骤 1：主题状态变更
+
+**位置**：`packages/excalidraw/actions/actionCanvas.tsx:480-488`
+
+```typescript
+perform: (_, appState, value) => {
+  return {
+    appState: {
+      ...appState,
+      theme:
+        value || (appState.theme === THEME.LIGHT ? THEME.DARK : THEME.LIGHT),
+    },
+    captureUpdate: CaptureUpdateAction.EVENTUALLY,
+  };
+},
+```
+
+**证据**：`actionToggleTheme` 只修改 `appState.theme`，不调用任何 `ShapeCache` 方法。
+
+#### 4.3.3 步骤 2：renderConfig 传递新 theme
+
+**位置**：`packages/excalidraw/components/App.tsx:2346-2359`
+
+```typescript
+<StaticCanvas
+  // ...
+  appState={this.state}
+  renderConfig={{
+    imageCache: this.imageCache,
+    isExporting: false,
+    renderGrid: isGridModeEnabled(this),
+    canvasBackgroundColor: this.state.viewBackgroundColor,
+    embedsValidationStatus: this.embedsValidationStatus,
+    elementsPendingErasure: this.elementsPendingErasure,
+    pendingFlowchartNodes: this.flowChartCreator.pendingNodes,
+    theme: this.state.theme,  // ← 新 theme 从这里传入
+  }}
+/>
+```
+
+**证据**：每次渲染时，`renderConfig.theme` 都从最新的 `this.state.theme` 获取。
+
+#### 4.3.4 步骤 3：elementWithCanvasCache 如何命中/失效
+
+**缓存获取**：`packages/element/src/renderElement.ts:619`
+
+```typescript
+const prevElementWithCanvas = elementWithCanvasCache.get(element);
+```
+
+**失效判断**：`packages/element/src/renderElement.ts:631-645`
+
+```typescript
+if (
+  !prevElementWithCanvas ||
+  shouldRegenerateBecauseZoom ||
+  prevElementWithCanvas.theme !== appState.theme ||  // ← 关键检查
+  prevElementWithCanvas.boundTextElementVersion !== boundTextElementVersion ||
+  prevElementWithCanvas.imageCrop !== imageCrop ||
+  prevElementWithCanvas.containingFrameOpacity !== containingFrameOpacity ||
+  (isArrowElement(element) &&
+    boundTextElement &&
+    element.angle !== prevElementWithCanvas.angle)
+) {
+  // 失效：重新生成
+  const elementWithCanvas = generateElementCanvas(
+    element,
+    elementsMap,
+    zoom,
+    renderConfig,
+    appState,
+  );
+  elementWithCanvasCache.set(element, elementWithCanvas);  // ← 写入新缓存
+  return elementWithCanvas;
+}
+return prevElementWithCanvas;  // ← 命中：直接返回
+```
+
+**elementWithCanvasCache 的缓存值结构**：`packages/element/src/renderElement.ts:608-663`
+
+```typescript
+const generateElementWithCanvas = (element, elementsMap, renderConfig, appState) => {
+  // ...
+  // 生成新的 canvas 后写入缓存
+  elementWithCanvasCache.set(element, {
+    element,
+    canvas,  // 离屏 Canvas
+    theme: appState.theme,  // ← 保存 theme
+    scale,
+    angle: element.angle,
+    zoomValue: zoom.value,
+    canvasOffsetX,
+    canvasOffsetY,
+    boundTextElementVersion,
+    imageCrop,
+    containingFrameOpacity,
+    boundTextCanvas,
+  });
+};
+```
+
+**命中 vs 失效的详细对比**：
+
+| 场景 | `prevElementWithCanvas.theme` | `appState.theme` | 比较结果 | 行为 |
+|-----|------------------------------|------------------|---------|------|
+| 正常渲染（无主题切换） | LIGHT | LIGHT | === | 命中，直接返回缓存的 canvas |
+| 主题切换后（LIGHT → DARK） | LIGHT | DARK | !== | 失效，调用 `generateElementCanvas()` 重新生成 |
+| 切回主题（DARK → LIGHT） | DARK | LIGHT | !== | 失效，但旧的 LIGHT 缓存如果仍在 WeakMap 中可能被后续命中 |
+
+**关键点**：elementWithCanvasCache 的检查在 **ShapeCache 之前**。如果 elementWithCanvasCache 命中，根本不会走到 ShapeCache 层。
+
+#### 4.3.5 步骤 4：ShapeCache 如何命中/失效
+
+只有当 elementWithCanvasCache **未命中**时，才会调用 `generateElementCanvas()`，内部通过 `drawElementOnCanvas()` 触发 ShapeCache 检查。
+
+**调用链**：
+1. `generateElementCanvas()` → `packages/element/src/renderElement.ts:204`
+2. 内部调用 `drawElementOnCanvas(element, rc, context, renderConfig)` → `renderElement.ts:256`
+3. `drawElementOnCanvas()` 内部调用 `ShapeCache.generateElementShape(element, renderConfig)` → `renderElement.ts:402`
+
+**ShapeCache.get 的检查逻辑**：`packages/element/src/shape.ts:92-103`
+
+```typescript
+public static get = <T extends ExcalidrawElement>(
+  element: T,
+  theme: AppState["theme"] | null,
+) => {
+  const cached = ShapeCache.cache.get(element);
+  // 关键检查：cached.theme 必须等于传入的 theme
+  if (cached && (theme === null || cached.theme === theme)) {
+    return cached.shape;
+  }
+  return undefined;  // ← theme 不匹配 → 返回 undefined（失效）
+};
+```
+
+**ShapeCache.generateElementShape 的完整逻辑**：`packages/element/src/shape.ts:118-163`
+
+```typescript
+public static generateElementShape = <T extends ...>(
+  element: T,
+  renderConfig: { ...; theme: AppState["theme"]; } | null,
+) => {
+  // 步骤 A：尝试获取缓存
+  const cachedShape = renderConfig?.isExporting
+    ? undefined
+    : ShapeCache.get(element, renderConfig ? renderConfig.theme : null);
+  //    ↑
+  //    这里传入了 renderConfig.theme（新 theme）
+  //    如果缓存的是旧 theme，返回 undefined
+
+  if (cachedShape !== undefined) {
+    return cachedShape;  // ← 命中：直接返回
+  }
+
+  // 步骤 B：未命中，先删除 elementWithCanvasCache
+  elementWithCanvasCache.delete(element);
+  //    ↑
+  //    注意：这里反向删除了 Canvas 缓存
+  //    因为 shape 变了，canvas 也必须重新生成
+
+  // 步骤 C：重新生成 shape
+  const shape = _generateElementShape(element, ShapeCache.rg, renderConfig);
+
+  // 步骤 D：写入新缓存，保存新 theme
+  if (!renderConfig?.isExporting) {
+    ShapeCache.cache.set(element, {
+      shape,
+      theme: renderConfig?.theme || THEME.LIGHT,  // ← 新 theme
+    });
+  }
+
+  return shape;
+};
+```
+
+**ShapeCache 的缓存值结构**：`packages/element/src/shape.ts:82-87`
+
+```typescript
+private static cache = new WeakMap<
+  ExcalidrawElement,
+  { shape: ElementShape; theme: AppState["theme"] }  // ← 每个元素 + theme 组合
+>();
+```
+
+**命中 vs 失效的详细对比**：
+
+| 场景 | 缓存中的 `cached.theme` | 传入的 `renderConfig.theme` | 检查结果 | 行为 |
+|-----|------------------------|---------------------------|---------|------|
+| 正常渲染 | LIGHT | LIGHT | `===` | 命中，返回 `cached.shape` |
+| 主题切换（LIGHT → DARK） | LIGHT | DARK | `!==` | 失效，返回 `undefined` |
+| `generateElementShape` 重新生成 | DARK（新写入） | DARK | `===` | 下次同主题渲染时命中 |
+
+**关键证据代码**：`shape.ts:156-159`
+
+```typescript
+ShapeCache.cache.set(element, {
+  shape,
+  theme: renderConfig?.theme || THEME.LIGHT,  // 写入时保存当前 theme
+});
+```
+
+这意味着：
+- WeakMap 的 Key 是 `element` 对象引用
+- Value 是 `{ shape, theme }`
+- 同一 element 对象可以被"逻辑上"缓存两个版本（LIGHT 和 DARK），但实际 WeakMap 中只保留最新写入的那个
+
+#### 4.3.6 为什么说"亮色/暗色模式各自独立缓存"是近似说法
+
+**真实情况**：
+- WeakMap 中同一 element 对象只能有一个 entry
+- 切换主题时，旧 entry 不会被删除，但下次 get 时因 theme 不匹配返回 undefined
+- 然后新 entry 被写入，**覆盖**了旧 entry
+
+**证据**：`shape.ts:156`
+
+```typescript
+ShapeCache.cache.set(element, { shape, theme: ... });
+```
+
+WeakMap 的 `set` 对同一个 key 会覆盖旧值。
+
+**那"独立缓存"的效果是怎么实现的？**
+
+通过**懒加载 + theme 检查**实现：
+1. 切换到 DARK → 生成 DARK 版本并缓存（覆盖 LIGHT）
+2. 切换回 LIGHT → 因 theme 不匹配失效 → 生成 LIGHT 版本并缓存（覆盖 DARK）
+3. 用户感知上像是"两个独立缓存"，但实际上是"交替覆盖"
+
+#### 4.3.7 两层缓存的交互关系
+
+```
+renderElement(element, renderConfig { theme: DARK })
+         │
+         ▼
+generateElementWithCanvas(element, ...)
+         │
+         ├─ elementWithCanvasCache.get(element)
+         │      { canvas, theme: LIGHT, ... }
+         │
+         ├─ 检查: LIGHT !== DARK → 失效
+         │
+         ▼
+generateElementCanvas(element, ..., renderConfig { theme: DARK })
+         │
+         ▼
+drawElementOnCanvas(element, rc, context, renderConfig)
+         │
+         ▼
+ShapeCache.generateElementShape(element, renderConfig { theme: DARK })
+         │
+         ├─ ShapeCache.get(element, DARK)
+         │      { shape, theme: LIGHT }
+         │
+         ├─ 检查: LIGHT !== DARK → 失效
+         │
+         ├─ elementWithCanvasCache.delete(element)  // 反向清理
+         │
+         ├─ _generateElementShape(...)  // 重新生成
+         │
+         └─ ShapeCache.cache.set(element, { shape, theme: DARK })
+         │
+         ▼
+elementWithCanvasCache.set(element, { canvas, theme: DARK, ... })
+```
+
+**关键交互**：
+- ShapeCache 失效时（`shape.ts:140`）会主动调用 `elementWithCanvasCache.delete(element)`
+- 这确保 shape 变化时，依赖该 shape 的 canvas 缓存也被清理
+- 但反向不成立：elementWithCanvasCache 失效时不会清理 ShapeCache
+
+---
+
+### 4.4 窗口尺寸变化 vs 主题切换：完整路径对比
+
+| 对比维度 | 窗口尺寸变化 (onResize) | 主题切换 (actionToggleTheme) |
+|---------|------------------------|------------------------------|
+| **触发入口** | `window.addEventListener('resize')` | `actionManager.executeAction(actionToggleTheme)` |
+| **对缓存的主动操作** | ✅ 主动遍历删除所有元素的缓存 | ❌ 不操作缓存，只改状态 |
+| **代码证据** | `App.tsx:3244-3251` 调用 `ShapeCache.delete(element)` | `actionCanvas.tsx:480-488` 只改 `appState.theme` |
+| **ShapeCache 机制** | `WeakMap.delete(element)` 物理删除 | `get()` 时 `theme !==` 逻辑失效 |
+| **elementWithCanvasCache 机制** | 被 `ShapeCache.delete()` 连带删除 | 检查 `prev.theme !== appState.theme` |
+| **elementWithCanvasCache 代码证据** | `shape.ts:107`: `elementWithCanvasCache.delete(element)` | `renderElement.ts:634`: `prevElementWithCanvas.theme !== appState.theme` |
+| **ShapeCache 代码证据** | `shape.ts:106`: `ShapeCache.cache.delete(element)` | `shape.ts:97`: `cached.theme === theme` |
+| **缓存内容是否保留** | ❌ 完全删除 | ✅ 保留，只是下次不命中 |
+| **切回时的性能** | 需要重新生成 | WeakMap 中旧值已被覆盖，也需重新生成 |
+| **根本原因** | `devicePixelRatio` 可能变化，Canvas 物理尺寸需重算 | 颜色滤镜需重新应用，roughjs 选项中的颜色变化 |
+
+---
+
+### 4.5 导出时的特殊处理
 
 **位置**：`shape.ts:130-132`
 
@@ -487,10 +827,15 @@ const cachedShape = renderConfig?.isExporting
 | 功能 | 文件路径 | 关键行号 |
 |-----|---------|---------|
 | ShapeCache 类 | `packages/element/src/shape.ts` | 81-164 |
+| ShapeCache.get 的 theme 检查 | `packages/element/src/shape.ts` | 97 |
 | 随机种子生成 | `packages/common/src/random.ts` | 1-16 |
 | 元素 seed 定义 | `packages/element/src/types.ts` | 55-57 |
 | 种子传递给 roughjs | `packages/element/src/shape.ts` | 193-264 |
 | 新元素创建 | `packages/element/src/newElement.ts` | 145 |
 | 元素修改缓存失效 | `packages/element/src/mutateElement.ts` | 130-137 |
 | Canvas 缓存 | `packages/element/src/renderElement.ts` | 603-663 |
-| Canvas 缓存命中判断 | `packages/element/src/renderElement.ts` | 631-645 |
+| Canvas 缓存命中判断 (theme) | `packages/element/src/renderElement.ts` | 634 |
+| 窗口尺寸变化 onResize | `packages/excalidraw/components/App.tsx` | 3244-3251 |
+| resize 事件注册 | `packages/excalidraw/components/App.tsx` | 3364 |
+| 主题切换 action | `packages/excalidraw/actions/actionCanvas.tsx` | 468-488 |
+| devicePixelRatio 计算 Canvas 尺寸 | `packages/element/src/renderElement.ts` | 180-181 |
