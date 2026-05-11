@@ -630,29 +630,53 @@ ShapeCache.cache.set(element, {
 这意味着：
 - WeakMap 的 Key 是 `element` 对象引用
 - Value 是 `{ shape, theme }`
-- 同一 element 对象可以被"逻辑上"缓存两个版本（LIGHT 和 DARK），但实际 WeakMap 中只保留最新写入的那个
+- 同一 element 对象只能有一个 entry，每次写入都会覆盖旧值（详见 4.3.6 节的完整时间线）
 
-#### 4.3.6 为什么说"亮色/暗色模式各自独立缓存"是近似说法
+#### 4.3.6 澄清：不存在"亮色/暗色两个独立缓存"
 
-**真实情况**：
-- WeakMap 中同一 element 对象只能有一个 entry
-- 切换主题时，旧 entry 不会被删除，但下次 get 时因 theme 不匹配返回 undefined
-- 然后新 entry 被写入，**覆盖**了旧 entry
+**真实机制**：
 
-**证据**：`shape.ts:156`
+WeakMap 的 Key 是 element 对象引用，同一元素只能有 **一个** entry。每次 `set()` 都会覆盖旧值。
 
-```typescript
-ShapeCache.cache.set(element, { shape, theme: ... });
+**覆盖证据**：
+- ShapeCache：`shape.ts:156` → `ShapeCache.cache.set(element, { shape, theme: ... })`
+- elementWithCanvasCache：`renderElement.ts:658` → `elementWithCanvasCache.set(element, elementWithCanvas)`
+
+**主题切换的完整时间线**：
+
+```
+初始状态：
+  ShapeCache[element] = { shape, theme: LIGHT }
+  elementWithCanvasCache[element] = { canvas, theme: LIGHT, ... }
+
+第 1 次切换（LIGHT → DARK）：
+  ① elementWithCanvasCache.get() → theme: LIGHT !== DARK → 失效
+  ② ShapeCache.get(element, DARK) → cached.theme: LIGHT !== DARK → 失效
+  ③ 重新生成 DARK 版本
+  ④ ShapeCache.cache.set(element, { shape, theme: DARK })  ← 覆盖！
+  ⑤ elementWithCanvasCache.set(element, { canvas, theme: DARK })  ← 覆盖！
+
+当前状态：
+  ShapeCache[element] = { shape, theme: DARK }   ← LIGHT 已被覆盖，不存在了
+  elementWithCanvasCache[element] = { canvas, theme: DARK, ... }  ← LIGHT 已被覆盖
+
+第 2 次切换（DARK → LIGHT）：
+  ① elementWithCanvasCache.get() → theme: DARK !== LIGHT → 失效
+  ② ShapeCache.get(element, LIGHT) → cached.theme: DARK !== LIGHT → 失效
+  ③ 重新生成 LIGHT 版本  ← 必须重新生成，因为旧的 LIGHT 版本已被覆盖
+  ④ ShapeCache.cache.set(element, { shape, theme: LIGHT })  ← 覆盖 DARK
+  ⑤ elementWithCanvasCache.set(element, { canvas, theme: LIGHT })  ← 覆盖 DARK
+
+当前状态：
+  ShapeCache[element] = { shape, theme: LIGHT }
+  elementWithCanvasCache[element] = { canvas, theme: LIGHT, ... }
 ```
 
-WeakMap 的 `set` 对同一个 key 会覆盖旧值。
-
-**那"独立缓存"的效果是怎么实现的？**
-
-通过**懒加载 + theme 检查**实现：
-1. 切换到 DARK → 生成 DARK 版本并缓存（覆盖 LIGHT）
-2. 切换回 LIGHT → 因 theme 不匹配失效 → 生成 LIGHT 版本并缓存（覆盖 DARK）
-3. 用户感知上像是"两个独立缓存"，但实际上是"交替覆盖"
+**结论**：
+- ❌ **不存在** "两个独立缓存"
+- ❌ **不存在** "交替覆盖后旧缓存还能命中"
+- ✅ **实际行为**：每次切换主题都会覆盖 WeakMap entry，切回时必须重新生成
+- ✅ **实现方式**：通过 theme 检查实现"逻辑上的缓存失效"，而非物理上的多版本共存
 
 #### 4.3.7 两层缓存的交互关系
 
