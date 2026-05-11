@@ -595,37 +595,44 @@ private handleEmbeddableClick(iframeLikeElement, event) {
     return true;
   }
 
-  // 🎯 YouTube 控制边界
-  if (iframe.src.includes("youtube")) {
-    const state = YOUTUBE_VIDEO_STATES.get(iframeLikeElement.id);
-    
-    // 边界 1：首次点击 - 发送监听注册消息
-    if (!state) {
-      YOUTUBE_VIDEO_STATES.set(iframeLikeElement.id, YOUTUBE_STATES.UNSTARTED);
-      iframe.contentWindow.postMessage(
-        JSON.stringify({ event: "listening", id: iframeLikeElement.id }),
-        "*",
-      );
-    }
+  // 🎯 YouTube 控制边界（注意 falsy 状态值陷阱）
+    if (iframe.src.includes("youtube")) {
+      const state = YOUTUBE_VIDEO_STATES.get(iframeLikeElement.id);
+      
+      // 🔴 边界 1：发送 listening 注册消息
+      // ❗ 重要：YouTube 状态枚举值为 { UNSTARTED: -1, ENDED: 0, PLAYING: 1, PAUSED: 2, BUFFERING: 3, CUED: 5 }
+      // 其中 ENDED = 0 是 JavaScript falsy 值，这导致：
+      // - 未初始化 (undefined) → if (!state) = true → 发送
+      // - 播放结束 (ENDED = 0) → if (!state) = true → 重新发送
+      // 结论：NOT "仅首次发送"，而是"未初始化 OR 播放结束时发送"
+      if (!state) {
+        YOUTUBE_VIDEO_STATES.set(iframeLikeElement.id, YOUTUBE_STATES.UNSTARTED);
+        iframe.contentWindow.postMessage(
+          JSON.stringify({ event: "listening", id: iframeLikeElement.id }),
+          "*",
+        );
+      }
 
-    // 边界 2：状态切换 - 播放/暂停
-    switch (state) {
-      case YOUTUBE_STATES.PLAYING:
-      case YOUTUBE_STATES.BUFFERING:
-        // 播放中 → 发送暂停命令
-        iframe.contentWindow?.postMessage(
-          JSON.stringify({ event: "command", func: "pauseVideo", args: "" }),
-          "*",
-        );
-        break;
-      default:
-        // 其他状态 → 发送播放命令
-        iframe.contentWindow?.postMessage(
-          JSON.stringify({ event: "command", func: "playVideo", args: "" }),
-          "*",
-        );
+      // 🔴 边界 2：状态切换 - 播放/暂停
+      switch (state) {
+        case YOUTUBE_STATES.PLAYING:
+        case YOUTUBE_STATES.BUFFERING:
+          // 播放中 / 缓冲中 → 发送暂停命令
+          iframe.contentWindow?.postMessage(
+            JSON.stringify({ event: "command", func: "pauseVideo", args: "" }),
+            "*",
+          );
+          break;
+        default:
+          // 其他状态（UNSTARTED=-1, ENDED=0, PAUSED=2, CUED=5, undefined）→ 发送播放命令
+          // 注意：当 state = 0 (ENDED) 时，!state = true 已设置为 UNSTARTED，
+          // 但 switch 仍使用原值 0，会进入 default 分支（播放）
+          iframe.contentWindow?.postMessage(
+            JSON.stringify({ event: "command", func: "playVideo", args: "" }),
+            "*",
+          );
+      }
     }
-  }
 
   // 🎯 Vimeo 控制边界
   if (iframe.src.includes("player.vimeo.com")) {
