@@ -215,15 +215,18 @@ Excalidraw 的多人协作同步采用了 **三层架构** 设计，通过三条
 #### 4.2.2 消息广播与接收
 1. **发送消息** (`excalidraw-app/collab/Portal.tsx:85-102`)
    - `_broadcastSocketData(data, volatile, roomId?)`
-   - 两种发送模式的送达语义区别：
+   - 两种发送模式的送达语义区别（均为 **at-most-once** 语义）：
      - **普通消息** (`volatile: false`)：`server-broadcast` 事件
        - 用于：`SCENE_INIT`、`SCENE_UPDATE`
-       - Socket.IO 会在**连接保持期间**尝试重传和确认，但若用户断开连接后重连，之前未送达的消息会丢失
-       - **不是绝对保证送达**：在网络抖动、服务器重启等极端情况下仍可能丢包
+       - Socket.IO 默认 **at-most-once**：服务端只负责即时广播到当前在线用户，**不做任何持久化存储**
+       - 断连重连后**不会补发**错过的广播：如果用户在消息发送时不在线，该消息永久丢失
+       - 仅在连接保持期间，传输层可能有有限次重试，但消息不会在服务端缓冲等待重连
      - **易失消息** (`volatile: true`)：`server-volatile-broadcast` 事件
        - 用于：`MOUSE_LOCATION`、`IDLE_STATUS`、`USER_VISIBLE_SCENE_BOUNDS`
-       - 完全不保证送达：发送即"fire-and-forget"，如果接收方暂时不可达则直接丢弃
+       - 完全"fire-and-forget"：发送时若接收方不可达则直接丢弃，连传输层重试也没有
        - 延迟更低，适合高频、可丢失的感知数据
+
+   > **送达语义说明**：Socket.IO 没有消息队列或持久化机制，普通消息与易失消息的核心区别仅在于**传输层是否尝试有限重试**。两者本质都是 **at-most-once**——消息最多送达一次，可能零次（丢失），绝不会多次。Excalidraw 不依赖传输层保证一致性，而是通过**20秒定时全量同步**和**Firebase 持久化**在应用层实现最终一致性。
 
 2. **接收消息** (`excalidraw-app/collab/Collab.tsx:568-677`)
    - 统一监听 `client-broadcast` 事件
@@ -286,7 +289,7 @@ Excalidraw 的多人协作同步采用了 **三层架构** 设计，通过三条
 │  │  • 房间加入/退出 (join-room)                                   │  │
 │  │  • 新用户初始化 (new-user → SCENE_INIT)                        │  │
 │  │  • 消息加密/解密 (AES-128-GCM)                                     │  │
-│  │  • 普通 vs 易失消息路由（连接保持期内重传 vs fire-and-forget）      │  │
+│  │  • at-most-once 广播（普通：传输层重试 / 易失：fire-and-forget）  │  │
 │  │                                                               │  │
 │  └────────────────────────┬──────────────────────────────────────┘  │
 │                           │                                          │
@@ -307,10 +310,10 @@ Excalidraw 的多人协作同步采用了 **三层架构** 设计，通过三条
 
 | 链路 | 触发源 | 传输类型 | 加密 | 送达语义 | 频率 | 一致性回补 |
 |------|--------|----------|------|----------|------|-----------|
-| 文档状态同步 | `onChange` 回调 | `SCENE_UPDATE` / `SCENE_INIT` | AES-128-GCM | 普通传输（连接保持期内重传） | 实时 + 20s全量 | 全量同步 + Firebase持久化 |
-| 光标位置 | `onPointerUpdate` 回调 | `MOUSE_LOCATION` | AES-128-GCM | 易失传输（fire-and-forget） | ~30fps (节流33ms) | 后续更新自然覆盖 |
-| 用户状态 | 指针移动/页面可见性 | `IDLE_STATUS` | AES-128-GCM | 易失传输 | 状态变化时 | 心跳定时刷新 |
-| 视口边界 | 滚动/缩放变化 | `USER_VISIBLE_SCENE_BOUNDS` | AES-128-GCM | 易失传输 | 视口变化时 | 跟随者主动请求 |
+| 文档状态同步 | `onChange` 回调 | `SCENE_UPDATE` / `SCENE_INIT` | AES-128-GCM | at-most-once（传输层有限重试） | 实时 + 20s全量 | 全量同步 + Firebase持久化 |
+| 光标位置 | `onPointerUpdate` 回调 | `MOUSE_LOCATION` | AES-128-GCM | at-most-once（fire-and-forget，无重试） | ~30fps (节流33ms) | 后续更新自然覆盖 |
+| 用户状态 | 指针移动/页面可见性 | `IDLE_STATUS` | AES-128-GCM | at-most-once（fire-and-forget） | 状态变化时 | 心跳定时刷新 |
+| 视口边界 | 滚动/缩放变化 | `USER_VISIBLE_SCENE_BOUNDS` | AES-128-GCM | at-most-once（fire-and-forget） | 视口变化时 | 跟随者主动请求 |
 
 ### 5.3 关键衔接点
 
@@ -329,11 +332,11 @@ Excalidraw 的多人协作同步采用了 **三层架构** 设计，通过三条
    - 服务器无法看到明文内容
 
 4. **消息分类策略**
-   - 状态修改（元素）：普通传输，连接保持期间有重传确认
-   - 感知数据（光标、状态）：易失传输，追求低延迟
+   - 状态修改（元素）：普通传输，**传输层有限重试**（但仍是 at-most-once）
+   - 感知数据（光标、状态）：易失传输，fire-and-forget，追求低延迟
 
 5. **一致性保障机制**
-   - 由于 WebSocket 广播不是绝对保证送达，系统通过两层回补机制维持最终一致性：
+   - 由于 Socket.IO 是 **at-most-once 广播**，断连重连后服务端不会补发错过的消息，系统通过两层回补机制维持最终一致性：
    - **定时全量同步**：每 20 秒 `SYNC_FULL_SCENE_INTERVAL_MS` 广播一次完整场景，覆盖可能丢失的增量更新
    - **Firebase 持久化**：断网重连或新用户加入时，优先从 Firebase 加载完整场景数据
 
@@ -356,6 +359,6 @@ Excalidraw 的多人协作同步采用了 **三层架构** 设计，通过三条
 2. **增量 + 全量同步**：实时增量更新 + 定期全量同步（20秒），兼顾效率和一致性
 3. **版本向量**：每个元素有 `version` 字段，`reconcileElements` 基于版本号进行冲突解决
 4. **双重持久化**：WebSocket 实时同步 + Firebase 持久化存储，断网重连也能恢复
-5. **消息分类**：状态数据用**普通传输**（连接保持期内重传），感知数据用**易失传输**（fire-and-forget），平衡一致性和延迟
-6. **最终一致性模型**：由于网络传输无法保证绝对送达，通过定时全量同步和 Firebase 持久化实现**最终一致性**而非依赖"绝对送达"。选择最终一致性是因为：绝对送达需要复杂的消息队列、确认回执和重发机制，会大幅增加延迟和系统复杂度；而实时协作场景允许短暂的状态差异，通过周期性同步即可收敛到一致状态，在性能和一致性之间取得平衡
+5. **消息分类**：状态数据用**普通传输**（传输层有限重试），感知数据用**易失传输**（fire-and-forget，无重试），两者均为 at-most-once 语义
+6. **最终一致性模型**：由于 Socket.IO 是 at-most-once 广播且断连不补发，Excalidraw 通过**20秒定时全量同步**和**Firebase 持久化**实现最终一致性。选择此模型是因为：实时协作场景允许短暂的状态差异，通过周期性同步即可收敛；而若追求 at-least-once 或 exactly-once，需要引入消息队列、确认回执和去重机制，会大幅增加延迟和系统复杂度
 7. **协作 API 抽象**：通过 Jotai atom 暴露协作能力，与 UI 层解耦
