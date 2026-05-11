@@ -520,8 +520,19 @@ const generateElementWithCanvas = (element, elementsMap, renderConfig, appState)
 | 场景 | `prevElementWithCanvas.theme` | `appState.theme` | 比较结果 | 行为 |
 |-----|------------------------------|------------------|---------|------|
 | 正常渲染（无主题切换） | LIGHT | LIGHT | === | 命中，直接返回缓存的 canvas |
-| 主题切换后（LIGHT → DARK） | LIGHT | DARK | !== | 失效，调用 `generateElementCanvas()` 重新生成 |
-| 切回主题（DARK → LIGHT） | DARK | LIGHT | !== | 失效，但旧的 LIGHT 缓存如果仍在 WeakMap 中可能被后续命中 |
+| 主题切换后（LIGHT → DARK） | LIGHT | DARK | !== | 失效，调用 `generateElementCanvas()` 重新生成，新生成的 DARK canvas 覆盖旧的 LIGHT 缓存 |
+| 切回主题（DARK → LIGHT） | DARK | LIGHT | !== | 失效，旧的 LIGHT 缓存已被覆盖，需要重新生成 |
+
+**关键证据**：`renderElement.ts:658`
+
+```typescript
+elementWithCanvasCache.set(element, elementWithCanvas);
+```
+
+WeakMap 的 `set()` 对同一个 key（element 对象）会覆盖旧值。因此：
+- 切换到 DARK 时，`set(element, { theme: DARK, ... })` 覆盖了 LIGHT 版本
+- 切回 LIGHT 时，WeakMap 中只有 DARK 版本，theme 检查不通过 → 失效
+- 重新生成 LIGHT 版本后，又覆盖了 DARK 版本
 
 **关键点**：elementWithCanvasCache 的检查在 **ShapeCache 之前**。如果 elementWithCanvasCache 命中，根本不会走到 ShapeCache 层。
 
