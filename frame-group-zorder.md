@@ -389,6 +389,13 @@ perform: (elements, appState, _, app) => {
 | `syncMovedIndices` (`fractionalIndex.ts:158-199`) | ❌ 无 | index 会被重新分配（第 191 行 `mutateElement`） |
 | `getMovedIndicesGroups` (`fractionalIndex.ts:244-272`) | ❌ 无 | 仅通过 `movedElements.has(elements[i].id)` 判定 |
 
+**锁定元素修改 frameId/index 的前置条件与例外路径**：
+
+| 修改操作 | 前置条件（满足才会修改） | 例外路径（不修改场景） |
+|---------|------------------------|---------------------|
+| 修改 `frameId` | 1. 元素在 `finalElementsToAdd` 集合中<br>2. `element.frameId !== frame.id`（`frame.ts:585`） | - 元素不在 `getElementsInResizingFrame` 返回结果中<br>- 元素已在目标 Frame 内（`frameId === frame.id`） |
+| 修改 `index` | 1. 元素在 `finalElementsToAdd` 集合中<br>2. `finalElementsToAdd.size > 0`<br>3. `commonFrameId !== frame.id`<br>4. `insertionIndex !== null` | - 纯 Frame 内解组<br>- `finalElementsToAdd` 为空<br>- `insertionIndex` 为 null<br>- 以上任一满足即跳过 `syncMovedIndices` |
+
 **各阶段锁定元素的实际行为**：
 
 1. **`removeFromSelectedGroups` 阶段**
@@ -409,6 +416,7 @@ perform: (elements, appState, _, app) => {
      }
      ```
    - 行为：锁定元素的 `frameId` 会被无条件修改，无锁定保护
+   - ✅ **例外**：若锁定元素已在 Frame 内（`frameId === frame.id`），则跳过修改
 
 4. **z-index 重排阶段（`syncMovedIndices`）**
    - 源码：`getMovedIndicesGroups` 仅检查 `movedElements.has(elements[i].id)`，无 `locked` 判断
@@ -419,38 +427,53 @@ perform: (elements, appState, _, app) => {
      }
      ```
    - 行为：属于 `finalElementsToAdd` 集合的锁定元素，其 `index` 会被重新分配，无锁定保护
+   - ✅ **例外**：三个提前返回分支会跳过 index 重排
 
 #### 2.5.4 解组对 z-index 结果的影响
 
-解组操作对元素叠层顺序的影响路径：
-
-**路径1：Frame 内解组 → 局部重排**
+**源码验证：`syncMovedIndices` 的触发条件**（`frame.ts:597-604`）：
+```typescript
+if (
+  !finalElementsToAdd.size ||
+  // if all elements to add already belong to the frame, then we don't want to
+  // reorder (case: we're dragging element children within the frame)
+  commonFrameId === frame.id
+) {
+  return allElements;
+}
 ```
-解组触发
-  → 收集选中组的所有元素
+- ✅ **仅当元素从 Frame 外移入时触发重排，纯 Frame 内解组不触发
+
+**解组操作对元素叠层顺序的影响路径**：
+
+**路径1：Frame 内解组 → 无 index 变更**
+```
+解组触发（所有元素均在 Frame 内）
   → removeFromSelectedGroups 清除 groupIds
-  → getElementsInResizingFrame 确定 Frame 内成员
-  → replaceAllElementsInFrame 触发 addElementsToFrame
-    → getFrameChildrenInsertionIndex 计算插入位置（Frame 之后或最高子元素之后）
-    → syncMovedIndices 同步 fractional index
-  → 结果：Frame 内元素保持在 Frame 层级下，相对顺序可能调整
+  → getElementsInResizingFrame 返回 Frame 内原有成员
+  → replaceAllElementsInFrame → addElementsToFrame
+    → 检测到 commonFrameId === frame.id（所有元素已在 Frame 内
+    → 直接返回，不调用 syncMovedIndices
+  → 结果：元素 index 不变，仅 groupIds 变更
 ```
 
-**路径2：跨 Frame 解组 → 全局重排**
+**路径2：跨 Frame 解组 → 触发 index 重排**
 ```
 选中跨 Frame 的组（部分在 Frame 内，部分在外）
   → 解组后元素变为独立
-  → 原组内绑定关系解除
-  → 每个元素独立判定 Frame 归属（基于几何重叠）
-  → 在各自 Frame 内（或根层级）重新计算 z-index
-  → 结果：可能打破原组的整体层级，元素按个体位置分层
+  → getElementsInResizingFrame 基于几何判定成员
+  → replaceAllElementsInFrame → addElementsToFrame
+    → 检测到 commonFrameId !== frame.id
+    → getFrameChildrenInsertionIndex 计算插入位置
+    → syncMovedIndices 生成新 fractional index
+  → 结果：移入 Frame 的元素 index 被重排，Frame 外元素 index 不变
 ```
 
-**关键 z-index 行为**：
-- 解组前：组内元素作为整体移动，保持相对顺序
-- 解组后：元素可独立移动，相对顺序可被打破
-- Frame 约束从"组级"降为"元素级"，每个元素单独判定是否在 Frame 内
-- 绑定文本虽然从选区中移除，但其 z-index 仍跟随宿主元素保持一致
+**关键 z-index 行为（源码可验证）**：
+- `syncMovedIndices 仅对 `finalElementsToAdd` 集合内元素生成新 index（`frame.ts:624`）
+- 不在 Frame 内的元素，其 index 保持不变
+- 绑定文本自动加入 `finalElementsToAdd` 集合（`frame.ts:575-578`），index 随宿主一起更新
+- 数组重排序 + index 同步仅发生在 `addElementsToFrame` 中，解组本身不直接修改顺序
 
 #### 2.5.5 解组后的选区变化
 
