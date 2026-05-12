@@ -4,23 +4,21 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                           共享公共模块                                    │
-├─────────────────────────────────────────────────────────────────────────┤
-│  AnimationFrameHandler 统一调度  +  getSvgPathFromStroke (common)        │
-│         ▲                               ▲                                │
-│         │                               │                                │
+│                      唯一共享：getSvgPathFromStroke (common)            │
+│                           仅 SVG 路径生成阶段共用                         │
 ├───────────────────────────────────┬─────────────────────────────────────┤
 │        手绘渲染管线 (Freedraw)    │    激光渲染管线 (Laser)            │
 ├───────────────────────────────────┼─────────────────────────────────────┤
-│  perfect-freehand → getStroke     │ @excalidraw/laser-pointer          │
-│  + 本地 SVG 生成函数              │    ↳ LaserPointer 类                │
-│  + ShapeCache 缓存               │    ↳ getStrokeOutline               │
-│  + Rough.js 手绘质感              │    ↳ 内置 streamline/simplify       │
-│  + points-on-curve simplify      │  + sizeMapping 动态衰减              │
-│                                  │  + 每帧重算机制                      │
+│  perfect-freehand → getStroke     │ AnimationFrameHandler 独占调度      │
+│  + 本地 SVG 生成函数              │ @excalidraw/laser-pointer          │
+│  + ShapeCache 缓存               │    ↳ 每帧动态 sizeMapping            │
+│  + Rough.js 手绘质感              │    ↳ 实时衰减重算                   │
+│  + points-on-curve simplify      │  + AnimatedTrail 帧渲染循环          │
+│                                  │  + LaserTrails 协作管理器            │
 ├───────────────────────────────────┼─────────────────────────────────────┤
 │        Canvas 2D 渲染            │      SVG 直接渲染                    │
 │        保存为 ExcalidrawElement  │      仅内存中轨迹                    │
+│        无帧动画循环              │      每帧全量重算                    │
 └───────────────────────────────────┴─────────────────────────────────────┘
 ```
 
@@ -110,77 +108,90 @@ const simplifiedPoints = simplify(
 // └───────────────────────────────────────────────────────┘
 ```
 
-### 2.3 perfect-freehand 工作原理
+### 2.3 perfect-freehand 可观测工作流程
+
+**证据来源：`packages/element/src/shape.ts` + perfect-freehand 库公开文档**
 
 ```
-perfect-freehand 内部处理链：
+从调用参数可观测的处理链：
 
 Input Points → [x, y, pressure]
     ↓
-1. streamline 阶段
-   ├─ 计算每个点的移动方向
-   ├─ 基于相邻点修正点位置
-   └─ 消除抖动，让轨迹更流畅
+1. streamline 阶段（参数值：0.5）
+   ├─ 基于相邻点方向修正点位置
+   └─ 消除鼠标抖动
     ↓
-2. smoothing 阶段
-   ├─ 高斯模糊-like 的点平滑
-   └─ 减少尖锐拐角
+2. smoothing 阶段（参数值：0.5）
+   └─ 点间插值平滑，减少尖锐拐角
     ↓
-3. thinning 阶段
-   ├─ pressure → 笔触宽度
-   ├─ easing 函数变换压力曲线
-   └─ 计算每个点的左右偏移量
+3. thinning 阶段（参数值：0.6）
+   ├─ pressure 映射到笔触宽度
+   ├─ easing: easeOutSine 变换压力曲线
+   └─ 计算每个点的左右轮廓偏移量
     ↓
-4. 输出轮廓点
-   └─ 闭合多边形顶点 [x, y][]
+4. 输出：闭合多边形顶点 [x, y][]
+
+注意：手绘无帧动画循环 → ShapeCache 缓存结果，
+      不使用 AnimationFrameHandler！
+```
+
+**证据：ShapeCache 验证**
+```typescript
+// 位置: packages/element/src/shape.ts:81-163
+export class ShapeCache {
+  private static cache = new WeakMap<
+    ExcalidrawElement,
+    { shape: ElementShape; theme: AppState["theme"] }
+  >();
+
+  // 生成后缓存，后续直接取用
+  public static generateElementShape(element, renderConfig) {
+    const cachedShape = renderConfig?.isExporting
+      ? undefined
+      : ShapeCache.get(element, renderConfig?.theme || null);
+    
+    if (cachedShape !== undefined) {
+      return cachedShape;  // 使用缓存，不重算
+    }
+    // ... 生成形状 ...
+  }
+}
 ```
 
 ---
 
 ## 三、激光衰减管线 (Time Decay Pipeline)
 
-### 3.1 @excalidraw/laser-pointer 内部架构
+### 3.1 @excalidraw/laser-pointer 可观测行为
+
+**证据来源：`packages/excalidraw/animated-trail.ts` 调用方式**
 
 ```typescript
-// 内部类结构（推导自使用方式）
+// 从代码调用可观测的类行为（注意：npm 包源码不在仓库内，
+// 以下为基于调用接口的行为推导，非内部实现事实）
 class LaserPointer {
-  // 原始点存储
+  // 可观测：能通过 originalPoints 访问原始点
+  // 证据: animated-trail.ts:65-71 hasLastPoint() 直接访问
   originalPoints: [number, number, number][];  // [x, y, timestamp]
   
-  // 配置
-  options: LaserPointerOptions;
+  // 可观测：构造函数接收 options 覆盖
+  // 证据: animated-trail.ts:97 new LaserPointer(this.options)
+  constructor(options: Partial<LaserPointerOptions>);
   
-  constructor(options: Partial<LaserPointerOptions>) {
-    this.options = {
-      size: 8,
-      thinning: 0.5,
-      smoothing: 0.5,
-      streamline: 0.4,
-      simplify: 0,          // 激光：不简化
-      sizeMapping: undefined,
-      keepHead: true,
-      ...options,
-    };
-  }
+  // 可观测：能添加新点
+  // 证据: animated-trail.ts:99, 106 调用
+  addPoint(point: [number, number, number]): void;
   
-  addPoint(point: [number, number, number]): void {
-    this.originalPoints.push(point);
-  }
+  // 可观测：能关闭 keepHead
+  // 证据: animated-trail.ts:114 trail.close()
+  close(): void;
   
-  close(): void {
-    this.options.keepHead = false;
-  }
-  
-  // 核心：生成带衰减的笔触轮廓
-  getStrokeOutline(scale: number = 1): [number, number][] {
-    // 1. 对每个点计算动态大小
-    //    sizeMapping(pressure, currentIndex, totalLength)
-    // 2. 内置 streamline + smoothing 处理
-    // 3. 计算轮廓偏移
-    // 4. 返回闭合多边形点
-  }
+  // 可观测：核心输出，接收 scale 参数
+  // 证据: animated-trail.ts:181-182 调用
+  getStrokeOutline(scale: number = 1): [number, number][];
 }
 
+// 可观测的 Options 接口（来自 TypeScript 类型标注）
 interface LaserPointerOptions {
   size: number;
   thinning: number;
@@ -188,46 +199,52 @@ interface LaserPointerOptions {
   streamline: number;
   simplify: number;
   
-  // 动态大小映射（激光核心！）
+  // 激光核心：动态大小映射
+  // 证据: laser-trails.ts:35-48 传入自定义函数
   sizeMapping?: (context: {
-    pressure: number;        // 存储的 timestamp
-    currentIndex: number;    // 当前点索引
-    totalLength: number;     // 总点数
+    pressure: number;        // 实际存储 timestamp
+    currentIndex: number;    // 点索引
+    totalLength: number;     // 总长度
   }) => number;
   
-  keepHead?: boolean;        // 保持头部不消失
+  keepHead?: boolean;        // 绘制中保持头部
 }
 ```
 
-### 3.2 激光几何平滑细节
+> ⚠️ **重要说明**：`@excalidraw/laser-pointer` 为 npm 外部包，
+> 其内部默认参数值（如 size 默认 8、thinning 默认 0.5 等）
+> 在本仓库源码中不可直接验证，不应作为确定事实陈述。
+> 以上仅为基于接口调用的可观测行为推导。
+
+### 3.2 激光几何平滑与衰减配置
 
 **位置: `packages/excalidraw/laser-trails.ts:31-50`**
 
 ```typescript
 private getTrailOptions() {
   return {
-    // ── 几何平滑参数 ─────────────────────────────
-    simplify: 0,           // 激光：完全不简化，保留所有点
-                           // 原因：轨迹短暂，需要精确跟随鼠标
-                           // 手绘：0.75，大幅减少点数量
+    // ── 几何平滑参数（仓库内可观测的传值） ──────
+    simplify: 0,           // 明确传值：不简化
+                           // 设计意图：激光轨迹短暂，需要精确跟随
+                           // 对比手绘：simplify(points, 0.75) 大幅简化
     
-    streamline: 0.4,       // 轻度流线化，平衡响应速度与平滑
-                           // 手绘：0.5，更注重平滑
+    streamline: 0.4,       // 明确传值：轻度流线化
+                           // 平衡鼠标响应与视觉平滑
+                           // 对比手绘：streamline: 0.5
     
-    // ── 动态衰减映射（激光独有） ──────────────────
+    // ── 动态衰减映射（激光独有，仓库可观测） ────
     sizeMapping: (c) => {
       const DECAY_TIME = 1000;     // 1秒完全消失
       const DECAY_LENGTH = 50;     // 尾部50个点淡出
       
-      // 双重衰减机制
-      // 1. 时间衰减：按点添加时间计算剩余可见度
+      // 可观测事实：pressure 字段被用作 timestamp 存储
+      // 证据: animated-trail.ts:99 addPoint([x, y, performance.now()])
       const t = Math.max(
         0,
         1 - (performance.now() - c.pressure) / DECAY_TIME,
-        //           ↑ 这里 pressure 实际存储的是 timestamp！
       );
       
-      // 2. 位置衰减：从头部到尾部自然淡出
+      // 位置衰减：从头部到尾部自然淡出
       const l =
         (DECAY_LENGTH -
           Math.min(DECAY_LENGTH, c.totalLength - c.currentIndex)) /
@@ -244,49 +261,78 @@ private getTrailOptions() {
 export const easeOut = (t: number) => t * (2 - t);
 ```
 
-### 3.3 AnimatedTrail 帧渲染循环
+### 3.3 AnimatedTrail 帧渲染循环与 AnimationFrameHandler
 
-**位置: `packages/excalidraw/animated-trail.ts:139-197`**
+**位置: `packages/excalidraw/animated-trail.ts:30-79, 139-197`**
 
 ```typescript
+// AnimationFrameHandler 仅激光链路使用，手绘不使用！
+// 证据：全局搜索 AnimationFrameHandler，仅出现于 laser 相关文件
+
 export class AnimatedTrail implements Trail {
   private currentTrail?: LaserPointer;   // 当前绘制中
   private pastTrails: LaserPointer[] = []; // 已结束但仍在衰减
   
+  private container?: SVGSVGElement;
+  private trailElement: SVGPathElement;
+
+  constructor(
+    private animationFrameHandler: AnimationFrameHandler,  // 注入依赖
+    protected app: App,
+    private options: Partial<LaserPointerOptions> & AnimatedTrailOptions,
+  ) {
+    // 注册到帧调度器
+    this.animationFrameHandler.register(this, this.onFrame.bind(this));
+    this.trailElement = document.createElementNS(SVG_NS, "path");
+  }
+
+  start(container?: SVGSVGElement) {
+    // 启动帧循环
+    this.animationFrameHandler.start(this);
+  }
+
+  stop() {
+    // 停止帧循环
+    this.animationFrameHandler.stop(this);
+  }
+
+  // ── 帧渲染核心 ─────────────────────────────────
   private onFrame() {
     const paths: string[] = [];
 
-    // ── 阶段1：渲染历史轨迹（继续衰减） ─────────
+    // 阶段1：渲染历史轨迹（仍在衰减中）
     for (const trail of this.pastTrails) {
       paths.push(this.drawTrail(trail, this.app.state));
     }
 
-    // ── 阶段2：渲染当前轨迹 ────────────────────
+    // 阶段2：渲染当前正在绘制的轨迹
     if (this.currentTrail) {
       const currentPath = this.drawTrail(this.currentTrail, this.app.state);
       paths.push(currentPath);
     }
 
-    // ── 阶段3：清理已完全消失的轨迹 ────────────
+    // 阶段3：清理已完全消失的轨迹
     this.pastTrails = this.pastTrails.filter((trail) => {
-      // 轮廓为空 = 已完全消失
       return trail.getStrokeOutline().length !== 0;
     });
 
-    // ── 阶段4：合并路径更新 SVG ────────────────
+    // 阶段4：合并所有路径更新 SVG
     const svgPaths = paths.join(" ").trim();
     this.trailElement.setAttribute("d", svgPaths);
+    this.trailElement.setAttribute(
+      "fill",
+      (this.options.fill ?? (() => "black"))(this),
+    );
     
-    // 注意：每帧都重新计算所有点！
-    // 因为 sizeMapping 依赖 performance.now()，是动态的
+    // 关键特性：每帧都重新计算所有点！
+    // 原因：sizeMapping 依赖 performance.now()，是动态函数
+    // 对比手绘：计算一次后 ShapeCache 缓存
   }
 
   private drawTrail(trail: LaserPointer, state: AppState): string {
-    // 1. 调用 laser-pointer 获取带衰减的轮廓
     const _stroke = trail
       .getStrokeOutline(trail.options.size / state.zoom.value)
       .map(([x, y]) => {
-        // 2. 坐标变换：场景坐标 → 视口坐标
         const result = sceneCoordsToViewportCoords(
           { sceneX: x, sceneY: y },
           state,
@@ -294,12 +340,11 @@ export class AnimatedTrail implements Trail {
         return [result.x, result.y];
       });
 
-    // 3. 动画模式：只使用一半点（虚线效果）
     const stroke = this.trailAnimation
       ? _stroke.slice(0, _stroke.length / 2)
       : _stroke;
 
-    // 4. 调用 common 包共享的 SVG 路径生成
+    // 使用 common 包共享的 SVG 路径函数
     return getSvgPathFromStroke(stroke, true);
   }
 }
@@ -307,16 +352,20 @@ export class AnimatedTrail implements Trail {
 
 ---
 
-## 四、真实共享模块详解
+## 四、共享模块边界准确说明
 
-### 4.1 getSvgPathFromStroke - 唯一真正共享的路径函数
+### 4.1 getSvgPathFromStroke - 唯一真正共享的函数
 
 **位置: `packages/common/src/utils.ts:1103-1134`**
 
 ```typescript
 /**
- * 唯一真正共享的 SVG 路径生成函数
- * 与手绘本地版本的区别：使用 T 命令的二次贝塞尔平滑
+ * 唯一真正在手绘与激光间共享的代码模块
+ * 
+ * 共享边界说明：
+ * ✓ 激光轨迹：AnimatedTrail.drawTrail() 第 303 行直接调用
+ * ✓ 手绘 SVG 导出：getFreeDrawSvgPath() 间接使用？待验证
+ * ✗ 手绘 Canvas 渲染：shape.ts 第 1211 行有本地独立实现
  */
 export function getSvgPathFromStroke(points: number[][], closed = true) {
   const len = points.length;
@@ -329,7 +378,7 @@ export function getSvgPathFromStroke(points: number[][], closed = true) {
   let b = points[1];
   const c = points[2];
 
-  // 关键区别：使用 Q + T 命令链，而非手绘版本的 reduce 模式
+  // Q + T 命令链实现
   let result = `M${a[0].toFixed(2)},${a[1].toFixed(2)} Q${b[0].toFixed(
     2,
   )},${b[1].toFixed(2)} ${average(b[0], c[0]).toFixed(2)},${average(
@@ -357,22 +406,30 @@ function average(a: number, b: number) {
 }
 ```
 
-**两个 SVG 函数对比：**
+### 4.2 两个 SVG 函数实现对比表
 
-| 特性 | 手绘本地版本 (shape.ts) | 共享版本 (common/utils.ts) |
-|------|-------------------------|---------------------------|
-| 实现方式 | reduce + 中点逐点构建 | Q + T 命令链 |
-| 平滑度 | 每点显式控制点 | 利用 T 命令的反射特性 |
-| 精度处理 | 正则替换统一处理 | 生成时直接 toFixed |
-| 使用者 | 手绘 SVG 导出 | 激光轨迹渲染 |
+| 特性 | 手绘本地版本 (shape.ts:1211) | 共享版本 (common/utils.ts:1103) |
+|------|-----------------------------|-------------------------------|
+| 实现方式 | reduce + 中点逐点构建 Q 命令 | 首点显式 Q，后续 T 命令链 |
+| 控制点策略 | 每对相邻点取中点作控制点 | 利用 SVG T 命令的反射特性 |
+| 数值精度 | 正则表达式后处理统一 toFixed | 生成时直接 toFixed |
+| 使用者 | 手绘元素的 Shape 生成 | 激光轨迹的帧渲染 |
+| 是否共享 | ✗ 本地私有 | ✓ 跨模块共享 |
 
-### 4.2 AnimationFrameHandler - 统一动画调度
+### 4.3 AnimationFrameHandler - 激光独占的帧调度器
 
 **位置: `packages/excalidraw/animation-frame-handler.ts:8-79`**
 
 ```typescript
+/**
+ * 帧动画调度器 - 仅激光链路使用，手绘不使用
+ * 
+ * 证据：全局搜索 AnimationFrameHandler
+ * 1. laser-trails.ts: 注入并管理协作者轨迹
+ * 2. animated-trail.ts: 注册 onFrame 回调
+ * 3. 无任何 freedraw / shape 相关文件引用
+ */
 export class AnimationFrameHandler {
-  // 使用 WeakMap，避免阻止 GC
   private targets = new WeakMap<object, AnimationTarget>();
   private rafIds = new WeakMap<object, number>();
 
@@ -400,12 +457,29 @@ export class AnimationFrameHandler {
     const rafId = requestAnimationFrame(this.constructFrame(key));
     this.rafIds.set(key, rafId);
   }
-}
 
-// 典型使用：
-// LaserTrails 注册自身的 onFrame
-// AnimatedTrail 注册自身的 onFrame
-// 两者共享同一个调度器，但独立启停
+  private constructFrame(key: object): FrameRequestCallback {
+    return (timestamp: number) => {
+      const target = this.targets.get(key);
+      if (!target) return;
+      
+      const shouldAbort = target.callback(timestamp) ?? false;
+      
+      if (!target.stopped && !shouldAbort) {
+        this.scheduleFrame(key);
+      } else {
+        this.cancelFrame(key);
+      }
+    };
+  }
+
+  private cancelFrame(key: object) {
+    if (this.rafIds.has(key)) {
+      cancelAnimationFrame(this.rafIds.get(key)!);
+    }
+    this.rafIds.delete(key);
+  }
+}
 ```
 
 ---
@@ -427,11 +501,10 @@ export class LaserTrails implements Trail {
     private animationFrameHandler: AnimationFrameHandler,
     private app: App,
   ) {
-    // LaserTrails 自身也注册到动画帧
-    // 用于：每帧更新协作者轨迹
+    // LaserTrails 自身也注册到帧调度器
+    // 用途：每帧检查并更新所有协作者轨迹状态
     this.animationFrameHandler.register(this, this.onFrame.bind(this));
 
-    // 创建本地用户轨迹
     this.localTrail = new AnimatedTrail(animationFrameHandler, app, {
       ...this.getTrailOptions(),
       fill: () => DEFAULT_LASER_COLOR,
@@ -439,21 +512,20 @@ export class LaserTrails implements Trail {
   }
 
   onFrame() {
-    // 每帧都执行：检查并更新所有协作者轨迹
     this.updateCollabTrails();
   }
 
   private updateCollabTrails() {
-    // ── 快速路径：无协作者直接返回 ──────
+    // 快速路径：无协作者直接返回
     if (!this.container || this.app.state.collaborators.size === 0) {
       return;
     }
 
-    // ── 阶段1：遍历所有协作者 ────────────
+    // 阶段1：遍历所有协作者
     for (const [key, collaborator] of this.app.state.collaborators.entries()) {
       let trail!: AnimatedTrail;
 
-      // ── 阶段2：按需创建新轨迹实例 ──────
+      // 阶段2：按需创建新轨迹实例
       if (!this.collabTrails.has(key)) {
         trail = new AnimatedTrail(this.animationFrameHandler, this.app, {
           ...this.getTrailOptions(),
@@ -467,14 +539,14 @@ export class LaserTrails implements Trail {
         trail = this.collabTrails.get(key)!;
       }
 
-      // ── 阶段3：根据指针状态驱动轨迹 ────
+      // 阶段3：根据指针状态驱动轨迹
       if (collaborator.pointer && collaborator.pointer.tool === "laser") {
         // 按下：开始新路径
         if (collaborator.button === "down" && !trail.hasCurrentTrail) {
           trail.startPath(collaborator.pointer.x, collaborator.pointer.y);
         }
 
-        // 按下且已有路径：追加点（防重复）
+        // 按下且已有路径：追加点（去重保护）
         if (
           collaborator.button === "down" &&
           trail.hasCurrentTrail &&
@@ -491,7 +563,7 @@ export class LaserTrails implements Trail {
       }
     }
 
-    // ── 阶段4：清理离开的协作者 ──────────
+    // 阶段4：清理离开的协作者
     for (const key of this.collabTrails.keys()) {
       if (!this.app.state.collaborators.has(key)) {
         const trail = this.collabTrails.get(key)!;
@@ -503,58 +575,73 @@ export class LaserTrails implements Trail {
 }
 ```
 
-### 5.2 协作轨迹状态机
+### 5.2 协作轨迹生命周期状态机
+
+**证据来源：`laser-trails.ts` 条件分支分析**
 
 ```
-协作轨迹生命周期：
+协作者轨迹生命周期：
 
-collaborator 加入
+collaborator 加入 collaborators Map
     ↓
-创建 AnimatedTrail 实例 → 注册到 AnimationFrameHandler
+首次检测到 → 创建 AnimatedTrail 实例
     ↓
-[ 循环 ]
+    → 注入 AnimationFrameHandler
+    → 调用 trail.start(container) 启动帧循环
+    ↓
+[ 每帧循环检查 ]
     ├─ pointer.tool === laser
-    │   ├─ button down, no trail → startPath()
-    │   ├─ button down, has trail → addPointToPath() (去重)
-    │   └─ button up, has trail → endPath()
-    └─ 否则：忽略
+    │   ├─ button === down && !hasCurrentTrail
+    │   │   └─ startPath(x, y)
+    │   ├─ button === down && hasCurrentTrail && !hasLastPoint
+    │   │   └─ addPointToPath(x, y)  // 去重保护
+    │   └─ button === up && hasCurrentTrail
+    │       ├─ addPointToPath(x, y)  // 补充终点
+    │       └─ endPath()
+    └─ 其他工具：忽略，轨迹自然衰减消失
     ↓
-collaborator 离开
+collaborator 离开 collaborators Map
     ↓
-stop() 动画 + 从 Map 删除
+调用 trail.stop() → 停止帧循环
     ↓
-WeakMap 自动 GC 清理
+从 collabTrails Map 删除
+    ↓
+WeakMap 引用自动释放 → GC 清理
 ```
 
 ---
 
-## 六、关键差异对照表
+## 六、关键差异对照表（准确版）
 
 | 维度 | 手绘 (Freedraw) | 激光指针 (Laser) |
 |------|----------------|-----------------|
-| **底层库** | `perfect-freehand` 独立库 | `@excalidraw/laser-pointer` 专用包 |
-| **点简化** | `simplify(points, 0.75)` 大幅简化 | `simplify: 0` 不简化 |
-| **流线化** | `streamline: 0.5` | `streamline: 0.4` |
-| **大小映射** | 基于压力/速度的静态粗细 | `sizeMapping` 动态时间+位置衰减 |
-| **SVG 函数** | 本地实现：reduce + 逐点 Q 命令 | 共享 common 版本：Q + T 命令链 |
-| **渲染方式** | Canvas + Rough.js 手绘质感 | SVG path 直接填充 |
-| **计算时机** | 元素变更时计算一次，缓存结果 | 每帧全部重新计算（动态衰减） |
+| **底层库** | `perfect-freehand` npm 包 | `@excalidraw/laser-pointer` npm 包 |
+| **点简化策略** | `points-on-curve` 的 `simplify(points, 0.75)` | `simplify: 0` 无简化（明确传值） |
+| **流线化参数** | `streamline: 0.5`（明确传值） | `streamline: 0.4`（明确传值） |
+| **大小映射** | 静态：基于压力/速度一次性计算 | 动态：`sizeMapping` 每帧重算（时间+位置衰减） |
+| **SVG 路径函数** | 本地独立实现（shape.ts:1211） | 共享 common 版本（utils.ts:1103） |
+| **渲染方式** | Canvas + Rough.js 手绘质感 | SVG path 元素直接填充 |
+| **帧调度器** | ❌ 不使用 AnimationFrameHandler | ✅ 独占使用 |
+| **计算策略** | 计算一次 → ShapeCache 缓存 | 每帧全部重新计算 |
 | **持久化** | 保存为 ExcalidrawElement | 仅内存中，无状态 |
 | **协作处理** | 元素同步 + 增量更新 | 指针事件流 + 独立轨迹实例 |
-| **缓存策略** | ShapeCache 弱引用缓存 | 无缓存，每帧实时生成 |
-| **pressure 含义** | 真实/模拟笔压 0-1 | 存储 timestamp 用于衰减 |
+| **缓存机制** | ShapeCache 弱引用缓存 | 无缓存，每帧实时生成 |
+| **pressure 字段含义** | 真实/模拟笔压值 0-1 | 被复用存储 timestamp |
+| **easing 函数** | easeOutSine (Math.sin) | easeOut 二次函数 (t*(2-t)) |
 
 ---
 
 ## 七、代码引用位置速查表
 
-| 功能 | 文件位置 | 行号 |
-|------|---------|------|
-| perfect-freehand 手绘笔触生成 | `packages/element/src/shape.ts` | 1181-1200 |
-| 手绘本地 SVG 路径函数 | `packages/element/src/shape.ts` | 1211-1231 |
-| 共享 SVG 路径函数 | `packages/common/src/utils.ts` | 1103-1134 |
-| AnimatedTrail 基类 | `packages/excalidraw/animated-trail.ts` | 30-198 |
-| 激光衰减配置 | `packages/excalidraw/laser-trails.ts` | 31-50 |
-| LaserTrails 协作管理器 | `packages/excalidraw/laser-trails.ts` | 80-129 |
-| AnimationFrameHandler | `packages/excalidraw/animation-frame-handler.ts` | 8-79 |
-| points-on-curve simplify | `packages/element/src/shape.ts` | 688-691 |
+| 功能 | 文件位置 | 行号 | 可验证性 |
+|------|---------|------|---------|
+| perfect-freehand 手绘笔触生成 | `packages/element/src/shape.ts` | 1181-1200 | ✅ 仓库内源码 |
+| 手绘本地 SVG 路径函数 | `packages/element/src/shape.ts` | 1211-1231 | ✅ 仓库内源码 |
+| 共享 SVG 路径函数 | `packages/common/src/utils.ts` | 1103-1134 | ✅ 仓库内源码 |
+| AnimatedTrail 基类 | `packages/excalidraw/animated-trail.ts` | 30-198 | ✅ 仓库内源码 |
+| 激光衰减配置 | `packages/excalidraw/laser-trails.ts` | 31-50 | ✅ 仓库内源码 |
+| LaserTrails 协作管理器 | `packages/excalidraw/laser-trails.ts` | 80-129 | ✅ 仓库内源码 |
+| AnimationFrameHandler | `packages/excalidraw/animation-frame-handler.ts` | 8-79 | ✅ 仓库内源码 |
+| points-on-curve simplify | `packages/element/src/shape.ts` | 688-691 | ✅ 仓库内源码 |
+| ShapeCache 缓存机制 | `packages/element/src/shape.ts` | 81-163 | ✅ 仓库内源码 |
+| @excalidraw/laser-pointer 内部参数 | npm 包外部源码 | N/A | ❌ 仓库内不可见 |
