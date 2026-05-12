@@ -252,26 +252,43 @@ class FirebaseSceneVersionCache {
 
 ### 2.3 本地磁盘文件（导出/导入）
 
-#### 导出后端
+**重要说明**：本地磁盘文件流程**不通过** `FileManager` 抽象接口调用，是独立于「浏览器存储/云端存储」的第三条路径。它直接使用序列化/反序列化机制，属于「归档式存储」而非「运行时持久化存储」。
 
-通过 `@excalidraw/excalidraw/data/blob` 模块实现：
+#### 导出流程（独立序列化）
+
+通过 `@excalidraw/excalidraw/data/blob` 和 `@excalidraw/excalidraw/data/json` 模块实现：
 
 ```typescript
-// 序列化为 JSON
+// 1. 全量序列化为 JSON（绕过 FileManager）
 serializeAsJSON(elements, appState, files, "local");
+// 注：files 会被完整内嵌到 JSON 中，不做外部引用
 
-// 导出为 .excalidraw 文件
-exportToBlob(elements, appState, files, "application/json");
+// 2. 导出为 Blob/.excalidraw 文件
+exportToBlob({ elements, appState, files, type: "application/json" });
 ```
 
-#### 导入后端
+#### 导入流程（独立反序列化）
 
 ```typescript
-// 从 Blob 加载
-loadFromBlob(blob, null, null).then((data) => {
-  // 解析为标准的 ExcalidrawInitialDataState 结构
+// 1. 从 Blob 全量解析（绕过 FileManager）
+loadFromBlob(blob, localAppState, localElements).then((data) => {
+  // data 包含完整的 elements、appState 和 files
+  // 此时 files 已被解析到内存中，但尚未进入 IndexedDB
 });
+
+// 2. 导入完成后，图片元素才异步通过 FileManager 流程进入 IndexedDB
+// 见 loadImages 回调中的 excalidrawAPI.addFiles(loadedFiles)
 ```
+
+#### 与统一抽象的关系边界
+
+| 流程 | 是否通过 FileManager | 数据生命周期 |
+|------|---------------------|-------------|
+| 浏览器存储（IndexedDB/localStorage） | ✅ 是 | 运行时自动持久化 |
+| 云端存储（Firebase/分享链接） | ✅ 是 | 协作/分享时持久化 |
+| 本地磁盘文件（.excalidraw 导入导出） | ❌ 否 | 用户主动归档/恢复 |
+
+**导入后的二次持久化**：文件导入到内存后，图片文件在后续保存时才会通过 `LocalData.fileStorage.saveFiles` 进入 IndexedDB，此时才真正接入统一抽象。
 
 ---
 
