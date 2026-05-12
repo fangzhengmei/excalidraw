@@ -540,7 +540,252 @@ if (!event.shiftKey && isSomeElementSelected(elements, this.state)) {
 
 ---
 
-### 3.5 最终时序确认总结
+### 3.5 Ctrl/Cmd 分支路径的最小可复现反例（完整追踪）
+
+#### 实验设置
+
+**画布元素**:
+- 矩形 A（id: `"rect-a"`），位置: (100, 100)，尺寸: 50×50
+- 矩形 B（id: `"rect-b"`），位置: (200, 100)，尺寸: 50×50
+- 矩形 C（id: `"rect-c"`），位置: (300, 100)，尺寸: 50×50
+- **编组**: B 和 C 编为一组，组 ID: `"group-1"`
+
+**初始状态**:
+- `selectedElementIds = { "rect-a": true }` （只有 A 被选中）
+- `selectedGroupIds = {}` （无组选中）
+- 鼠标指针在 B 中心 (225, 125)
+
+**操作步骤**:
+1. 按住 **Ctrl** 键（保持按下状态）
+2. 按住鼠标左键（pointerDown 发生在 B 上）
+3. 向右拖动鼠标约 150px，使选择框刚好框住 **B 和 C**（框选范围: (200, 100) → (375, 175)）
+4. 保持 Ctrl 按下，松开鼠标左键（pointerUp）
+
+---
+
+#### 逐步骤追踪
+
+##### 🔴 阶段 1: pointerDown 事件
+```
+// 命中测试
+hit.element = B (rect-b)
+hit.allHitElements = [B]
+
+// Ctrl 状态
+withCmdOrCtrl = true  (pointerDown 时的状态快照)
+event.altKey = false  (不触发套索)
+
+// pointerDown 阶段的 Ctrl 组穿透
+this.setState({
+  selectedElementIds: { "rect-b": true },
+  editingGroupId: null,
+  selectedGroupIds: {},
+  previousSelectedElementIds: { "rect-a": true }
+})
+
+// ⚠️ 关键：返回 false，不阻止后续 pointerMove 流程
+return false
+```
+
+**pointerDown 结束时的状态**:
+- `selectedElementIds = { "rect-b": true }` （组穿透后只选中 B）
+- `withCmdOrCtrl = true` （状态快照已记录）
+- `hit.element = B` （命中元素记录）
+
+---
+
+##### 🟡 阶段 2: pointerMove 事件（拖动超过阈值）
+
+```
+boxSelection.hasOccurred = true
+进入框选分支
+```
+
+**子步骤 2.1: Ctrl 分支条件判断**（第 10477 行）
+```typescript
+if (!event.shiftKey && isSomeElementSelected(elements, this.state)) {
+  // ✅ !event.shiftKey = true
+  // ✅ isSomeElementSelected = true (B 已被 pointerDown 选中)
+  
+  if (pointerDownState.withCmdOrCtrl && pointerDownState.hit.element) {
+    // ✅ withCmdOrCtrl = true
+    // ✅ hit.element = B 存在
+    
+    // ⚠️ 第一次 setState
+    this.setState((prevState) =>
+      selectGroupsForSelectedElements(
+        {
+          ...prevState,
+          selectedElementIds: { "rect-b": true },  // 只保留 B
+        },
+        elements,
+        prevState,
+        this,
+      ),
+    );
+  }
+}
+```
+
+**第一次 setState 后的中间状态**:
+```
+// 传入 selectGroupsForSelectedElements:
+selectedElementIds = { "rect-b": true }
+
+// 组回写逻辑:
+B.groupIds = ["group-1"]
+→ 找到 B 的顶层组 "group-1"
+→ 回写组内所有成员
+
+// 第一次 setState 后的结果
+selectedElementIds = { "rect-b": true, "rect-c": true }  (组 B+C 都被选中)
+selectedGroupIds = { "group-1": true }
+editingGroupId = null
+```
+
+---
+
+**子步骤 2.2: 计算框选命中集合**（第 10499 行，总是执行！）
+```typescript
+const elementsWithinSelection = this.state.selectionElement
+  ? getElementsWithinSelection(...)
+  : [];
+```
+
+**框选计算过程**:
+- 选择框范围: (200, 100) → (375, 175)
+- 命中检测:
+  - B (200, 100, 50×50): ✅ 完全在选区内
+  - C (300, 100, 50×50): ✅ 完全在选区内
+  - A (100, 100, 50×50): ❌ 不在选区内
+
+**框选结果**:
+```
+elementsWithinSelection = [B, C]  (顺序按 z-index)
+```
+
+---
+
+**子步骤 2.3: 第二次 setState，构建最终结果**（第 10509 行）
+
+```typescript
+this.setState((prevState) => {
+  // ==============================================
+  // 步骤 A: 合并已有选择 + 框选元素
+  // ==============================================
+  const nextSelectedElementIds = {
+    // shouldReuseSelection = true  (未进入 else 分支)
+    ...(shouldReuseSelection && prevState.selectedElementIds),
+    // prevState.selectedElementIds = { "rect-b": true, "rect-c": true }  (来自第一次 setState)
+    
+    ...elementsWithinSelection.reduce((acc, element) => {
+      acc[element.id] = true;
+      return acc;
+    }, {}),
+    // 展开框选结果: { "rect-b": true, "rect-c": true }
+  };
+  
+  // 合并结果: { "rect-b": true, "rect-c": true }  (无变化)
+```
+
+---
+
+```typescript
+  // ==============================================
+  // 步骤 B: 命中元素增删互斥处理 （最终裁决者！）
+  // ==============================================
+  if (pointerDownState.hit.element) {
+    // pointerDownState.hit.element = B 存在
+    
+    if (!elementsWithinSelection.length) {
+      // 框选无结果：追加命中元素
+      nextSelectedElementIds[pointerDownState.hit.element.id] = true;
+    } else {
+      // ⚠️ 框选有结果：删除命中元素（起始点元素）！
+      delete nextSelectedElementIds["rect-b"];
+    }
+  }
+  
+  // 互斥处理后的集合:
+  // 删除 B 之前: { "rect-b": true, "rect-c": true }
+  // 删除 B 之后: { "rect-c": true }
+```
+
+---
+
+```typescript
+  // ==============================================
+  // 步骤 C: 第二次组回写（覆盖第一次结果！）
+  // ==============================================
+  return {
+    ...selectGroupsForSelectedElements(
+      {
+        editingGroupId: prevState.editingGroupId,  // = null
+        selectedElementIds: nextSelectedElementIds,  // = { "rect-c": true }
+      },
+      this.scene.getNonDeletedElements(),
+      prevState,
+      this,
+    ),
+    // ...其他字段
+  };
+});
+```
+
+**第二次组回写过程**:
+```
+输入: selectedElementIds = { "rect-c": true }
+     C.groupIds = ["group-1"]
+     → 找到顶层组 "group-1"
+     → 组内包含 B 和 C
+     → 回写组内所有成员
+
+最终回写结果:
+selectedElementIds = { "rect-b": true, "rect-c": true }  (B 又回来了！)
+selectedGroupIds = { "group-1": true }
+```
+
+---
+
+##### 🟢 阶段 3: pointerUp 事件
+```
+boxSelection.hasOccurred = true
+→ 保持第二次 setState 的结果
+→ 清除 selectionElement
+→ 提交历史记录
+```
+
+---
+
+#### 📊 完整状态变化追踪表
+
+| 阶段 | selectedElementIds | 说明 |
+|-----|---------------------|------|
+| **初始状态** | `{ A }` | 只有 A 被选中 |
+| **pointerDown 后** | `{ B }` | Ctrl 组穿透，只选中 B |
+| **第一次 setState 后** | `{ B, C }` | 组回写，B 的组 C 也被加入 |
+| **框选计算后** | `[B, C]` | elementsWithinSelection 结果 |
+| **互斥处理后** | `{ C }` | 框选有结果，删除起始点命中的 B |
+| **第二次组回写后** | `{ B, C }` | 🔄 组回写，C 的组 B 又被加回来了！ |
+| **最终结果** | `{ B, C }` | pointerUp 确认 |
+
+---
+
+#### 🎯 关键结论
+
+| 断言 | 结果 | 证据 |
+|-----|------|------|
+| Ctrl 分支绕过框选计算？ | ❌ 否 | elementsWithinSelection 总是被计算 |
+| 第一次 setState 是最终结果？ | ❌ 否 | 被第二次 setState 覆盖 |
+| 互斥逻辑删除 B 后就结束了？ | ❌ 否 | 第二次组回写把 B 又加回来了 |
+| `withCmdOrCtrl` 是实时按键？ | ❌ 否 | pointerDown 时的状态快照 |
+| Ctrl+单击 优先于框选？ | ❌ 否 | 框选结果经过组回写后覆盖了互斥删除 |
+
+**最反直觉的发现**: 即使命中元素增删逻辑删除了 B，第二次组回写会因为 C 仍被选中而把 B 重新加回来！最终 B、C 都被选中。
+
+---
+
+### 3.6 最终时序确认总结
 
 ```
 用户按下鼠标（pointerDown）
@@ -584,8 +829,11 @@ if (!event.shiftKey && isSomeElementSelected(elements, this.state)) {
 1. ✅ Ctrl 分支在 **pointerMove** 阶段触发，不是 pointerDown
 2. ✅ `withCmdOrCtrl` 是**状态快照**，不是实时按键
 3. ✅ 拖拽已选中元素优先级 **高于** Ctrl 分支
-4. ✅ Shift 键按下时 **完全跳过** Ctrl 分支
-5. ❌ "Ctrl/Cmd+单击优先" 是不成立的简化结论
+4. ✅ Shift 键按下时 **完全跳过** Ctrl 分支（外层 `!event.shiftKey` 条件）
+5. ✅ Ctrl 分支**不会绕过** `getElementsWithinSelection` 计算
+6. ✅ 两次 setState 机制：第一次被第二次**覆盖**
+7. ✅ 最终裁决者是**命中元素增删互斥逻辑**（第10521-10528行）
+8. ❌ "Ctrl/Cmd+单击优先" 是不成立的简化结论
 
 ---
 
