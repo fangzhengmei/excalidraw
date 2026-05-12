@@ -286,99 +286,249 @@ if (element.frameId && framesInSelection.has(element.frameId)) {
 
 ---
 
-## 3. 单击与框选的优先级机制
+## 3. 单击与拖拽分支的决策澄清
 
-### 3.1 决策流程 (`onPointerMoveFromPointerDownHandler`)
+### 3.1 三事件状态标志的时序拆解
 
-**位置**: `packages/excalidraw/components/App.tsx:10460-10563`
+**核心修正**: Ctrl/Cmd 分支**不仅在 pointerDown 触发**，在 pointerMove 阶段也有独立分支逻辑。三个事件的状态标志完全解耦：
+
+| 事件 | 状态标志 | 设置时机 | 语义 |
+|-----|---------|---------|-----|
+| **pointerDown** | `hit.element` | 命中测试后 | 指针按下时命中的元素 |
+| | `hit.wasAddedToSelection` | Ctrl分支中 | 该元素是否因Ctrl被加入选择 |
+| | `withCmdOrCtrl` | pointerDown初始化 | **状态快照**，记录按下时是否按Ctrl |
+| **pointerMove** | `boxSelection.hasOccurred` | 进入选择分支时 | 是否发生了框选拖动 |
+| | `selectedElementsAreBeingDragged` | 进入拖拽分支时 | 是否在拖拽已选中元素 |
+| **pointerUp** | （无新增） | - | 最终确认阶段 |
+
+---
+
+### 3.2 优先级重定义：PointerMove 阶段的 Ctrl 独立分支
+
+#### 3.2.1 PointerDown 阶段：组穿透的前置处理
+
+**位置**: `packages/excalidraw/components/App.tsx:8766-8794`
 
 ```typescript
-if (this.state.activeTool.type === "selection") {
-  pointerDownState.boxSelection.hasOccurred = true;
-  
-  // 步骤1: 确定是否复用已有选择
-  let shouldReuseSelection = true;
-  
-  if (!event.shiftKey && isSomeElementSelected(elements, this.state)) {
-    if (pointerDownState.withCmdOrCtrl && pointerDownState.hit.element) {
-      // Ctrl+单击: 只选中点击的元素
-      nextSelectedElementIds = {
-        [pointerDownState.hit.element!.id]: true,
-      };
-    } else {
-      // 普通单击: 清空之前选择
-      shouldReuseSelection = false;
-    }
+// == deep selection ==
+// on CMD/CTRL, drill down to hit element regardless of groups etc.
+if (event[KEYS.CTRL_OR_CMD]) {
+  if (event.altKey) {
+    this.lassoTrail.startPath(...);
+    this.setActiveTool({ type: "lasso", fromSelection: true });
+    return false;
   }
-  
-  // 步骤2: 获取选择框内元素
-  const elementsWithinSelection = this.state.selectionElement
-    ? getElementsWithinSelection(...)
-    : [];
-  
-  // 步骤3: 合并选择结果
-  const nextSelectedElementIds = {
-    ...(shouldReuseSelection && prevState.selectedElementIds),
-    ...elementsWithinSelection.reduce(...),
-  };
-  
-  // 步骤4: 单击命中元素与框选的互斥逻辑
-  if (pointerDownState.hit.element) {
-    if (!elementsWithinSelection.length) {
-      // 只有单击命中，没有框选: 选中单击元素
-      nextSelectedElementIds[pointerDownState.hit.element.id] = true;
-    } else {
-      // 既有框选又有单击: 移除单击命中元素
-      // (因为用户开始拖动选择框，起始点命中的元素不应被选中)
-      delete nextSelectedElementIds[pointerDownState.hit.element.id];
-    }
+  if (!this.state.selectedElementIds[hitElement.id]) {
+    pointerDownState.hit.wasAddedToSelection = true;
+  }
+  this.setState((prevState) => ({
+    ...editGroupForSelectedElement(prevState, hitElement),
+    previousSelectedElementIds: this.state.selectedElementIds,
+  }));
+  // ⚠️ 关键：返回 false 表示未完全处理，pointerMove 阶段会继续
+  return false;
+}
+```
+
+**pointerDown 的实际作用**:
+- ✅ 穿透组层级选中单个元素
+- ✅ 设置 `editingGroupId` 进入组编辑模式
+- ❌ **不阻止后续流程**：返回 `false` 允许 pointerMove 继续判断
+
+#### 3.2.2 PointerMove 阶段：Ctrl 分支独立触发（核心修正）
+
+**位置**: `packages/excalidraw/components/App.tsx:10477-10494`
+
+```typescript
+// 这段代码在 pointerMove 的框选分支内执行！
+if (!event.shiftKey && isSomeElementSelected(elements, this.state)) {
+  // ⚠️ withCmdOrCtrl 是 pointerDown 时的状态快照，不是当前按键状态！
+  if (pointerDownState.withCmdOrCtrl && pointerDownState.hit.element) {
+    // 独立分支：Ctrl+单击触发的特殊选择模式
+    // 只保留 pointerDown 命中的单个元素，清除所有其他选择
+    nextSelectedElementIds = {
+      [pointerDownState.hit.element!.id]: true,
+    };
+  } else {
+    // 普通框选: 清空之前选择
+    shouldReuseSelection = false;
   }
 }
 ```
 
-### 3.2 优先级判断关键条件
+**关键澄清**:
+1. **分支触发时机**: 这段代码在 `pointerMove` 的框选分支内执行，**不是** pointerDown
+2. **状态快照特性**: `withCmdOrCtrl` 记录的是 pointerDown 瞬间的按键状态，拖动过程中松开 Ctrl **不影响**此分支
+3. **不等于普通单击**: 这是 `pointerMove` 阶段的独立分支，不是 pointerDown 单击逻辑的延续
 
-| 条件组合 | 行为 |
-|---------|------|
-| **Shift + 框选** | 追加选择（保留原有选择） |
-| **Ctrl/Cmd + 单击** | 只选中单击元素，替换原有选择 |
-| **单击命中 + 无拖动** | 选中单击元素 |
-| **单击命中 + 有拖动（框选发生）** | 移除起始点命中元素，只保留框选结果 |
-| **框选范围为0** | 等同于单击操作 |
+---
 
-### 3.3 `pointerUp` 最终确认
+### 3.3 完整决策流程与优先级澄清
 
-**位置**: `packages/excalidraw/components/App.tsx:10655-10687`
+#### 真实优先级排序（修正后）
 
+| 优先级 | 分支 | 触发事件 | 行为特征 |
+|-------|-----|---------|---------|
+| **1** | **Ctrl+Alt 套索** | pointerDown | 切换工具，完全接管后续流程 |
+| **2** | **拖拽已选中元素** | pointerMove | 平移拖拽，选中集合不变 |
+| **3** | **Ctrl+拖动命中元素** | pointerMove | 特殊分支：只保留单个命中元素 |
+| **4** | **Shift+框选（追加）** | pointerMove | 保留原有选择，追加新元素 |
+| **5** | **普通框选** | pointerMove | 清空原有选择，重选框内元素 |
+
+#### 优先级分支的代码证据
+
+**分支2（拖拽已选中元素）优先于框选**：
 ```typescript
+// packages/excalidraw/components/App.tsx:10130-10175
+// 在 pointerMove 中，先判断是否应该拖拽已选中元素
 if (
-  this.state.activeTool.type === "selection" &&
-  !pointerDownState.boxSelection.hasOccurred &&  // 关键: 没有发生框选
-  !pointerDownState.resize.isResizing &&
-  !hitElements.some((el) => this.state.selectedElementIds[el.id])
+  !event.shiftKey &&
+  this.scene.shouldDraggingSelectedElements(event, pointerDownState)
 ) {
-  // 纯单击操作: 处理锁定元素、高亮等状态
+  // 进入拖拽模式，直接调用 dragSelectedElements
+  // 清除 selectionElement，设置 selectedElementsAreBeingDragged
+  // 跳过后续框选逻辑
+  return;
 }
 ```
 
-### 3.4 状态标志位说明
-
+**分支3（Ctrl+拖动命中元素）独立于框选**：
 ```typescript
-interface PointerDownState {
-  boxSelection: {
-    hasOccurred: boolean;  // 核心标志: 是否真正发生了框选拖动
-  };
-  
-  hit: {
-    element: ExcalidrawElement | null;  // pointerDown时命中的元素
-    allHitElements: ExcalidrawElement[]; // 所有命中元素
-  };
-  
-  drag: {
-    hasOccurred: boolean;  // 是否发生了拖动
+// 只有按下 Ctrl 且有命中元素时才触发
+// 触发后直接设置 nextSelectedElementIds，绕过 getElementsWithinSelection
+if (pointerDownState.withCmdOrCtrl && pointerDownState.hit.element) {
+  nextSelectedElementIds = {
+    [pointerDownState.hit.element!.id]: true,  // 只保留单个元素
   };
 }
 ```
+
+---
+
+### 3.4 三个反例：为什么"Ctrl/Cmd+单击优先"是错误结论
+
+#### 反例1：按下 Ctrl 拖动已选中的组元素
+
+**操作步骤**:
+1. 创建矩形 A 和矩形 B，编为一组
+2. 框选整个组（A、B 都被选中）
+3. 按住 Ctrl，鼠标放到 A 上，按住左键拖动
+
+**错误预测**（Ctrl+单击优先）:
+- Ctrl 穿透组，单独选中 A
+- 拖动时只移动 A
+
+**实际行为**:
+1. ✅ pointerDown: Ctrl 生效，A 被单独选中，B 取消选中
+2. ✅ pointerMove: 检测到 A 已选中 → 进入**拖拽分支**（优先级2）
+3. ❌ **没有触发 Ctrl 分支**（优先级3），因为拖拽分支优先级更高
+4. ✅ 最终：只移动 A，B 留在原地
+
+**结论**: 拖拽已选中元素（优先级2）比 Ctrl 分支（优先级3）优先级更高
+
+---
+
+#### 反例2：先按 Ctrl，拖动过程中松开 Ctrl
+
+**操作步骤**:
+1. 画布上有元素 A、B、C（均未选中）
+2. 按住 Ctrl，鼠标点击空白处开始拖动（框选）
+3. 拖动过程中保持左键按下，松开 Ctrl
+4. 继续拖动直到框住 A、B
+
+**错误预测**（Ctrl+单击优先）:
+- 松开 Ctrl 后应该切换到普通框选模式
+
+**实际行为**:
+1. ✅ pointerDown: 空白处点击，`hit.element = null`
+2. ✅ pointerMove: 超过拖动阈值，进入框选分支
+3. ✅ `withCmdOrCtrl = true`（pointerDown 时的状态快照）
+4. ❌ **但由于 hit.element 为空，不触发 Ctrl 分支条件**
+5. ✅ 执行普通框选逻辑，A、B 同时被选中
+6. ✅ 松开 Ctrl 对结果**完全无影响**
+
+**结论**: `withCmdOrCtrl` 是状态快照，只在 pointerDown 时记录；拖动过程中按键变化不影响已进入的分支
+
+---
+
+#### 反例3：Ctrl + Shift 组合键的优先级冲突
+
+**操作步骤**:
+1. 元素 A 已选中
+2. 同时按住 Ctrl + Shift
+3. 鼠标点击元素 B 并拖动一小段距离（框选）
+
+**错误预测**（Ctrl+单击优先）:
+- Ctrl 穿透，只选中 B
+
+**实际行为**:
+1. ✅ pointerDown: `hit.element = B`，`withCmdOrCtrl = true`，`event.shiftKey = true`
+2. ✅ pointerMove: 进入框选分支
+3. ⚠️ **关键判断**: `if (!event.shiftKey && ...)` —— Shift 为 true，**不进入内层判断**
+4. ❌ **Ctrl 分支完全被跳过**！因为外层条件要求 `!event.shiftKey`
+5. ✅ 最终：Shift 追加模式生效，A、B 同时被选中
+
+**代码证据**:
+```typescript
+// 外层条件：Shift 按下时直接跳过 Ctrl 分支！
+if (!event.shiftKey && isSomeElementSelected(elements, this.state)) {
+  // Ctrl 分支只在这个 if 块内
+  if (pointerDownState.withCmdOrCtrl && pointerDownState.hit.element) {
+    // ... 永远不会执行，因为 shiftKey = true
+  }
+}
+```
+
+**结论**: Shift 键的优先级**高于** Ctrl 键，同时按下时 Ctrl 分支完全不执行
+
+---
+
+### 3.5 最终时序确认总结
+
+```
+用户按下鼠标（pointerDown）
+    ↓
+┌─────────────────────────────────────────────────────┐
+│  1. 命中测试 → hit.element                           │
+│  2. Ctrl+Alt → 套索工具（终止流程）                  │
+│  3. Ctrl → 组穿透选中单个元素（但不终止流程）       │
+│  4. 记录 withCmdOrCtrl = true/false 状态快照        │
+└─────────────────────────────────────────────────────┘
+    ↓（拖动超过阈值 pointerMove）
+┌─────────────────────────────────────────────────────┐
+│  1. 已选中元素且未按Shift？                          │
+│     ├─ 是 → 拖拽分支（优先级2）→ 结束               │
+│     └─ 否 → 进入框选分支                             │
+│              设置 boxSelection.hasOccurred = true   │
+│              创建 selectionElement                   │
+│     ↓                                               │
+│  2. 未按 Shift 且已有选中？                          │
+│     ├─ 是 + withCmdOrCtrl + 有命中元素 → Ctrl 分支  │
+│     │                  只保留单个命中元素            │
+│     ├─ 是 + 其他 → shouldReuseSelection = false     │
+│     │                清空原有选择                    │
+│     └─ 否 → 保留原有选择（追加模式）                 │
+│     ↓                                               │
+│  3. 调用 getElementsWithinSelection()               │
+│  4. 二次互斥处理：框选有结果则删除起始命中元素       │
+│  5. selectGroupsForSelectedElements() 组回写        │
+└─────────────────────────────────────────────────────┘
+    ↓（松开鼠标 pointerUp）
+┌─────────────────────────────────────────────────────┐
+│  1. boxSelection.hasOccurred ?                      │
+│     ├─ true → 保持框选结果                          │
+│     └─ false → 纯单击，处理锁定/高亮等               │
+│  2. 清除 selectionElement                           │
+│  3. 提交历史记录                                    │
+└─────────────────────────────────────────────────────┘
+```
+
+**核心修正点总结**:
+1. ✅ Ctrl 分支在 **pointerMove** 阶段触发，不是 pointerDown
+2. ✅ `withCmdOrCtrl` 是**状态快照**，不是实时按键
+3. ✅ 拖拽已选中元素优先级 **高于** Ctrl 分支
+4. ✅ Shift 键按下时 **完全跳过** Ctrl 分支
+5. ❌ "Ctrl/Cmd+单击优先" 是不成立的简化结论
 
 ---
 
