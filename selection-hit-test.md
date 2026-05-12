@@ -392,16 +392,73 @@ if (
 }
 ```
 
-**分支3（Ctrl+拖动命中元素）独立于框选**：
+**分支3（Ctrl+拖动命中元素）的真实执行顺序**：
+
+⚠️ **之前描述不准确**：Ctrl 分支**不会绕过** `getElementsWithinSelection`，真实执行顺序是：
+
 ```typescript
-// 只有按下 Ctrl 且有命中元素时才触发
-// 触发后直接设置 nextSelectedElementIds，绕过 getElementsWithinSelection
-if (pointerDownState.withCmdOrCtrl && pointerDownState.hit.element) {
-  nextSelectedElementIds = {
-    [pointerDownState.hit.element!.id]: true,  // 只保留单个元素
-  };
+// 第1步：条件判断（第10477行）
+if (!event.shiftKey && isSomeElementSelected(elements, this.state)) {
+  if (pointerDownState.withCmdOrCtrl && pointerDownState.hit.element) {
+    // ⚠️ 第一次 setState：立即设置只包含命中元素
+    // ✅ 立即调用 selectGroupsForSelectedElements 组回写
+    this.setState((prevState) =>
+      selectGroupsForSelectedElements(
+        {
+          ...prevState,
+          selectedElementIds: {
+            [pointerDownState.hit.element!.id]: true,  // 只保留命中元素
+          },
+        },
+        this.scene.getNonDeletedElements(),
+        prevState,
+        this,
+      ),
+    );
+  } else {
+    shouldReuseSelection = false;
+  }
 }
+
+// 第2步：计算框选元素（第10499行）
+// ⚠️ 这行代码总是执行，即使 Ctrl 分支已触发！
+const elementsWithinSelection = this.state.selectionElement
+  ? getElementsWithinSelection(...)
+  : [];
+
+// 第3步：第二次 setState，构建最终结果（第10509行）
+this.setState((prevState) => {
+  // 合并已有选择 + 框选元素
+  const nextSelectedElementIds = {
+    ...(shouldReuseSelection && prevState.selectedElementIds),
+    ...elementsWithinSelection.reduce(...),
+  };
+
+  // 命中元素增删互斥处理
+  if (pointerDownState.hit.element) {
+    if (!elementsWithinSelection.length) {
+      // 框选无结果：追加命中元素
+      nextSelectedElementIds[pointerDownState.hit.element.id] = true;
+    } else {
+      // 框选有结果：删除命中元素（起始点元素）
+      delete nextSelectedElementIds[pointerDownState.hit.element.id];
+    }
+  }
+
+  // ⚠️ 第二次组回写：覆盖第一次的结果！
+  return {
+    ...selectGroupsForSelectedElements(...),  // 再次组回写
+    // ...其他字段
+  };
+});
 ```
+
+**关键修正**:
+1. ❌ **错误认知**: Ctrl 分支直接设置 nextSelectedElementIds，绕过框选计算
+2. ✅ **实际机制**: Ctrl 分支触发**第一次** setState 立即设置单个元素，但**不会 return 退出**
+3. ✅ 框选计算 `getElementsWithinSelection` **总是在之后执行**
+4. ✅ **第二次** setState 构建最终结果，会**覆盖**第一次的设置
+5. ✅ 命中元素的增删互斥逻辑**在第二次 setState 中执行**
 
 ---
 
