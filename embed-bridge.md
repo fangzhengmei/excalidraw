@@ -284,25 +284,177 @@ type OnStateChange = {
 ```
 
 **使用示例**：
+
+---
+
+## 🚨 常见错误修正指南
+
+### 错误 1: selectedElementIds 类型误用
+
+#### ❌ 错误写法（把对象当成 Set 用）
+```typescript
+// 错误原因：selectedElementIds 是普通对象，不是 Set
+// types.ts:416 - selectedElementIds: Readonly<{ [id: string]: true }>
+api.onStateChange(
+  (state) => state.selectedElementIds,
+  (selectedIds, state) => {
+    console.log("Selected count:", selectedIds.size);      // ❌ undefined！没有 size 属性
+    selectedIds.forEach((id) => console.log(id));           // ❌ 报错！没有 forEach 方法
+    selectedIds.has("element-id");                          // ❌ 报错！没有 has 方法
+  },
+);
+```
+
+#### ✅ 正确写法（按真实对象结构操作）
+```typescript
+api.onStateChange(
+  (state) => state.selectedElementIds,
+  (selectedIds, state) => {
+    // ✅ 获取选中数量
+    const count = Object.keys(selectedIds).length;
+    console.log("Selected count:", count);
+
+    // ✅ 遍历选中的 ID
+    Object.keys(selectedIds).forEach((id) => {
+      console.log("Selected element ID:", id);
+    });
+
+    // ✅ 判断某个元素是否被选中
+    const isSelected = selectedIds["some-element-id"] === true;
+    console.log("Is selected:", isSelected);
+
+    // ✅ 获取实际的元素对象
+    const allElements = api.getSceneElements();
+    const selectedElements = allElements.filter(
+      (element) => selectedIds[element.id] === true
+    );
+    console.log("Selected elements:", selectedElements);
+  },
+);
+```
+
+#### 💡 改前改后差异
+| 操作 | 错误写法（Set 假设） | 正确写法（真实对象） | 行为差异 |
+|------|---------------------|---------------------|---------|
+| 获取数量 | `selectedIds.size` | `Object.keys(selectedIds).length` | 错误写法返回 `undefined`，导致后续计算出错 |
+| 遍历 | `selectedIds.forEach()` | `Object.keys(selectedIds).forEach()` | 错误写法直接抛出 `TypeError`，导致崩溃 |
+| 判断存在 | `selectedIds.has(id)` | `selectedIds[id] === true` | 错误写法直接抛出 `TypeError` |
+
+---
+
+### 错误 2: 多属性订阅回调语义误解
+
+#### ❌ 错误写法（以为是前后状态对比）
+```typescript
+// 错误原因：两个参数都是当前状态，不是 prevState 和 nextState
+// AppStateObserver.ts:154 - stateChangeCallback(getValue(state), state)
+api.onStateChange(
+  ["selectedElementIds", "theme"],
+  (prevState, nextState) => {                       // ❌ 参数命名误导！
+    const prevCount = Object.keys(prevState.selectedElementIds).length;
+    const nextCount = Object.keys(nextState.selectedElementIds).length;
+    console.log("Changed from", prevCount, "to", nextCount);  // ❌ 永远相同！
+  },
+);
+```
+
+#### ✅ 正确写法（理解两个参数都是当前状态）
+```typescript
+api.onStateChange(
+  ["selectedElementIds", "theme"],
+  (currentState, appState) => {
+    // ✅ 理解：currentState === appState，两者完全相同，都是最新状态
+    console.assert(currentState === appState, "两个参数应该相同");
+
+    // ✅ 如果需要对比，自己保存前一次状态
+    const selectedCount = Object.keys(currentState.selectedElementIds).length;
+    console.log("当前选中数量:", selectedCount);
+    console.log("当前主题:", currentState.theme);
+  },
+);
+```
+
+#### 💡 改前改后差异
+| 场景 | 错误理解 | 正确理解 | 实际行为 |
+|------|---------|---------|---------|
+| 参数含义 | `(prevState, nextState)` | `(currentState, appState)` | 两个参数是同一个对象引用 |
+| 对比变化 | 以为能直接对比 | 需要外部自己保存 | `prevState.selectedElementIds === nextState.selectedElementIds` 永远为 true |
+| 典型坑 | 计算 delta 变化量 | 直接使用当前值 | 错误写法的"变化量"永远为 0 |
+
+---
+
+## ✅ 完整可运行示例
+
+### 示例 1: 订阅单个属性
 ```typescript
 // 订阅主题变化
 api.onStateChange("theme", (theme, state) => {
   console.log("Theme changed to:", theme);
 });
+```
 
+### 示例 2: 订阅多个属性（正确理解参数）
+```typescript
+api.onStateChange(
+  ["selectedElementIds", "activeTool"],
+  (currentState, appState) => {
+    // 两个参数完全相同，都是最新状态
+    const selectedCount = Object.keys(currentState.selectedElementIds).length;
+    console.log(`选中 ${selectedCount} 个元素，工具: ${currentState.activeTool.type}`);
+  },
+);
+```
+
+### 示例 3: Promise 形式等待条件
+```typescript
 // 等待侧边栏打开
 await api.onStateChange({
   predicate: (state) => state.openSidebar !== null,
 });
+console.log("Sidebar is now open!");
+```
 
-// 订阅选中元素变化
+### 示例 4: 选择器函数形式 + 完整操作
+```typescript
+// 只关心选中 ID 列表
 api.onStateChange(
-  (state) => state.selectedElementIds,
-  (selectedIds, state) => {
-    console.log("Selected elements:", selectedIds.size);
+  (state) => Object.keys(state.selectedElementIds),  // 选择器返回处理后的值
+  (selectedIdList, state) => {
+    console.log("Selected IDs:", selectedIdList);    // 直接得到数组
+    console.log("Count:", selectedIdList.length);
   },
 );
 ```
+
+### 示例 5: 需要对比变化时自己保存
+```typescript
+let prevSelectedIds: string[] = [];
+
+api.onStateChange(
+  (state) => Object.keys(state.selectedElementIds),
+  (currentIds, state) => {
+    // 自己对比变化
+    const added = currentIds.filter((id) => !prevSelectedIds.includes(id));
+    const removed = prevSelectedIds.filter((id) => !currentIds.includes(id));
+
+    if (added.length > 0) console.log("Added:", added);
+    if (removed.length > 0) console.log("Removed:", removed);
+
+    // 更新前一次状态
+    prevSelectedIds = currentIds;
+  },
+);
+```
+
+---
+
+> **源码依据**：
+> - `packages/excalidraw/types.ts:416` - `selectedElementIds: Readonly<{ [id: string]: true }>`
+> - `packages/excalidraw/components/AppStateObserver.ts:154` - `stateChangeCallback(getValue(state), state)`
+>
+> **总结**：
+> 1. `selectedElementIds` 是纯对象，永远用 `Object.keys()` 处理
+> 2. 多属性订阅的两个参数相同，对比请外部自己保存状态
 
 ---
 
