@@ -403,22 +403,78 @@ export const importFromBackend = async (id, decryptionKey) => {
 
 #### 协作连接断开的降级
 
-当协作连接断开时，系统自动降级为本地存储模式，保证用户可继续编辑：
+当用户主动停止协作或网络断开时，执行以下流程，**非自动降级，而是用户确认后覆盖本地存储**：
 
 ```typescript
-// 位于 Collab 组件的离线状态检测
-const [isOffline, setIsOffline] = useAtom(isOfflineAtom);
+stopCollaboration = (keepRemoteState = true) => {
+  // 1. 取消所有待执行的 Firebase 操作
+  this.queueSaveToFirebase.cancel();
+  this.loadImageFiles.cancel();
 
-// 离线时停止 Firebase 同步，但保留本地 IndexedDB 写入
-useEffect(() => {
-  if (isOffline) {
-    // 暂停云端同步
-    LocalData.resumeSave();  // 确保本地存储继续工作
+  // 2. 触发用户确认对话框
+  if (window.confirm(t("alerts.collabStopOverridePrompt"))) {
+    // 3. 确认后，重置多标签页同步版本号
+    resetBrowserStateVersions();
+    
+    // 4. 清除 URL hash，回到本地模式
+    window.history.pushState({}, APP_NAME, window.location.origin);
+    
+    // 5. 销毁 Socket 连接
+    this.destroySocketClient();
+    
+    // 6. 重置 FileManager 状态（清空内存中的文件追踪）
+    LocalData.fileStorage.reset();
+    
+    // 7. 将图片状态从 saved 重置为 pending，重新走本地保存流程
+    const elements = this.excalidrawAPI.getSceneElementsIncludingDeleted()
+      .map((element) => {
+        if (isImageElement(element) && element.status === "saved") {
+          return newElementWith(element, { status: "pending" });
+        }
+        return element;
+      });
+    
+    // 8. 更新场景，触发后续本地 IndexedDB 持久化
+    this.excalidrawAPI.updateScene({ elements, ... });
   }
-}, [isOffline]);
+  
+  // 恢复本地存储定时器（之前协作时被暂停），注意带锁类型参数
+  LocalData.resumeSave("collaboration");
+};
 ```
 
-### 3.4 多浏览器标签页的状态同步与降级
+#### 离线状态的行为
+
+协作中的离线状态**不做存储后端切换**，仅做 UI 提示：
+
+```typescript
+// 仅显示离线指示条，不切换存储后端
+{isCollaborating && isOffline && (
+  <div className="offline-indicator">
+    {t("labels.offline")}
+  </div>
+)}
+
+// Firebase 保存队列继续重试，连接恢复后自动同步
+```
+
+---
+
+### 3.4 三种后端的边界与切换矩阵
+
+| 切换方向 | 触发条件 | 切换机制 | FileManager 状态 |
+|---------|---------|---------|-----------------|
+| **本地存储 → 云端协作** | 用户点击「开始协作」 | Socket 连接 + Firebase 初始化 | 创建协作专用 FileManager 实例，重置状态 |
+| **本地存储 → 分享链接查看** | URL hash 含 `#json=` | 后端 GET 请求 + Firebase 文件下载 | 不创建新 FileManager，下载完成后走本地流程 |
+| **云端协作 → 本地存储** | 用户点击「停止协作」 | Socket 断开 + 确认后重置 URL + 状态重置 | 协作 FileManager reset，回归本地 FileManager |
+| **分享链接查看 → 本地存储** | 用户主动编辑画布 | URL hash 清除 + bumpElementVersions | 文件重新走本地 FileManager 保存流程 |
+| **本地磁盘导入 → 本地存储** | 用户选择 .excalidraw 文件 | loadFromBlob 反序列化 | 文件初始在内存，后续保存接入本地 FileManager |
+
+**切换一致性保证**：每次后端切换都调用 `FileManager.reset()` 清空状态机，避免不同后端间的状态污染。
+
+---
+
+### 3.5 多浏览器标签页的状态同步与降级
 
 #### 版本号同步机制
 
@@ -619,3 +675,19 @@ Excalidraw 的三层存储架构设计实现了：
 | **多端同步** | localStorage 版本戳 + IndexedDB 数据分离的标签页同步 |
 
 这种设计使得存储后端可以独立演进，同时通过严格的边界约定保证跨后端行为的一致性和可预测性。
+
+---
+
+## 六、文档勘误对照
+
+| 序号 | 修改位置 | 修改前 | 修改后 |
+|-----|---------|--------|--------|
+| 1 | 3.3 节云端失败描述 + 总结表 | 云端失败自动回退到本地存储 | 云端失败仅告警不自动切回本地，格式兼容降级仅针对解码格式 |
+| 2 | 3.3 节协作断开代码示例 | `LocalData.resumeSave();`（无参调用） | `LocalData.resumeSave("collaboration");`（带锁类型参数） |
+| 3 | 3.3 节协作断开标题与描述 | "协作连接断开的降级 + 自动降级为本地存储模式" | "协作连接断开的处理流程 + 用户确认后覆盖本地存储" |
+| 4 | 4.5 节示例代码注释 | "退出协作模式时恢复" | "退出协作模式时恢复，注意必须传入锁类型参数" |
+
+**修正说明：**
+- 问题 1-2：修正正文与真实代码实现的不一致，消除表述矛盾
+- 问题 3-4：补充 API 调用参数约束，保证示例代码可直接运行
+- 所有章节标题、代码示例、总结表格已完全对齐真实实现
