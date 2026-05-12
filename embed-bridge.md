@@ -1,70 +1,94 @@
 # Excalidraw 嵌入桥接机制 (Embed Bridge)
 
-本文档描述 Excalidraw 画板如何嵌入到第三方网页中，宿主如何通过 API 注入命令、监听内部状态变化，以及如何拦截或扩展默认行为。
+本文档基于源码真实实现，描述 Excalidraw 画板如何嵌入到第三方网页中，宿主应用可用的 API、内部事件外发机制、以及外部命令注入方式。
 
 ---
 
-## 1. API 暴露面 (API Surface)
+## 一、宿主可用的 API 暴露面 (API Surface)
 
-Excalidraw 提供两层 API 供宿主应用集成：声明式 Props 和命令式 Imperative API。
+### 1.1 声明式配置 Props (ExcalidrawProps)
 
-### 1.1 声明式 Props (ExcalidrawProps)
-
-通过 React Props 配置组件行为和订阅事件：
+通过 React Props 配置编辑器行为和订阅事件：
 
 ```typescript
 interface ExcalidrawProps {
-  // 场景变化回调 - 元素、状态、文件变化时触发
+  // ========== 数据初始化 ==========
+  initialData?: ExcalidrawInitialDataState | null;
+  libraryItems?: LibraryItem[] | null;
+
+  // ========== 状态回调 ==========
   onChange?: (
     elements: readonly OrderedExcalidrawElement[],
     appState: AppState,
-    files: BinaryFiles
+    files: BinaryFiles,
   ) => void;
 
-  // 增量更新回调 - 细粒度状态变更
   onIncrement?: (event: DurableIncrement | EphemeralIncrement) => void;
 
-  // API 就绪回调 - 编辑器挂载前触发
   onExcalidrawAPI?: (api: ExcalidrawImperativeAPI | null) => void;
 
-  // 编辑器挂载完成回调
-  onMount?: (payload: ExcalidrawMountPayload) => void;
-
-  // 编辑器卸载回调
-  onUnmount?: () => void;
-
-  // 场景初始化完成回调
   onInitialize?: (api: ExcalidrawImperativeAPI) => void;
 
-  // 指针更新回调
+  onMount?: (payload: {
+    excalidrawAPI: ExcalidrawImperativeAPI;
+    container: HTMLDivElement | null;
+  }) => void;
+
+  onUnmount?: () => void;
+
+  // ========== 交互事件 ==========
   onPointerUpdate?: (payload: {
     pointer: { x: number; y: number; tool: "pointer" | "laser" };
     button: "down" | "up";
     pointersMap: Gesture["pointers"];
   }) => void;
 
-  // 粘贴事件拦截
-  onPaste?: (
-    data: ClipboardData,
-    event: ClipboardEvent | null
-  ) => Promise<boolean> | boolean;
-
-  // 嵌入 URL 验证
-  validateEmbeddable?: 
-    | boolean 
-    | string[] 
-    | RegExp 
+  // ========== 嵌入内容 ==========
+  validateEmbeddable?:
+    | boolean
+    | string[]
+    | RegExp
     | ((link: string) => boolean | undefined);
 
-  // 自定义嵌入元素渲染
   renderEmbeddable?: (
     element: NonDeleted<ExcalidrawEmbeddableElement>,
-    appState: AppState
+    appState: AppState,
   ) => JSX.Element | null;
 
-  // 导出进度回调
+  // ========== 粘贴拦截 ==========
+  onPaste?: (
+    data: ClipboardData,
+    event: ClipboardEvent | null,
+  ) => Promise<boolean> | boolean;
+
+  // ========== 导出控制 ==========
   onExport?: (exportOpts: ExportOpts) => void;
   onExportProgress?: (status: OnExportProgress) => void;
+
+  // ========== UI 控制 ==========
+  viewModeEnabled?: boolean;
+  zenModeEnabled?: boolean;
+  gridModeEnabled?: boolean;
+  theme?: Theme;
+  name?: string;
+  UIOptions?: UIOptions;
+  langCode?: Language["code"];
+  renderCustomStats?: (
+    elements: readonly NonDeletedExcalidrawElement[],
+    appState: AppState,
+  ) => React.ReactNode;
+
+  // ========== 协作 ==========
+  isCollaborating?: boolean;
+  onPointerDownOnElement?: OnPointerDownOnElementPayload;
+  onUserFollow?: OnUserFollowedPayload;
+
+  // ========== 其他 ==========
+  detectScroll?: boolean;
+  handleKeyboardGlobally?: boolean;
+  autoFocus?: boolean;
+  generateDiagramToCode?: GenerateDiagramToCode;
+  getFormFactor?: (editorWidth: number, editorHeight: number) => FormFactor;
 }
 ```
 
@@ -74,134 +98,309 @@ interface ExcalidrawProps {
 
 ```typescript
 interface ExcalidrawImperativeAPI {
-  // 核心场景操作
-  updateScene: (opts: {
+  // ========== 核心标记 ==========
+  isDestroyed: boolean;
+  id: string;
+
+  // ========== 场景操作 ==========
+  updateScene(opts: {
     elements?: readonly ExcalidrawElement[];
     appState?: DeepPartial<AppState>;
     captureUpdate?: CaptureUpdateActionType;
-  }) => void;
+  }): void;
 
-  // 应用状态管理
-  setAppState: (appState: DeepPartial<AppState>) => void;
+  applyDeltas(
+    elements: readonly ExcalidrawElement[],
+    deltas: readonly ElementsMapOrArray,
+    {
+      mergeIntoAppState,
+      captureUpdate,
+    }?: {
+      mergeIntoAppState?: boolean;
+      captureUpdate?: CaptureUpdateActionType;
+    },
+  ): void;
 
-  // 元素操作
-  addFiles: (files: Array<File | HTMLImageElement | Blob>) => Promise<BinaryFiles>;
-  getSceneElementsIncludingDeleted: () => readonly ExcalidrawElement[];
-  getSceneElements: () => readonly NonDeletedExcalidrawElement[];
-  getSelectedElements: () => readonly NonDeletedExcalidrawElement[];
+  mutateElement<T extends Mutable<ExcalidrawElement>>(
+    element: T,
+    updates: Partial<Omit<T, keyof ExcalidrawElement>> & Partial<ExcalidrawElement>,
+    options?: {
+      regenerateIds?: boolean;
+      preservePrototype?: boolean;
+      captureUpdate?: CaptureUpdateActionType;
+    },
+  ): T;
 
-  // 历史操作
+  resetScene(opts?: {
+    resetLoadingState?: boolean;
+    preserveSession?: boolean;
+  }): void;
+
+  // ========== 历史操作 ==========
   history: {
     clear: () => void;
   };
 
-  // 重置画布
-  resetScene: (opts?: {
-    resetLoadingState?: boolean;
-    preserveSession?: boolean;
-  }) => void;
+  // ========== 数据读取 ==========
+  getSceneElements(): readonly NonDeletedExcalidrawElement[];
+  getSceneElementsIncludingDeleted(): readonly ExcalidrawElement[];
+  getSceneElementsMapIncludingDeleted(): Map<string, ExcalidrawElement>;
+  getAppState(): AppState;
+  getFiles(): BinaryFiles;
+  getName(): string;
 
-  // 刷新尺寸
-  refresh: () => void;
+  // ========== 文件操作 ==========
+  addFiles(data: BinaryFileData[]): void;
 
-  // 事件订阅
+  // ========== 视图操作 ==========
+  scrollToContent(opts?: {
+    fitToContent?: boolean;
+    animate?: boolean;
+    elements?: readonly ExcalidrawElement[];
+    scale?: number;
+  }): void;
+
+  refresh(): void;
+
+  // ========== 工具操作 ==========
+  setActiveTool(
+    nextActiveTool:
+      | AppState["activeTool"]["type"]
+      | {
+          type: AppState["activeTool"]["type"];
+          lastActiveTool?: AppState["activeTool"]["lastActiveTool"];
+          customType?: string;
+          locked?: boolean;
+        },
+  ): void;
+
+  // ========== UI 控制 ==========
+  setToast(toast: Toast | null): void;
+  toggleSidebar(
+    name: SidebarName,
+    options?: { tab?: SidebarTabName; force?: boolean },
+  ): void;
+  setCursor(cursor: string): void;
+  resetCursor(): void;
+  updateFrameRendering(enabled: boolean): void;
+
+  // ========== 扩展 ==========
+  registerAction(action: Action): void;
+  updateLibrary(libraryItems: LibraryItems): Promise<void>;
+  getEditorInterface(): EditorInterface;
+
+  // ========== 事件订阅 ==========
+  onChange(
+    callback: (
+      elements: readonly ExcalidrawElement[],
+      appState: AppState,
+      files: BinaryFiles,
+    ) => void,
+  ): UnsubscribeCallback;
+
+  onIncrement(
+    callback: (event: DurableIncrement | EphemeralIncrement) => void,
+  ): UnsubscribeCallback;
+
+  onPointerDown(
+    callback: (
+      activeTool: AppState["activeTool"],
+      pointerDownState: PointerDownState,
+      event: React.PointerEvent<HTMLElement>,
+    ) => void,
+  ): UnsubscribeCallback;
+
+  onPointerUp(
+    callback: (
+      activeTool: AppState["activeTool"],
+      pointerDownState: PointerDownState,
+      event: PointerEvent,
+    ) => void,
+  ): UnsubscribeCallback;
+
+  onScrollChange(
+    callback: (scrollX: number, scrollY: number, zoom: Zoom) => void,
+  ): UnsubscribeCallback;
+
+  onUserFollow(
+    callback: (payload: OnUserFollowedPayload) => void,
+  ): UnsubscribeCallback;
+
+  onStateChange: OnStateChange; // 见下方详细定义
+
   onEvent: <K extends keyof ExcalidrawImperativeAPIEventMap>(
     name: K,
-    callback: (...args: ExcalidrawImperativeAPIEventMap[K]) => void
-  ) => UnsubscribeCallback;
-
-  onStateChange: (
-    observer: OnStateChange,
-    options?: { fireImmediately?: boolean }
+    callback: (...args: ExcalidrawImperativeAPIEventMap[K]) => void,
   ) => UnsubscribeCallback;
 }
 ```
 
----
+### 1.3 onStateChange 详细定义 (重要)
 
-## 2. 内部事件外发 (Internal Event Forwarding)
-
-### 2.1 场景状态变化广播
-
-**触发时机**：元素增删改、视图变化、工具切换等任何影响场景的操作
+**这是宿主最常用的状态订阅 API，有多种调用形式**：
 
 ```typescript
-// 方式一：全量 onChange 回调
-<Excalidraw
-  onChange={(elements, appState, files) => {
-    // 宿主接收完整最新状态
-    console.log("Elements changed:", elements);
-    console.log("App state:", appState);
-    console.log("Files:", files);
-  }}
-/>
+type OnStateChange = {
+  // 形式1: 订阅单个属性变化
+  <K extends keyof AppState>(
+    prop: K,
+    callback: (value: AppState[K], appState: AppState) => void,
+    opts?: { once: boolean },
+  ): UnsubscribeCallback;
 
-// 方式二：增量 onIncrement 回调
-<Excalidraw
-  onIncrement={(increment) => {
-    // 接收增量变更（性能更优）
-    // DurableIncrement: 持久化变更（元素更新等）
-    // EphemeralIncrement: 临时变更（鼠标位置等）
-  }}
-/>
+  // 形式2: Promise 形式等待单个属性满足条件
+  <K extends keyof AppState>(prop: K): Promise<AppState[K]>;
+
+  // 形式3: 订阅多个属性变化
+  (
+    prop: (keyof AppState)[],
+    callback: (appState: AppState, prevState: AppState) => void,
+    opts?: { once: boolean },
+  ): UnsubscribeCallback;
+
+  // 形式4: Promise 形式等待多个属性满足条件
+  (prop: (keyof AppState)[]): Promise<AppState>;
+
+  // 形式5: 通过选择器函数订阅
+  <T>(
+    prop: (appState: AppState) => T,
+    callback: (value: T, appState: AppState) => void,
+    opts?: { once: boolean },
+  ): UnsubscribeCallback;
+
+  // 形式6: Promise 形式等待选择器满足条件
+  <T>(prop: (appState: AppState) => T): Promise<T>;
+
+  // 形式7: 通过 predicate 函数订阅
+  (opts: {
+    predicate: (appState: AppState) => boolean;
+    callback: (appState: AppState) => void;
+    once?: boolean;
+  }): UnsubscribeCallback;
+
+  // 形式8: Promise 形式等待 predicate 满足
+  (opts: { predicate: (appState: AppState) => boolean }): Promise<AppState>;
+};
 ```
 
-### 2.2 指针协作事件
-
-**触发时机**：鼠标/触摸移动、按下/抬起
-
+**使用示例**：
 ```typescript
-<Excalidraw
-  onPointerUpdate={({ pointer, button, pointersMap }) => {
-    // 广播指针位置到协作服务器
-    broadcastPointerPosition({
-      x: pointer.x,
-      y: pointer.y,
-      tool: pointer.tool,
-      button
-    });
-  }}
-/>
-```
+// 订阅主题变化
+api.onStateChange("theme", (theme, state) => {
+  console.log("Theme changed to:", theme);
+});
 
-### 2.3 状态观察器模式
+// 等待侧边栏打开
+await api.onStateChange({
+  predicate: (state) => state.openSidebar !== null,
+});
 
-细粒度订阅特定状态变化：
-
-```typescript
+// 订阅选中元素变化
 api.onStateChange(
-  (state) => {
-    // 只响应选中元素变化
-    console.log("Selected elements:", state.selectedElementIds);
+  (state) => state.selectedElementIds,
+  (selectedIds, state) => {
+    console.log("Selected elements:", selectedIds.size);
   },
-  { 
-    fireImmediately: true,  // 订阅时立即触发一次
-    observedNodes: ["selectedElementIds", "activeTool"]  // 只监听特定字段
-  }
 );
 ```
 
-### 2.4 生命周期事件
+---
+
+## 二、内部事件外发机制 (Internal Event Forwarding)
+
+### 2.1 onChange - 全量状态变更
+
+**触发时机**：任何影响元素、AppState 或文件的操作都会触发
 
 ```typescript
+// 宿主侧使用
+const unsubscribe = api.onChange((elements, appState, files) => {
+  // elements: 所有未删除的画布元素
+  // appState: 完整的应用状态
+  // files: 所有二进制文件（图片等）
+  console.log("Total elements:", elements.length);
+  console.log("Current tool:", appState.activeTool.type);
+});
+
+// 取消订阅
+unsubscribe();
+```
+
+### 2.2 onIncrement - 增量变更 (性能优先)
+
+**触发时机**：与 onChange 相同，但只返回变更的增量部分
+
+```typescript
+api.onIncrement((event) => {
+  if (event.type === "durable") {
+    // 持久化变更（元素更新、状态变化等）
+    console.log("Durable changes:", event.elements);
+  } else {
+    // 临时变更（鼠标位置、临时交互状态等）
+    console.log("Ephemeral changes");
+  }
+});
+```
+
+### 2.3 onStateChange - 细粒度状态订阅
+
+**实现位置**：`packages/excalidraw/components/AppStateObserver.ts`
+
+**触发机制**：
+1. 每次状态变化时调用 `AppStateObserver.flush(prevState)`
+2. 遍历所有监听器，调用其 `predicate` 函数判断是否触发
+3. 如果满足条件，调用 `callback` 并传入新值
+4. 标记 `once: true` 的监听器在触发后自动移除
+
+**自动立即触发**：
+如果订阅时当前状态已满足 predicate，会通过 `queueMicrotask` 立即触发回调。
+
+### 2.4 指针事件外发
+
+**onPointerDown / onPointerUp**：
+```typescript
+api.onPointerDown((activeTool, pointerState, event) => {
+  // 广播指针按下事件到协作服务器
+  broadcastPointer({
+    x: pointerState.origin.x,
+    y: pointerState.origin.y,
+    tool: activeTool.type,
+  });
+});
+```
+
+### 2.5 滚动变化事件
+
+```typescript
+api.onScrollChange((scrollX, scrollY, zoom) => {
+  // 同步视口位置给其他协作用户
+  syncViewport({ scrollX, scrollY, zoom: zoom.value });
+});
+```
+
+### 2.6 生命周期事件
+
+```typescript
+// 编辑器生命周期事件
+type ExcalidrawImperativeAPIEventMap = {
+  "editor:mount": [payload: {
+    excalidrawAPI: ExcalidrawImperativeAPI;
+    container: HTMLDivElement | null;
+  }];
+  "editor:initialize": [api: ExcalidrawImperativeAPI];
+  "editor:unmount": [];
+};
+
 api.onEvent("editor:mount", ({ container }) => {
   console.log("Excalidraw mounted on:", container);
-});
-
-api.onEvent("editor:initialize", (api) => {
-  console.log("Excalidraw ready with API");
-});
-
-api.onEvent("editor:unmount", () => {
-  console.log("Excalidraw unmounted");
 });
 ```
 
 ---
 
-## 3. 外部命令注入 (External Command Injection)
+## 三、外部命令注入 (External Command Injection)
 
-### 3.1 场景注入 (updateScene)
+### 3.1 updateScene - 核心注入 API
 
 **最常用的注入方式**，支持原子化操作：
 
@@ -218,95 +417,179 @@ api.updateScene({
       height: 150,
       strokeColor: "#000000",
       backgroundColor: "#ffffff",
-      // ...其他属性
-    }
+      // ... 其他必需属性
+    },
   ],
-  // CAPTURE: 加入历史栈（可撤销）
-  // EVENTUALLY: 延迟加入历史栈
-  // NEVER: 不加入历史栈（远程更新推荐）
-  captureUpdate: CaptureUpdateAction.NEVER
+  // CaptureUpdateAction.IMMEDIATELY: 加入历史栈（可撤销，默认）
+  // CaptureUpdateAction.EVENTUALLY: 延迟加入历史栈
+  // CaptureUpdateAction.NEVER: 不加入历史栈（远程协作更新推荐）
+  captureUpdate: CaptureUpdateAction.NEVER,
 });
 
 // 只更新应用状态
 api.updateScene({
   appState: {
-    activeTool: { type: "laser" },
+    activeTool: { type: "selection" },
     theme: "dark",
-    viewBackgroundColor: "#1a1a1a"
-  }
-});
-
-// 快捷方式：只更新状态
-api.setAppState({
-  selectedElementIds: { "element-id": true }
+    viewBackgroundColor: "#1a1a1a",
+  },
 });
 ```
 
-### 3.2 初始数据注入
+### 3.2 applyDeltas - 增量更新
 
-通过 `initialData` 预加载场景：
+适用于协作场景的增量同步：
+
+```typescript
+// 只更新变化的属性，而不是全量替换
+api.applyDeltas(
+  allElements,
+  [
+    {
+      id: "element-id",
+      x: 150, // 只更新 x 坐标
+      y: 150, // 只更新 y 坐标
+    },
+  ],
+  { captureUpdate: CaptureUpdateAction.NEVER },
+);
+```
+
+### 3.3 mutateElement - 单个元素更新
+
+更新单个元素的特定属性：
+
+```typescript
+api.mutateElement(
+  element,
+  {
+    strokeColor: "#ff0000",
+    width: 300,
+  },
+  {
+    captureUpdate: CaptureUpdateAction.IMMEDIATELY, // 允许撤销
+  },
+);
+```
+
+### 3.4 文件注入 (addFiles)
+
+**注意**：输入必须是 `BinaryFileData` 格式，不是原生 File 对象
+
+```typescript
+// BinaryFileData 结构
+interface BinaryFileData {
+  id: FileId;
+  dataURL: DataURL; // base64 编码的 data URL
+  mimeType: string;
+  created: number; // 时间戳
+}
+
+// 注入图片文件
+api.addFiles([
+  {
+    id: "file-id-1",
+    dataURL: "data:image/png;base64,...",
+    mimeType: "image/png",
+    created: Date.now(),
+  },
+]);
+
+// 创建引用该文件的图片元素
+api.updateScene({
+  elements: [
+    {
+      type: "image",
+      fileId: "file-id-1",
+      x: 0,
+      y: 0,
+      width: 400,
+      height: 300,
+      // ... 其他必需属性
+    },
+  ],
+});
+```
+
+### 3.5 初始数据注入
+
+通过组件 Props 预加载场景：
 
 ```typescript
 <Excalidraw
   initialData={{
     elements: savedElements,
     appState: { theme: "dark" },
-    files: savedFiles
+    files: savedFiles,
   }}
-  // 或异步加载
+  // 或异步加载函数
   initialData={async () => {
-    const data = await fetchFromServer();
-    return data;
+    const response = await fetch("/api/scene");
+    return response.json();
   }}
 />
 ```
 
-### 3.3 文件注入
+### 3.6 历史操作控制
 
 ```typescript
-// 注入图片文件
-const files = await api.addFiles([
-  new File([blob], "image.png", { type: "image/png" })
-]);
-
-// 创建图片元素
-api.updateScene({
-  elements: [
-    {
-      type: "image",
-      fileId: files[0].id,
-      x: 0,
-      y: 0,
-      width: 400,
-      height: 300
-    }
-  ]
-});
-```
-
-### 3.4 历史操作控制
-
-```typescript
-// 清空历史栈（远程协作时常用）
+// 清空历史栈（远程协作时推荐在连接建立后调用）
 api.history.clear();
 
 // 重置整个场景
 api.resetScene({
   resetLoadingState: true,
-  preserveSession: false
+  preserveSession: false,
 });
 ```
 
 ---
 
-## 4. 嵌入内容通信 (Embeddable PostMessage Bridge)
+## 四、宿主能力与内部实现边界 (Boundary)
 
-### 4.1 iframe Sandbox 配置
+### ✅ 宿主公开可用 (Public API)
 
-嵌入元素通过严格的沙箱配置运行：
+| 类别 | 定义位置 | 说明 |
+|------|---------|------|
+| Props 配置 | `types.ts: ExcalidrawProps` | 组件传入的所有属性 |
+| Imperative API | `types.ts: ExcalidrawImperativeAPI` | `api.xxx` 调用的所有方法 |
+| 事件回调 | `onChange / onIncrement / onStateChange` 等 | 文档中列出的所有订阅方法 |
+| 嵌入验证 | `validateEmbeddable` / `renderEmbeddable` | 自定义嵌入内容的验证和渲染 |
+| 粘贴拦截 | `onPaste` | 返回 `true` 阻止默认粘贴行为 |
+| 自定义 Action | `registerAction` | 扩展编辑器操作 |
+
+### ⚠️ 内部框架能力 (Internal Only)
+
+**以下是框架内部能力，宿主不应直接使用**：
+
+| 类别 | 定义位置 | 说明 |
+|------|---------|------|
+| App 类实例 | `components/App.tsx` | 整个编辑器实例，包含大量内部方法 |
+| AppClassProperties | `types.ts: AppClassProperties` | 供内部组件使用的 App 属性集合 |
+| Scene 类 | `scene/Scene.ts` | 场景状态管理，内部方法不对外 |
+| AppStateObserver 内部 | `AppStateObserver.ts` | 除 `onStateChange` 外的内部实现 |
+| 内部事件总线 | `AppEventBus` | 不建议宿主直接订阅 |
+| 子组件实例方法 | `LinearElementEditor` 等 | 编辑器内部组件方法 |
+
+### ❌ 之前文档中的错误
+
+| 之前描述 | 真实情况 |
+|---------|---------|
+| `addFiles(files: Array<File | HTMLImageElement | Blob>)` | ❌ 错误，真实签名是 `addFiles(data: BinaryFileData[])` |
+| `onStateChange(observer, { fireImmediately })` | ❌ 错误，真实支持多种重载形式（见 1.3） |
+| `AppEventBus.on("element:create")` | ❌ 这是内部 API，宿主不应依赖 |
+| `api.setPlugins` | ❌ 不在 ExcalidrawImperativeAPI 中，是内部方法 |
+
+---
+
+## 五、嵌入内容通信机制 (Embeddable Communication)
+
+### 5.1 iframe Sandbox 配置
+
+所有嵌入内容默认运行在沙箱中：
 
 ```typescript
-// packages/excalidraw/components/App.tsx:1849-1853
+// packages/excalidraw/components/App.tsx
 sandbox={`${
   src?.sandbox?.allowSameOrigin
     ? "allow-same-origin"
@@ -314,56 +597,25 @@ sandbox={`${
 } allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-presentation allow-downloads`}
 ```
 
-### 4.2 内置平台通信
+### 5.2 内置平台双向通信
 
-**YouTube 视频控制**：
+**YouTube 播放器**：
+- 播放器通过 postMessage 发送 `infoDelivery` 事件（包含播放状态）
+- 编辑器通过 postMessage 发送命令控制播放/暂停
 
-```typescript
-// 监听 YouTube 播放器状态
-// packages/excalidraw/components/App.tsx:870-930
-case "https://www.youtube.com":
-  if (data.event === "infoDelivery" && data.info.playerState) {
-    YOUTUBE_VIDEO_STATES.set(data.id, data.info.playerState);
-  }
-  break;
+**Vimeo 播放器**：
+- 监听 `paused` 事件
+- 发送播放/暂停命令控制
 
-// 发送播放/暂停命令
-iframe.contentWindow.postMessage(
-  JSON.stringify({
-    event: "command",
-    func: "playVideo" | "pauseVideo",
-    args: ""
-  }),
-  "*"
-);
-```
-
-**Vimeo 视频控制**：
+### 5.3 URL 白名单验证
 
 ```typescript
-// 监听 Vimeo 暂停事件
-case "https://player.vimeo.com":
-  if (data.method === "paused") {
-    source?.postMessage(
-      JSON.stringify({
-        method: data.value ? "play" : "pause",
-        value: true
-      }),
-      "*"
-    );
-  }
-  break;
-```
-
-### 4.3 URL 白名单验证
-
-```typescript
-// packages/element/src/embeddable.ts:452-535
+// packages/element/src/embeddable.ts
 const ALLOWED_DOMAINS = new Set([
   "youtube.com", "youtu.be", "vimeo.com", "player.vimeo.com",
   "drive.google.com", "figma.com", "gist.github.com",
   "twitter.com", "x.com", "*.simplepdf.eu", "stackblitz.com",
-  "val.town", "giphy.com", "reddit.com", "forms.microsoft.com"
+  "val.town", "giphy.com", "reddit.com", "forms.microsoft.com",
 ]);
 
 // 宿主可扩展验证
@@ -375,19 +627,14 @@ const ALLOWED_DOMAINS = new Set([
 />
 ```
 
-### 4.4 自定义嵌入渲染
+### 5.4 自定义嵌入渲染
 
 ```typescript
 <Excalidraw
   renderEmbeddable={(element, appState) => {
     // 返回自定义 React 组件替代默认 iframe
     if (element.link?.includes("custom-app")) {
-      return (
-        <CustomEmbed
-          link={element.link}
-          onCommand={(cmd) => handleEmbedCommand(element.id, cmd)}
-        />
-      );
+      return <CustomEmbedComponent link={element.link} />;
     }
     // 返回 null 使用默认渲染
     return null;
@@ -397,146 +644,83 @@ const ALLOWED_DOMAINS = new Set([
 
 ---
 
-## 5. 拦截与扩展机制 (Interception & Extension)
+## 六、典型集成模式 (Typical Integration Patterns)
 
-### 5.1 粘贴拦截
-
-```typescript
-<Excalidraw
-  onPaste={async (data, event) => {
-    // 拦截自定义内容
-    if (data.text?.startsWith("custom-payload:")) {
-      // 注入自定义元素
-      api.updateScene({ elements: createCustomElements(data.text) });
-      // 返回 true 阻止默认粘贴行为
-      return true;
-    }
-    // 返回 false 使用默认粘贴逻辑
-    return false;
-  }}
-/>
-```
-
-### 5.2 事件总线扩展
-
-通过 `AppEventBus` 订阅内部事件：
-
-```typescript
-import { AppEventBus } from "@excalidraw/common";
-
-// 订阅全局事件
-AppEventBus.on("element:create", (element) => {
-  console.log("Element created:", element);
-});
-```
-
-### 5.3 自定义工具扩展
-
-通过 Plugin API 扩展工具栏和工具：
-
-```typescript
-api.setPlugins([
-  {
-    name: "custom-tool",
-    tools: [
-      {
-        type: "custom",
-        icon: CustomIcon,
-        name: "Custom Tool",
-        onPointerDown: (event, app) => {
-          // 自定义工具逻辑
-        }
-      }
-    ]
-  }
-]);
-```
-
----
-
-## 6. 典型集成模式 (Typical Integration Patterns)
-
-### 6.1 受控模式 (Controlled Mode)
+### 6.1 受控模式
 
 宿主完全控制场景状态：
 
 ```typescript
 function ControlledExcalidraw() {
-  const [elements, setElements] = useState([]);
-  const [appState, setAppState] = useState({});
+  const [api, setApi] = useState<ExcalidrawImperativeAPI | null>(null);
 
   return (
     <Excalidraw
-      initialData={{ elements, appState }}
-      onChange={(newElements, newAppState) => {
-        // 1. 同步到宿主状态
-        setElements(newElements);
-        setAppState(newAppState);
-        // 2. 同步到服务器
-        saveToServer(newElements, newAppState);
+      onExcalidrawAPI={setApi}
+      onChange={(elements, appState, files) => {
+        // 同步到宿主状态存储
+        saveToHostState({ elements, appState, files });
       }}
     />
   );
+
+  // 在需要时通过 api.updateScene 注入外部变更
 }
 ```
 
-### 6.2 远程协作模式 (Collaboration Mode)
+### 6.2 远程协作模式
 
 ```typescript
-function CollaborativeExcalidraw() {
+function CollaborativeExcalidraw({ api }) {
   useEffect(() => {
     // 接收远程更新
     socket.on("remote:update", ({ elements, appState }) => {
       api.updateScene({
         elements,
         appState,
-        captureUpdate: CaptureUpdateAction.NEVER  // 不加入本地历史
+        captureUpdate: CaptureUpdateAction.NEVER,
       });
     });
 
-    // 广播本地更新
-    api.onIncrement((increment) => {
-      if (increment.type === "durable") {
-        socket.emit("local:update", increment);
+    // 广播本地增量
+    const unsubscribe = api.onIncrement((event) => {
+      if (event.type === "durable") {
+        socket.emit("local:update", event);
       }
     });
-  }, [api]);
+
+    return unsubscribe;
+  }, [api, socket]);
 }
 ```
 
-### 6.3 只读预览模式 (Read-only Mode)
+### 6.3 只读预览模式
 
 ```typescript
 <Excalidraw
   initialData={readOnlyData}
   viewModeEnabled={true}
-  // 禁用所有编辑操作
-  onPointerUpdate={() => {}}
-  onChange={() => {}}
+  // 禁用所有编辑交互
+  UIOptions={{
+    canvasActions: {
+      changeViewBackgroundColor: false,
+      clearCanvas: false,
+      export: false,
+      loadScene: false,
+      saveAsImage: false,
+      saveSceneToLocalStorage: false,
+    },
+  }}
 />
 ```
 
 ---
 
-## 7. 安全注意事项 (Security Considerations)
+## 文档信息
 
-1. **Sandbox 隔离**：嵌入 iframe 默认启用沙箱，最小权限原则
-2. **Origin 验证**：PostMessage 处理前必须验证 `event.origin`
-3. **URL 白名单**：嵌入内容必须通过 `validateEmbeddable` 验证
-4. **XSS 防护**：嵌入链接经过 HTML 转义处理 (`escapeDoubleQuotes`)
-5. **CSP 兼容**：Excalidraw 内容安全策略需允许指定嵌入源
-
----
-
-## 8. 性能优化建议 (Performance Tips)
-
-1. **优先使用增量回调**：`onIncrement` 比 `onChange` 性能更好
-2. **批量更新**：合并多次 `updateScene` 调用减少重渲染
-3. **远程更新禁用历史**：使用 `CaptureUpdateAction.NEVER` 避免历史栈膨胀
-4. **懒加载嵌入内容**：只有当嵌入元素进入视口时才初始化 iframe
-
----
-
-**文档版本**：1.0  
-**最后更新**：2026-05-12  
-**适用版本**：Excalidraw v0.17+
+- **基于源码版本**：Excalidraw v0.17+
+- **源码位置**：
+  - API 类型定义：`packages/excalidraw/types.ts`
+  - AppStateObserver：`packages/excalidraw/components/AppStateObserver.ts`
+  - 嵌入相关：`packages/element/src/embeddable.ts`
+- **最后更新**：2026-05-12
