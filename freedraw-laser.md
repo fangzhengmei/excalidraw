@@ -207,7 +207,26 @@ interface LaserPointerOptions {
 > 其内部默认参数值在本仓库源码中不可直接验证，
 > 以上仅为基于调用接口的可观测行为推导。
 
-### 3.2 三种动态轨迹参数对比（仓库内可验证）
+### 3.2 hasLastPoint 去重逻辑（仓库内可验证）
+
+**位置: `packages/excalidraw/animated-trail.ts:64-74`**
+
+```typescript
+hasLastPoint(x: number, y: number) {
+  if (this.currentTrail) {
+    const len = this.currentTrail.originalPoints.length;
+    // 真实去重条件：比较最后一个点的坐标
+    return (
+      this.currentTrail.originalPoints[len - 1][0] === x &&
+      this.currentTrail.originalPoints[len - 1][1] === y
+    );
+  }
+
+  return false;
+}
+```
+
+### 3.3 三种动态轨迹参数对比（仓库内可验证）
 
 | 参数 | 激光 | 套索 | 橡皮擦 | 验证位置 |
 |------|------|------|--------|---------|
@@ -220,7 +239,7 @@ interface LaserPointerOptions {
 | `animateTrail` | false | true | false | lasso:52 |
 | 颜色 | 固定激光色 | 主题色半透明 | 主题色半透明 | 各文件 fill/stroke |
 
-### 3.3 AnimationFrameHandler 适用范围（最终结论）
+### 3.4 AnimationFrameHandler 适用范围（最终结论）
 
 **可验证事实**：AnimationFrameHandler 用于：
 1. ✓ 激光轨迹（laser-trails.ts）
@@ -249,7 +268,7 @@ export class AnimationFrameHandler {
 }
 ```
 
-### 3.4 AnimatedTrail 基类帧渲染循环
+### 3.5 AnimatedTrail 基类帧渲染循环
 
 **位置: `packages/excalidraw/animated-trail.ts:30-197`**
 
@@ -276,7 +295,8 @@ export class AnimatedTrail implements Trail {
 
     // 渲染当前轨迹
     if (this.currentTrail) {
-      paths.push(this.drawTrail(this.currentTrail, this.app.state));
+      const currentPath = this.drawTrail(this.currentTrail, this.app.state);
+      paths.push(currentPath);
     }
 
     // 清理已消失轨迹
@@ -401,9 +421,9 @@ AnimatedTrail 基类 (animated-trail.ts)
 
 ## 五、协作轨迹处理详解
 
-### 5.1 LaserTrails 协作管理器架构
+### 5.1 LaserTrails 协作管理器架构（与源码完全对齐）
 
-**位置: `packages/excalidraw/laser-trails.ts:13-129`**
+**位置: `packages/excalidraw/laser-trails.ts:102-128`**
 
 ```typescript
 export class LaserTrails implements Trail {
@@ -429,17 +449,26 @@ export class LaserTrails implements Trail {
         trail = this.collabTrails.get(key)!;
       }
 
-      // 根据指针状态驱动轨迹
+      // 根据指针状态驱动轨迹（与源码完全一致）
       if (collaborator.pointer && collaborator.pointer.tool === "laser") {
+        // 1. 按下且无当前轨迹 → 开始
         if (collaborator.button === "down" && !trail.hasCurrentTrail) {
           trail.startPath(collaborator.pointer.x, collaborator.pointer.y);
         }
 
-        if (collaborator.button === "down" && trail.hasCurrentTrail) {
+        // 2. 按下且有当前轨迹且坐标不重复 → 追加点
+        if (
+          collaborator.button === "down" &&
+          trail.hasCurrentTrail &&
+          !trail.hasLastPoint(collaborator.pointer.x, collaborator.pointer.y)
+        ) {
           trail.addPointToPath(collaborator.pointer.x, collaborator.pointer.y);
         }
 
+        // 3. 抬起且有当前轨迹 → 先追加点再结束
+        // 顺序对齐源码：先 addPointToPath，再 endPath
         if (collaborator.button === "up" && trail.hasCurrentTrail) {
+          trail.addPointToPath(collaborator.pointer.x, collaborator.pointer.y);
           trail.endPath();
         }
       }
@@ -457,9 +486,41 @@ export class LaserTrails implements Trail {
 }
 ```
 
+### 5.2 协作轨迹状态机（准确版）
+
+```
+协作者轨迹生命周期（源码可验证）：
+
+collaborator 加入 collaborators Map
+    ↓
+首次检测到 → 创建 AnimatedTrail 实例
+    ↓
+    → 注入 AnimationFrameHandler
+    → 调用 trail.start(container) 启动帧循环
+    ↓
+[ 每帧循环检查 ]
+    ├─ pointer.tool === laser
+    │   ├─ button === down && !hasCurrentTrail
+    │   │   └─ startPath(x, y)
+    │   ├─ button === down && hasCurrentTrail && !hasLastPoint(x, y)
+    │   │   └─ addPointToPath(x, y)  // 去重条件：坐标比较
+    │   └─ button === up && hasCurrentTrail
+    │       ├─ addPointToPath(x, y)  // 顺序：先追加点
+    │       └─ endPath()              // 再结束
+    └─ 其他工具：忽略，轨迹自然衰减消失
+    ↓
+collaborator 离开 collaborators Map
+    ↓
+调用 trail.stop() → 停止帧循环
+    ↓
+从 collabTrails Map 删除
+    ↓
+WeakMap 引用自动释放 → GC 清理
+```
+
 ---
 
-## 六、关键差异对照表（最终准确版）
+## 六、关键差异对照表（最终准确版，全文一致）
 
 | 维度 | 手绘 (Freedraw) | 动态轨迹（激光/套索/橡皮擦） |
 |------|----------------|---------------------------|
@@ -477,6 +538,7 @@ export class LaserTrails implements Trail {
 | **pressure 字段含义** | 真实/模拟笔压值 0-1 | 被复用存储 timestamp |
 | **easing 函数** | easeOutSine (Math.sin) | easeOut 二次函数 (t*(2-t)) |
 | **轨迹基类** | 不继承 AnimatedTrail | 都继承 AnimatedTrail |
+| **去重逻辑** | 无（点简化代替） | hasLastPoint(x, y) 坐标比较（仅协作场景） |
 
 ---
 
@@ -491,6 +553,9 @@ export class LaserTrails implements Trail {
 5. 手绘使用 perfect-freehand，动态轨迹使用 @excalidraw/laser-pointer
 6. 手绘使用 ShapeCache 静态缓存，动态轨迹每帧重算无缓存
 7. 三种动态轨迹的 streamline、DECAY_TIME、DECAY_LENGTH 参数值
+8. `hasLastPoint` 去重逻辑：坐标比较（animated-trail.ts:64-74）
+9. `button === up` 时协作轨迹顺序：先 addPointToPath 再 endPath
+10. 协作轨迹状态机的完整条件分支
 
 ### ⚠️ 基于调用接口的推导（仓库内不可见内部实现）
 
@@ -507,9 +572,10 @@ export class LaserTrails implements Trail {
 | perfect-freehand 手绘笔触生成 | `packages/element/src/shape.ts` | 1181-1200 | ✅ 仓库内源码 |
 | 手绘本地 SVG 路径函数 | `packages/element/src/shape.ts` | 1211-1231 | ✅ 仓库内源码 |
 | 共享 SVG 路径函数 | `packages/common/src/utils.ts` | 1103-1134 | ✅ 仓库内源码 |
-| AnimatedTrail 基类 | `packages/excalidraw/animated-trail.ts` | 30-198 | ✅ 仓库内源码 |
+| AnimatedTrail 基类 | `packages/excalidraw/animated-trail.ts` | 30-197 | ✅ 仓库内源码 |
+| hasLastPoint 去重逻辑 | `packages/excalidraw/animated-trail.ts` | 64-74 | ✅ 仓库内源码 |
 | 激光衰减配置 | `packages/excalidraw/laser-trails.ts` | 31-50 | ✅ 仓库内源码 |
-| 激光协作管理器 | `packages/excalidraw/laser-trails.ts` | 80-129 | ✅ 仓库内源码 |
+| 激光协作管理器（完整版） | `packages/excalidraw/laser-trails.ts` | 102-128 | ✅ 仓库内源码 |
 | AnimationFrameHandler | `packages/excalidraw/animation-frame-handler.ts` | 8-79 | ✅ 仓库内源码 |
 | LassoTrail 实现 | `packages/excalidraw/lasso/index.ts` | 42-71 | ✅ 仓库内源码 |
 | EraserTrail 实现 | `packages/excalidraw/eraser/index.ts` | 42-70 | ✅ 仓库内源码 |
