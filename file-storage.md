@@ -526,16 +526,96 @@ export const bumpElementVersions = (
 
 ---
 
+## 四、三种后端的边界与一致性机制
+
+### 4.1 统一抽象的适用边界
+
+| 机制 | 本地存储（IndexedDB/LS） | 云端存储（Firebase） | 本地磁盘（.excalidraw） |
+|------|-------------------------|----------------------|-----------------------|
+| FileManager getFiles/saveFiles | ✅ 原生实现 | ✅ Firebase 适配 | ❌ 仅导入后二次接入 |
+| 文件状态机（pending/loading/saved/error） | ✅ 完整 | ✅ 完整 | ❌ 导入后才有 |
+| shouldPreventUnload 防卸载 | ✅ 是 | ✅ 是 | ❌ 纯内存无未保存概念 |
+| clearObsoleteFiles 垃圾回收 | ✅ 是 | ❌ 云端无 GC 概念 | ❌ 不适用 |
+| 版本号 bumpElementVersions | ✅ 本地版本 | ✅ 远程 + 本地 | ✅ 导入时合并 |
+
+### 4.2 跨后端的一致性保障
+
+#### 保障一：元素 status 字段的统一语义
+
+```typescript
+// 三种后端统一使用图片元素的 status 字段表达持久化状态
+type ExcalidrawImageElement = {
+  status: "pending"  // 未持久化
+        | "saving"   // 正在写入
+        | "saved"    // 已持久化
+        | "error";   // 持久化失败
+}
+
+// 后端切换时重置状态保证一致性
+if (isImageElement(element) && element.status === "saved") {
+  return newElementWith(element, { status: "pending" });
+}
+```
+
+#### 保障二：BinaryFileData 数据结构全链路统一
+
+三种后端都使用相同的文件模型，确保切换时不需要数据格式转换：
+
+```typescript
+type BinaryFileData = {
+  id: FileId;           // 全局唯一，跨后端不变
+  dataURL: DataURL;     // base64 编码，跨后端无损
+  mimeType: string;     // MIME 类型统一
+  created: number;      // 创建时间戳
+  lastRetrieved: number; // 最后访问时间（仅本地存储有效）
+  version?: number;     // 乐观锁版本号
+}
+```
+
+**关键约束**：`FileId` 全局唯一，基于内容哈希生成，同一图片在三种后端使用相同 ID。
+
+#### 保障三：FileManager.reset() 状态隔离
+
+每次后端切换前必须调用 reset，清除前一后端的状态追踪：
+
+```typescript
+reset() {
+  this.fetchingFiles.clear();      // 清空进行中的读取
+  this.savingFiles.clear();        // 清空进行中的写入
+  this.savedFiles.clear();         // 清空已保存缓存
+  this.erroredFiles_fetch.clear(); // 清空错误缓存
+  this.erroredFiles_save.clear();  // 清空写入错误缓存
+}
+```
+
+#### 保障四：协作时的本地存储暂停机制
+
+协作模式下，暂停本地存储定时器，避免双写冲突：
+
+```typescript
+// 进入协作模式时暂停
+LocalData.pauseSave("collaboration");
+
+// 退出协作模式时恢复
+LocalData.resumeSave("collaboration");
+
+// Firebase 写入队列与本地存储队列互斥，不会同时写入
+```
+
+---
+
 ## 五、总结
 
 Excalidraw 的三层存储架构设计实现了：
 
 | 特性 | 实现方式 |
 |------|----------|
-| **接口一致性** | `FileManager` 抽象基类定义统一契约 |
-| **后端透明性** | 上层调用无需关心具体存储实现 |
-| **优雅降级** | 云端失败时自动回退到本地存储 |
-| **状态一致性** | 统一的文件状态机 + 版本号机制 |
-| **多端同步** | localStorage 版本戳 + IndexedDB 数据分离 |
+| **接口一致性** | `FileManager` 抽象基类定义统一契约，本地/云端共享实现 |
+| **后端边界清晰** | 本地磁盘导入导出独立于 FileManager，仅二次持久化接入 |
+| **降级策略明确** | 云端失败仅告警不自动切回本地，格式兼容降级仅针对解码格式 |
+| **状态隔离** | 后端切换时强制 `FileManager.reset()`，避免状态污染 |
+| **数据格式统一** | `BinaryFileData` + 元素 `status` 字段跨后端语义一致 |
+| **版本保障** | `bumpElementVersions` 确保外部导入时版本号只增不减 |
+| **多端同步** | localStorage 版本戳 + IndexedDB 数据分离的标签页同步 |
 
-这种设计使得存储后端可以独立演进，同时保证应用层行为的一致性和可预测性。
+这种设计使得存储后端可以独立演进，同时通过严格的边界约定保证跨后端行为的一致性和可预测性。
