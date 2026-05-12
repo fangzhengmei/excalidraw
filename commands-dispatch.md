@@ -3,12 +3,13 @@
 ## 目录
 - [概述](#概述)
 - [一、入口来源](#一入口来源)
-- [二、动作注册](#二动作注册)
-- [三、快捷键解析](#三快捷键解析)
-- [四、运行时上下文判定](#四运行时上下文判定)
-- [五、执行落点](#五执行落点)
-- [六、端到端完整示例](#六端到端完整示例)
-- [七、核心文件索引](#七核心文件索引)
+- [二、命令类型分层（新增）](#二命令类型分层新增)
+- [三、动作注册](#三动作注册)
+- [四、快捷键解析](#四快捷键解析)
+- [五、运行时上下文判定](#五运行时上下文判定)
+- [六、执行落点](#六执行落点)
+- [七、端到端完整示例](#七端到端完整示例)
+- [八、核心文件索引](#八核心文件索引)
 
 ---
 
@@ -20,51 +21,59 @@ Excalidraw 的指令派发系统是一个**"一次定义，多处复用"**的统
 - 动作定义与 UI 表现分离
 - 所有入口共享相同的业务逻辑（`perform` 函数）
 - 不同入口有不同的上下文判定机制
+- 命令面板支持两种命令类型：Action 命令和纯 UI 命令
 - 追踪来源但不改变核心执行路径
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                          四个独立入口                                 │
-├─────────────────────────────────────────────────────────────────────┤
-│  ┌────────────────┐  ┌────────────────┐  ┌────────────────┐       │
-│  │   命令面板     │  │   右键菜单     │  │    工具栏      │  快捷键  │
-│  │ Cmd+Shift+P   │  │  RightClick    │  │  Toolbar      │ KeyDown│
-│  └───────┬────────┘  └───────┬────────┘  └───────┬────────┘  ──┬──  │
-└───────────┼─────────────────────┼─────────────────────┼──────────────┼──┘
-            │                     │                     │              │
-            ▼                     ▼                     ▼              ▼
-  固定动作集合+额外命令      predicate 过滤      renderAction渲染   keyTest匹配
-  (非全部Action遍历)         (显示/隐藏)         PanelComponent    (键盘事件)
-            │                     │                     │              │
-            └─────────────────────┴─────────────────────┴──────────────┘
-                                  │
-                                  ▼
-                        ┌─────────────────────┐
-                        │   Action 定义        │
-                        │  (一次定义)          │
-                        │  - name             │
-                        │  - perform()        │ ← 核心业务逻辑唯一定义
-                        │  - keyTest()        │
-                        │  - predicate()      │
-                        │  - PanelComponent   │
-                        │  - viewMode         │
-                        └───────────┬─────────┘
-                                    │
-                                    ▼
-                        ┌─────────────────────┐
-                        │   ActionManager     │
-                        │  (统一引擎)         │
-                        │  - executeAction()  │ ← 命令面板/右键菜单入口
-                        │  - handleKeyDown()  │ ← 快捷键专属入口
-                        │  - renderAction()   │ ← 工具栏专属入口
-                        └───────────┬─────────┘
-                                    │
-                                    ▼
-                        ┌─────────────────────┐
-                        │     updater()       │  ← 统一执行落点
-                        │  更新 elements       │
-                        │  更新 appState       │
-                        └─────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                            四个独立入口                                   │
+├─────────────────────────────────────────────────────────────────────────┤
+│  ┌────────────────┐  ┌────────────────┐  ┌────────────────┐           │
+│  │   命令面板     │  │   右键菜单     │  │    工具栏      │  快捷键    │
+│  │ Cmd+Shift+P   │  │  RightClick    │  │  Toolbar      │ KeyDown    │
+│  └───────┬────────┘  └───────┬────────┘  └───────┬────────┘  ──┬────  │
+└───────────┼─────────────────────┼─────────────────────┼────────────────┼───┘
+            │                     │                     │                │
+            ▼                     ▼                     ▼                ▼
+  ┌───────────────────────┐  predicate 过滤     renderAction渲染    keyTest匹配
+  │  固定动作集合+额外命令 │                     PanelComponent    (键盘事件)
+  │  (非全部Action遍历)   │
+  │  ┌─────────────────┐ │
+  │  │ Layer 1: Action │ │ → 进 action.perform 执行业务逻辑
+  │  │   命令          │ │
+  │  ├─────────────────┤ │
+  │  │ Layer 2: 非     │ │ → 直接执行界面逻辑（打开弹窗/侧边栏）
+  │  │   Action 命令   │ │
+  │  └─────────────────┘ │
+  └───────────┬───────────┘
+              │
+              ▼
+    ┌─────────────────────────┐
+    │   Action 定义           │
+    │  (一次定义)             │
+    │  - name                │
+    │  - perform()           │ ← 核心业务逻辑唯一定义
+    │  - keyTest()           │
+    │  - predicate()         │
+    │  - PanelComponent      │
+    │  - viewMode            │
+    └─────────────┬───────────┘
+                  │
+                  ▼
+    ┌─────────────────────────┐
+    │   ActionManager         │
+    │  (统一引擎)             │
+    │  - executeAction()      │ ← 命令面板/右键菜单入口
+    │  - handleKeyDown()      │ ← 快捷键专属入口
+    │  - renderAction()       │ ← 工具栏专属入口
+    └─────────────┬───────────┘
+                  │
+                  ▼
+    ┌─────────────────────────┐
+    │     updater()           │ ← 统一执行落点
+    │  更新 elements           │
+    │  更新 appState           │
+    └─────────────────────────┘
 ```
 
 ---
@@ -81,10 +90,10 @@ Excalidraw 有四个独立的动作触发入口，它们最终都指向同一个
 
 **核心机制 - 固定动作集合 + 额外命令：**
 
-命令面板**不是遍历全部 Action**，而是手动构建了几个固定的动作集合，再加上额外的自定义命令，最后进行可用性过滤：
+命令面板**不是遍历全部 Action**，而是手动构建了几个固定的动作集合，再加上额外的自定义命令，最后进行可用性过滤。命令分为两层：
 
 ```typescript
-// 第 1 步：构建 4 个固定的动作集合
+// 第 1 步：构建 4 个固定的动作集合（Layer 1: Action 命令）
 const elementsCommands: CommandPaletteItem[] = [
   actionManager.actions.group,
   actionManager.actions.ungroup,
@@ -114,24 +123,83 @@ const exportCommands: CommandPaletteItem[] = [
   actionManager.actions.copyAsSvg,
 ].map((action) => actionToCommand(action, DEFAULT_CATEGORIES.export));
 
-// 第 2 步：合并固定动作集合 + 额外的自定义命令
+// 第 2 步：合并固定动作集合 + 额外的自定义命令（Layer 2: 非 Action 命令）
 commandsFromActions = [
-  ...elementsCommands,      // 元素操作命令
-  ...editorCommands,        // 编辑器命令
-  { /* clearCanvas 自定义命令 */ },  // 非标准 Action，直接定义
-  { /* exportImage 自定义命令 */ },  // 非标准 Action，直接定义
-  ...exportCommands,        // 导出命令
+  ...elementsCommands,      // 元素操作命令（Layer 1）
+  ...editorCommands,        // 编辑器命令（Layer 1）
+  {
+    // clearCanvas 自定义命令（Layer 2：直接执行 UI 逻辑）
+    label: getActionLabel(actionClearCanvas),
+    icon: getActionIcon(actionClearCanvas),
+    viewMode: false,
+    perform: () => {
+      editorJotaiStore.set(activeConfirmDialogAtom, "clearCanvas");
+    },
+  },
+  {
+    // exportImage 自定义命令（Layer 2：直接执行 UI 逻辑）
+    label: t("buttons.exportImage"),
+    category: DEFAULT_CATEGORIES.export,
+    icon: ExportImageIcon,
+    perform: () => {
+      setAppState({ openDialog: { name: "imageExport" } });
+    },
+  },
+  ...exportCommands,        // 导出命令（Layer 1）
 ];
 
-// 第 3 步：additionalCommands - 与 Action 无关的纯自定义命令
+// 第 3 步：additionalCommands - 与 Action 无关的纯自定义命令（主要是 Layer 2）
 const additionalCommands: CommandPaletteItem[] = [
-  { label: "Library", /* ... */ },          // 打开侧边栏
-  { label: "Search", /* ... */ },           // 搜索
-  { label: "Shape Switch", /* ... */ },     // 形状切换
-  { label: "Change Stroke", /* ... */ },    // 改颜色
-  { label: "Change Background", /* ... */ }, // 改背景
-  { label: "Canvas Background", /* ... */ }, // 画布背景
-  ...SHAPES.reduce((acc, shape) => { /* 转换为命令 */ }, []),  // 形状工具命令
+  {
+    // Library（Layer 2：打开/关闭侧边栏）
+    label: t("toolBar.library"),
+    category: DEFAULT_CATEGORIES.app,
+    icon: LibraryIcon,
+    viewMode: false,
+    perform: () => {
+      if (uiAppState.openSidebar) {
+        setAppState({ openSidebar: null });
+      } else {
+        setAppState({
+          openSidebar: {
+            name: DEFAULT_SIDEBAR.name,
+            tab: DEFAULT_SIDEBAR.defaultTab,
+          },
+        });
+      }
+    },
+  },
+  {
+    // Search（混合 Layer：内部调用 executeAction）
+    label: t("search.title"),
+    category: DEFAULT_CATEGORIES.app,
+    icon: searchIcon,
+    viewMode: true,
+    perform: () => {
+      actionManager.executeAction(actionToggleSearchMenu);
+    },
+  },
+  {
+    // Change Stroke（Layer 2：打开颜色选择器弹窗）
+    label: t("labels.changeStroke"),
+    keywords: ["color", "outline"],
+    category: DEFAULT_CATEGORIES.elements,
+    icon: bucketFillIcon,
+    viewMode: false,
+    predicate: (elements, appState) => {
+      const selectedElements = getSelectedElements(elements, appState);
+      return (
+        selectedElements.length > 0 &&
+        canChangeStrokeColor(appState, selectedElements)
+      );
+    },
+    perform: () => {
+      setAppState((prevState) => ({
+        openPopup: "elementStroke",
+      }));
+    },
+  },
+  // ... 更多形状工具命令（直接 setActiveTool）
 ];
 
 // 第 4 步：最终合并 + 可用性过滤
@@ -142,7 +210,7 @@ const allCommands = [
 ].filter(isCommandAvailable);  // 可用性过滤
 ```
 
-**actionToCommand 转换器：**
+**actionToCommand 转换器（Layer 1 专用）：**
 
 ```typescript
 const actionToCommand = (
@@ -159,7 +227,7 @@ const actionToCommand = (
     predicate: action.predicate,          // 直接复制 predicate
     viewMode: action.viewMode,            // 直接复制 viewMode
     perform: () => {
-      actionManager.executeAction(action, "commandPalette");  // 执行
+      actionManager.executeAction(action, "commandPalette");  // ✅ 走 executeAction → action.perform
     },
   };
   return transformer ? transformer(command, action) : command;
@@ -206,7 +274,7 @@ const filteredItems = items.reduce((acc: ContextMenuItem[], item) => {
 // 点击执行
 onClick={() => {
   onClose(() => {
-    actionManager.executeAction(item, "contextMenu");  // 通过统一入口执行
+    actionManager.executeAction(item, "contextMenu");  // ✅ 走统一入口
   });
 }}
 ```
@@ -308,24 +376,183 @@ handleKeyDown(event: React.KeyboardEvent | KeyboardEvent) {
     return false;
   }
 
-  // ⚠️ 注意：快捷键路径没有调用 predicate！
-  // 如果需要上下文判定，必须在 perform 内部实现
-
   // 第 3 层：直接调用 perform 执行
   event.preventDefault();
   event.stopPropagation();
-  this.updater(action.perform(elements, appState, null, this.app));  // 直接调用
+  this.updater(action.perform(elements, appState, null, this.app));  // ✅ 直接调用
   return true;
 }
 ```
 
 ---
 
-## 二、动作注册
+## 二、命令类型分层（新增）
+
+命令面板包含两类命令，执行路径有本质区别：
+
+### 2.1 Layer 1: Action 命令
+
+**来源：** `actionToCommand` 转换的 4 个固定动作集合（`elementsCommands` / `toolCommands` / `editorCommands` / `exportCommands`）
+
+**特点：**
+- ✅ 有对应的 `Action` 对象定义（在 `packages/excalidraw/actions/*.tsx` 中）
+- ✅ 执行时走 `actionManager.executeAction(action, "commandPalette")` 统一入口
+- ✅ 经过 `trackEvent` 事件追踪
+- ✅ 最终进入 `action.perform()` 执行业务逻辑
+- ✅ 返回 `ActionResult` 后通过 `updater` 更新状态
+
+**执行路径：**
+```
+用户点击命令项
+    ↓
+command.perform() 触发
+    ↓
+actionManager.executeAction(action, "commandPalette")
+    ↓
+trackEvent(action, "commandPalette", ...)
+    ↓
+action.perform(elements, appState, value, app)
+    ↓
+updater(ActionResult)
+    ↓
+更新 elements / appState
+```
+
+**典型示例：**
+- `deleteSelectedElements` - 删除选中元素
+- `group` - 组合元素
+- `undo` / `redo` - 撤销/重做
+- `zoomIn` / `zoomOut` - 缩放
+- `copyAsPng` - 复制为图片
+
+---
+
+### 2.2 Layer 2: 非 Action 命令
+
+**来源：** `commandsFromActions` 中的额外对象 + `additionalCommands` 数组
+
+**特点：**
+- ❌ 没有对应的 `Action` 对象定义（纯 `CommandPaletteItem` 对象）
+- ❌ **不经过 `executeAction` 统一入口**
+- ❌ **不进入 `action.perform()`**（也根本没有 action）
+- ✅ 直接执行 UI 逻辑（打开弹窗、切换侧边栏、设置 activeTool 等）
+- ✅ 可以调用 `setAppState` 或其他状态管理 API
+- ⚠️ 部分命令内部可能调用 `executeAction`（混合模式）
+
+**执行路径：**
+```
+用户点击命令项
+    ↓
+command.perform() 触发
+    ↓
+┌─────────────────────────────────────────────┐
+│  直接执行 UI 逻辑（不经过 Action 系统）      │
+│  - 打开弹窗：setAppState({ openDialog })    │
+│  - 打开侧边栏：setAppState({ openSidebar }) │
+│  - 切换工具：app.setActiveTool({ type })    │
+│  - 其他 UI 状态变更                         │
+└──────────────────────┬──────────────────────┘
+                       ↓
+              状态更新由状态管理系统处理
+              （不经过 updater 回调）
+```
+
+**典型示例 1: Export Image（导出图片弹窗）**
+
+```typescript
+// Layer 2: 直接打开导出弹窗，不涉及 Action
+{
+  label: t("buttons.exportImage"),
+  category: DEFAULT_CATEGORIES.export,
+  icon: ExportImageIcon,
+  shortcut: getShortcutFromShortcutName("imageExport"),
+  keywords: ["export", "image", "png", "jpeg", "svg", "clipboard", "picture"],
+  perform: () => {
+    // ✅ 直接调用 setAppState，不经过任何 Action
+    setAppState({ openDialog: { name: "imageExport" } });
+  },
+}
+```
+
+**执行对比：** `exportImage`（Layer 2） vs `copyAsPng`（Layer 1）
+
+| 对比项 | Export Image (Layer 2) | Copy as PNG (Layer 1) |
+|-------|------------------------|----------------------|
+| **是否有 Action 对象** | ❌ 无 | ✅ `actionCopyAsPng` |
+| **执行入口** | ❌ 直接 `setAppState` | ✅ `executeAction` |
+| **是否经过 action.perform** | ❌ 否 | ✅ 是 |
+| **trackEvent 追踪** | ❌ 无 | ✅ 有 |
+| **返回值** | ❌ 无返回值 | ✅ ActionResult |
+| **经过 updater** | ❌ 否 | ✅ 是 |
+| **核心逻辑** | 打开导出弹窗 UI | 执行 PNG 复制业务逻辑 |
+
+---
+
+**典型示例 2: Library（侧边栏切换）**
+
+```typescript
+// Layer 2: 切换侧边栏打开/关闭状态，不涉及 Action
+{
+  label: t("toolBar.library"),
+  category: DEFAULT_CATEGORIES.app,
+  icon: LibraryIcon,
+  viewMode: false,
+  perform: () => {
+    // ✅ 直接调用 setAppState，不经过任何 Action
+    if (uiAppState.openSidebar) {
+      setAppState({ openSidebar: null });
+    } else {
+      setAppState({
+        openSidebar: {
+          name: DEFAULT_SIDEBAR.name,
+          tab: DEFAULT_SIDEBAR.defaultTab,
+        },
+      });
+    }
+  },
+}
+```
+
+**执行对比：** `Library`（Layer 2） vs `toggleHandTool`（Layer 1）
+
+| 对比项 | Library (Layer 2) | Toggle Hand Tool (Layer 1) |
+|-------|-------------------|---------------------------|
+| **是否有 Action 对象** | ❌ 无 | ✅ `actionToggleHandTool` |
+| **执行入口** | ❌ 直接 `setAppState` | ✅ `executeAction` |
+| **是否经过 action.perform** | ❌ 否 | ✅ 是 |
+| **trackEvent 追踪** | ❌ 无 | ✅ 有 |
+| **返回值** | ❌ 无返回值 | ✅ ActionResult |
+| **经过 updater** | ❌ 否 | ✅ 是 |
+| **核心逻辑** | 切换侧边栏 UI 状态 | 切换工具执行业务逻辑 |
+
+---
+
+### 2.3 Layer 1.5: 混合模式（非 Action 内部调用 executeAction）
+
+部分非 Action 命令内部会调用 `executeAction`，形成混合模式：
+
+```typescript
+{
+  label: t("search.title"),
+  category: DEFAULT_CATEGORIES.app,
+  icon: searchIcon,
+  viewMode: true,
+  perform: () => {
+    // ⚠️ 非 Action 命令内部调用 executeAction
+    actionManager.executeAction(actionToggleSearchMenu);
+  },
+}
+```
+
+这种命令虽然属于 Layer 2（没有通过 `actionToCommand` 转换），但实际执行时会进入 Layer 1 的执行路径。
+
+---
+
+## 三、动作注册
 
 所有动作都通过统一的注册机制添加到系统中。
 
-### 2.1 Action 接口定义
+### 3.1 Action 接口定义
 
 **位置：** `packages/excalidraw/actions/types.ts`
 
@@ -384,7 +611,7 @@ interface Action<TData = any> {
 }
 ```
 
-### 2.2 注册函数
+### 3.2 注册函数
 
 **位置：** `packages/excalidraw/actions/register.ts`
 
@@ -399,7 +626,7 @@ export const register = <TData extends any, T extends Action<TData> = Action<TDa
 };
 ```
 
-### 2.3 ActionManager 初始化
+### 3.3 ActionManager 初始化
 
 **位置：** `packages/excalidraw/actions/manager.tsx`
 
@@ -432,11 +659,11 @@ export class ActionManager {
 
 ---
 
-## 三、快捷键解析
+## 四、快捷键解析
 
 快捷键系统实现了跨平台、可冲突解决的键盘事件映射，但需要注意它有独立的判定机制。
 
-### 3.1 快捷键映射表
+### 4.1 快捷键映射表
 
 **位置：** `packages/excalidraw/actions/shortcuts.ts`
 
@@ -459,7 +686,7 @@ export const getShortcutFromShortcutName = (name: ShortcutName, idx = 0) => {
 };
 ```
 
-### 3.2 跨平台快捷键适配
+### 4.2 跨平台快捷键适配
 
 **位置：** `packages/excalidraw/shortcut.ts`
 
@@ -481,7 +708,7 @@ export const getShortcutKey = (shortcut: string): string =>
     .replace(/\b(Del(?:ete)?)\b/i, t("keys.delete"));
 ```
 
-### 3.3 快捷键匹配算法详解
+### 4.3 快捷键匹配算法详解
 
 **位置：** `packages/excalidraw/actions/manager.tsx` → `handleKeyDown()`
 
@@ -547,20 +774,21 @@ handleKeyDown(event: React.KeyboardEvent | KeyboardEvent) {
 
 **关键点总结：**
 
-| 判定层级 | 快捷键 | 命令面板 | 右键菜单 | 工具栏 |
-|---------|--------|---------|---------|-------|
-| **keyTest** | ✅ filter 阶段匹配 | ❌ 无 | ❌ 无 | ❌ 无 |
-| **viewMode** | ✅ 单独判断 | ✅ `isCommandAvailable` | ✅ filter 阶段 | ❌ 外部控制 |
-| **predicate** | ❌ **不自动调用** | ✅ `isCommandAvailable` | ✅ filter 阶段 | ⚠️ 外部或组件内控制 |
-| **perform 内部判断** | ✅ 依赖此层 | ✅ 最终兜底 | ✅ 最终兜底 | ✅ 最终兜底 |
+| 判定层级 | 快捷键 | 命令面板 Layer 1 | 命令面板 Layer 2 | 右键菜单 | 工具栏 |
+|---------|--------|-----------------|-----------------|---------|-------|
+| **keyTest** | ✅ filter 阶段匹配 | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 |
+| **viewMode** | ✅ 单独判断 | ✅ `isCommandAvailable` | ✅ `isCommandAvailable` | ✅ filter 阶段 | ❌ 外部控制 |
+| **predicate** | ❌ 不自动调用 | ✅ `isCommandAvailable` | ✅ `isCommandAvailable`（如有） | ✅ filter 阶段 | ⚠️ 外部或组件内控制 |
+| **perform 内部判断** | ✅ 依赖此层 | ✅ 最终兜底 | ❌ 无（直接 UI 操作） | ✅ 最终兜底 | ✅ 最终兜底 |
+| **经过 action.perform** | ✅ 是 | ✅ 是 | ❌ 否 | ✅ 是 | ✅ 是 |
 
 ---
 
-## 四、运行时上下文判定
+## 五、运行时上下文判定
 
 上下文判定决定了动作在当前状态下是否可用，但**不同入口的判定机制差异显著**。
 
-### 4.1 predicate 判定函数
+### 5.1 predicate 判定函数
 
 `predicate` 是 Action 的可选属性，主要用于命令面板和右键菜单的可用性判定：
 
@@ -578,9 +806,9 @@ predicate?: (
 - 需要特定工具激活：`appState.activeTool.type === "selection"`
 - 需要特定配置：`appProps.aiEnabled`
 
-### 4.2 各入口的上下文判定实现
+### 5.2 各入口的上下文判定实现
 
-#### 4.2.1 命令面板判定
+#### 5.2.1 命令面板判定
 
 **位置：** `packages/excalidraw/components/CommandPalette/CommandPalette.tsx`
 
@@ -614,8 +842,9 @@ let matchingCommands = allCommands
 - ✅ 显式检查 `viewMode`
 - ✅ 显式调用 `predicate`
 - ✅ 过滤发生在命令显示前
+- ✅ Layer 1 和 Layer 2 命令使用相同的过滤逻辑
 
-#### 4.2.2 右键菜单判定
+#### 5.2.2 右键菜单判定
 
 **位置：** `packages/excalidraw/components/ContextMenu.tsx`
 
@@ -638,7 +867,7 @@ const filteredItems = items.reduce((acc: ContextMenuItem[], item) => {
 - ❌ 没有显式检查 `viewMode`（依赖 predicate 内部处理或执行时失败）
 - ✅ 过滤发生在菜单渲染前
 
-#### 4.2.3 工具栏判定
+#### 5.2.3 工具栏判定
 
 **位置：** `packages/excalidraw/components/Actions.tsx`
 
@@ -665,7 +894,7 @@ PanelComponent: ({ elements, appState, updateData }) => (
 - ⚠️ 可用性判定分散在多个地方
 - ✅ 最灵活但也最容易不一致
 
-#### 4.2.4 快捷键判定（再次强调）
+#### 5.2.4 快捷键判定（再次强调）
 
 ```typescript
 // ❌ 快捷键路径不会自动调用 predicate！
@@ -675,62 +904,28 @@ PanelComponent: ({ elements, appState, updateData }) => (
 // 3. perform 内部 - 最终兜底（如果有）
 ```
 
-**示例：deleteSelectedElements 的快捷键路径**
-
-```typescript
-// keyTest 只检查按键，不检查是否有选中元素
-keyTest: (event, appState, elements) =>
-  (event.key === KEYS.BACKSPACE || event.key === KEYS.DELETE) &&
-  !event[KEYS.CTRL_OR_CMD],
-
-// ⚠️ 是否有选中元素的检查在 perform 内部
-perform: (elements, appState, formData, app) => {
-  // 如果没有选中元素，删除逻辑会自然不执行或返回 false
-  if (/* 没有选中元素 */) {
-    return false;  // 不执行任何更新
-  }
-  // ... 删除逻辑
-}
-```
-
-### 4.3 ActionManager 统一判定接口
-
-**位置：** `packages/excalidraw/actions/manager.tsx`
-
-```typescript
-// 仅供外部调用，快捷键派发内部不使用此方法
-isActionEnabled = (action: Action) => {
-  const elements = this.getElementsIncludingDeleted();
-  const appState = this.getAppState();
-
-  return (
-    !action.predicate ||
-    action.predicate(elements, appState, this.app.props, this.app)
-  );
-};
-```
-
 ---
 
-## 五、执行落点
+## 六、执行落点
 
-无论从哪个入口触发，最终都调用 `action.perform()`，但**到达 perform 的路径有显著差异**。
+无论从哪个入口触发，Layer 1 命令最终都调用 `action.perform()`，但**到达 perform 的路径有显著差异**。
 
-### 5.1 四个入口的执行路径对比
+### 6.1 四个入口的执行路径对比
 
 | 入口 | 执行路径 | 调用链 |
 |------|---------|--------|
-| **命令面板** | 命令项 `perform` → `executeAction` → `action.perform` → `updater` | 完整路径 |
+| **命令面板 Layer 1** | 命令项 `perform` → `executeAction` → `action.perform` → `updater` | 完整路径 |
+| **命令面板 Layer 2** | 命令项 `perform` → 直接 UI 操作 | ❌ 跳过整个 Action 系统 |
 | **右键菜单** | `onClick` → `executeAction` → `action.perform` → `updater` | 完整路径 |
 | **工具栏** | `PanelComponent.updateData` → **直接调用 `action.perform`** → `updater` | ❌ 跳过 `executeAction` |
 | **快捷键** | `handleKeyDown` → **直接调用 `action.perform`** → `updater` | ❌ 跳过 `executeAction` |
 
-### 5.2 executeAction 统一入口（命令面板/右键菜单专用）
+### 6.2 executeAction 统一入口（命令面板 Layer 1 / 右键菜单专用）
 
 **位置：** `packages/excalidraw/actions/manager.tsx`
 
 ```typescript
-// ⚠️ 只有命令面板和右键菜单走这个入口！
+// ⚠️ 只有命令面板 Layer 1 和右键菜单走这个入口！
 executeAction<T extends Action>(
   action: T,
   source: ActionSource = "api",  // "ui" | "keyboard" | "contextMenu" | "api" | "commandPalette"
@@ -748,7 +943,7 @@ executeAction<T extends Action>(
 }
 ```
 
-### 5.3 工具栏专属路径（renderAction → PanelComponent → updateData）
+### 6.3 工具栏专属路径（renderAction → PanelComponent → updateData）
 
 ```typescript
 // renderAction 内部实现
@@ -771,7 +966,7 @@ renderAction = (name: ActionName, data?: any) => {
 };
 ```
 
-### 5.4 快捷键专属路径（handleKeyDown 直接调用）
+### 6.4 快捷键专属路径（handleKeyDown 直接调用）
 
 ```typescript
 // handleKeyDown 内部
@@ -783,60 +978,63 @@ event.stopPropagation();
 this.updater(action.perform(elements, appState, null, this.app));
 ```
 
-### 5.5 基于源码的完整调用链对照表
+### 6.5 基于源码的完整调用链对照表（更新版）
 
-| 步骤 | 命令面板 | 右键菜单 | 工具栏 | 快捷键 |
-|------|---------|---------|-------|--------|
-| **1. 触发点** | 用户点击命令项 | 用户右键点击菜单项 | 用户点击工具栏按钮 | 用户按下快捷键 |
-| **2. 触发函数** | `command.perform()` | `onClick` 回调 | `PanelComponent` 内部 `onClick` | `window.addEventListener('keydown')` |
-| **3. 调用 ActionManager** | `actionManager.executeAction(action, "commandPalette")` | `actionManager.executeAction(item, "contextMenu")` | ❌ **不调用** | ❌ **不调用** |
-| **4. trackEvent 位置** | `executeAction` 内部 | `executeAction` 内部 | `renderAction` → `updateData` 内部 | `handleKeyDown` 内部 |
-| **5. source 参数** | `"commandPalette"` | `"contextMenu"` | `"ui"` | `"keyboard"` |
-| **6. 调用 perform** | ✅ `executeAction` 内部调用 | ✅ `executeAction` 内部调用 | ✅ `updateData` 直接调用 | ✅ `handleKeyDown` 直接调用 |
-| **7. 到达 updater** | ✅ 统一落点 | ✅ 统一落点 | ✅ 统一落点 | ✅ 统一落点 |
-| **8. predicate 判定位置** | 显示前 `isCommandAvailable` 过滤 | 渲染前 `reduce` 过滤 | 外部条件渲染 / `disabled` | ❌ **不在派发层调用，依赖 perform 内部** |
-| **9. keyTest 判定** | ❌ 无 | ❌ 无 | ❌ 无 | ✅ `handleKeyDown` filter 阶段 |
-| **10. viewMode 判定位置** | `isCommandAvailable` 内部 | ⚠️ 依赖 predicate 或执行失败 | ⚠️ 外部控制 | ✅ `handleKeyDown` 单独判断 |
+| 步骤 | 命令面板 Layer 1 | 命令面板 Layer 2 | 右键菜单 | 工具栏 | 快捷键 |
+|------|-----------------|-----------------|---------|-------|--------|
+| **1. 触发点** | 用户点击 Action 命令项 | 用户点击非 Action 命令项 | 用户右键点击菜单项 | 用户点击工具栏按钮 | 用户按下快捷键 |
+| **2. 触发函数** | `command.perform()` | `command.perform()` | `onClick` 回调 | `PanelComponent` 内部 `onClick` | `window.addEventListener('keydown')` |
+| **3. 调用 ActionManager** | `actionManager.executeAction(action, "commandPalette")` | ❌ 不调用 | `actionManager.executeAction(item, "contextMenu")` | ❌ 不调用 | ❌ 不调用 |
+| **4. trackEvent 位置** | `executeAction` 内部 | ❌ 无（直接 UI 操作） | `executeAction` 内部 | `renderAction` → `updateData` 内部 | `handleKeyDown` 内部 |
+| **5. source 参数** | `"commandPalette"` | ❌ 无 | `"contextMenu"` | `"ui"` | `"keyboard"` |
+| **6. 调用 perform** | ✅ `executeAction` 内部调用 | ❌ **无 perform 可调用（没有 Action 对象）** | ✅ `executeAction` 内部调用 | ✅ `updateData` 直接调用 | ✅ `handleKeyDown` 直接调用 |
+| **7. 是否经过 action.perform** | ✅ 是 | ❌ **否，直接 UI 操作** | ✅ 是 | ✅ 是 | ✅ 是 |
+| **8. 到达 updater** | ✅ 统一落点 | ❌ 绕过，走状态管理 | ✅ 统一落点 | ✅ 统一落点 | ✅ 统一落点 |
+| **9. predicate 判定位置** | 显示前 `isCommandAvailable` 过滤 | 显示前 `isCommandAvailable` 过滤（如有） | 渲染前 `reduce` 过滤 | 外部条件渲染 / `disabled` | ❌ 不在派发层调用，依赖 perform 内部 |
+| **10. keyTest 判定** | ❌ 无 | ❌ 无 | ❌ 无 | ❌ 无 | ✅ `handleKeyDown` filter 阶段 |
+| **11. viewMode 判定位置** | `isCommandAvailable` 内部 | `isCommandAvailable` 内部 | ⚠️ 依赖 predicate 或执行失败 | ⚠️ 外部控制 | ✅ `handleKeyDown` 单独判断 |
+| **12. 返回值类型** | ✅ `ActionResult` | ❌ 无返回值 | ✅ `ActionResult` | ✅ `ActionResult` | ✅ `ActionResult` |
 
 ```
-┌───────────────────────────────────────────────────────────────────────────────┐
-│                              调用链对比图                                      │
-├───────────────────────────────────────────────────────────────────────────────┤
-│                                                                               │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐│
-│  │  命令面板    │    │  右键菜单    │    │    工具栏     │    │    快捷键    ││
-│  │  Command     │    │  ContextMenu │    │  Toolbar     │    │ KeyDown      ││
-│  └──────┬───────┘    └──────┬───────┘    └──────┬───────┘    └──────┬───────┘│
-│         │                    │                    │                    │        │
-│         ▼                    ▼                    │                    │        │
-│  ┌────────────────────────────────────┐           │                    │        │
-│  │  executeAction(action, source)     │           │                    │        │
-│  │  source = "commandPalette"         │           │                    │        │
-│  │  source = "contextMenu"            │           │                    │        │
-│  └────────────────┬───────────────────┘           │                    │        │
-│                   │                                │                    │        │
-│                   └────────────────────────────────┼────────────────────┘        │
-│                                                    │                             │
-│                                                    ▼                             │
-│  ┌──────────────────────────────────────────────────────────────────────────┐  │
-│  │                         action.perform()                                 │  │
-│  │                                                                          │  │
-│  │  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐         │  │
-│  │  │ trackEvent      │◄─│ 业务逻辑       │◄─│ 结果返回        │         │  │
-│  │  │ (区分 source)   │  │ (唯一核心)     │  │ ActionResult    │         │  │
-│  │  └─────────────────┘  └─────────────────┘  └────────┬────────┘         │  │
-│  └──────────────────────────────────────────────────────┼──────────────────┘  │
-│                                                          │                      │
-│                                                          ▼                      │
-│  ┌──────────────────────────────────────────────────────────────────────────┐  │
-│  │                            updater(result)                                │  │
-│  │                    (更新 elements / appState 唯一落点)                    │  │
-│  └──────────────────────────────────────────────────────────────────────────┘  │
-│                                                                               │
-└───────────────────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────────────────────┐
+│                                    调用链对比图                                        │
+├───────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                       │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐                   │
+│  │ 命令面板 Layer 1 │  │ 命令面板 Layer 2 │  │    右键菜单      │  工具栏  快捷键    │
+│  │   Action 命令    │  │   纯 UI 命令      │  │  ContextMenu     │ Toolbar  KeyDown  │
+│  └────────┬─────────┘  └────────┬─────────┘  └────────┬─────────┘  ──┬───  ──┬───   │
+│           │                      │                      │               │        │       │
+│           ▼                      ▼                      │               │        │       │
+│  ┌───────────────────────┐  ┌───────────────────────┐  │               │        │       │
+│  │ executeAction         │  │  直接 UI 操作         │  │               │        │       │
+│  │ source: commandPalette│  │  - 打开弹窗           │  │               │        │       │
+│  └──────────┬────────────┘  │  - 切换侧边栏         │  │               │        │       │
+│             │               │  - 其他 UI 状态变更   │  │               │        │       │
+│             │               └───────────────────────┘  │               │        │       │
+│             │                                          │               │        │       │
+│             └──────────────────────────────────────────┘               │        │       │
+│                                          │                               │        │       │
+│                                          ▼                               │        │       │
+│  ┌─────────────────────────────────────────────────────────────────────────────────┐  │
+│  │                             action.perform()                                    │  │
+│  │                                                                                   │  │
+│  │  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐              │  │
+│  │  │ trackEvent      │◄─│ 业务逻辑       │◄─│ 结果返回        │              │  │
+│  │  │ (区分 source)   │  │ (唯一核心)     │  │ ActionResult    │              │  │
+│  │  └─────────────────┘  └─────────────────┘  └────────┬────────┘              │  │
+│  └──────────────────────────────────────────────────────┼───────────────────────────┘  │
+│                                                          │                               │
+│                                                          ▼                               │
+│  ┌─────────────────────────────────────────────────────────────────────────────────┐  │
+│  │                               updater(result)                                    │  │
+│  │                      (更新 elements / appState 唯一落点)                         │  │
+│  └─────────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                       │
+└───────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 5.6 ActionResult 返回值
+### 6.6 ActionResult 返回值
 
 ```typescript
 export type ActionResult =
@@ -852,11 +1050,11 @@ export type ActionResult =
 
 ---
 
-## 六、端到端完整示例
+## 七、端到端完整示例
 
 让我们以 **"删除选中元素"** (`actionDeleteSelected`) 动作为例，完整跟踪从四个入口触发到执行的全过程。
 
-### 6.1 Action 定义：actionDeleteSelected
+### 7.1 Action 定义：actionDeleteSelected
 
 **位置：** `packages/excalidraw/actions/actionDeleteSelected.tsx`
 
@@ -924,7 +1122,7 @@ export const actionDeleteSelected = register({
 });
 ```
 
-### 6.2 入口 1：快捷键 Delete 键（完整路径）
+### 7.2 入口 1：快捷键 Delete 键（完整路径）
 
 ```
 用户按下 Delete 键
@@ -973,7 +1171,7 @@ updater(actionResult)
 更新画布状态
 ```
 
-### 6.3 入口 2：右键菜单 → 删除（完整路径）
+### 7.3 入口 2：右键菜单 → 删除（完整路径）
 
 ```
 用户在选中元素上右键点击
@@ -1010,7 +1208,7 @@ updater(actionResult)
 更新画布状态
 ```
 
-### 6.4 入口 3：工具栏 → 删除按钮（完整路径）
+### 7.4 入口 3：工具栏 → 删除按钮（完整路径）
 
 ```
 选中至少一个元素
@@ -1053,7 +1251,7 @@ updater(actionResult)
 更新画布状态
 ```
 
-### 6.5 入口 4：命令面板 → Delete（完整路径）
+### 7.5 入口 4：命令面板 Layer 1 → Delete（完整路径）
 
 ```
 用户按下 Cmd+Shift+P 打开命令面板
@@ -1078,9 +1276,9 @@ CommandPalette 组件渲染
 │   predicate = () => selectedElements.length > 0 │
 └──────────────────────┬──────────────────────┘
                        ↓
-添加额外自定义命令（clearCanvas、exportImage 等）
+添加额外自定义命令（clearCanvas、exportImage 等 Layer 2 命令）
     ↓
-添加 additionalCommands（Library、Search、形状工具等）
+添加 additionalCommands（Library、Search、形状工具等 Layer 2 命令）
     ↓
 ┌─────────────────────────────────────────────┐
 │ isCommandAvailable 可用性过滤               │
@@ -1112,22 +1310,66 @@ updater(actionResult)
 更新画布状态
 ```
 
-### 6.6 四个入口执行路径对比总结
+### 7.6 入口 5：命令面板 Layer 2 → Export Image（完整路径对比）
 
 ```
-┌───────────────────────────────────────────────────────────────────────┐
-│                        四个独立入口触发                                 │
-├───────────────┬───────────────┬───────────────┬───────────────────┤
-│   Delete 键   │  右键菜单     │  工具栏按钮   │   命令面板        │
-│   (快捷键)    │  "Delete"     │  (垃圾桶)     │  "Delete"         │
-└───────┬───────┴───────┬───────┴───────┬───────┴─────────┬─────────┘
-        │               │               │                 │
-        │               │               │                 │
-        ▼               ▼               │                 ▼
- handleKeyDown     onClick 菜单项        │          选中命令项
-        │               │               │                 │
-        │               │               │                 │
-        │               └───────────────┼─────────────────┘
+用户按下 Cmd+Shift+P 打开命令面板
+    ↓
+CommandPalette 组件渲染
+    ↓
+┌─────────────────────────────────────────────┐
+│ exportImage 属于 Layer 2 命令               │
+│ 直接定义在 commandsFromActions 数组中        │
+│ ❌ 不经过 actionToCommand 转换               │
+│ ❌ 没有对应的 Action 对象                    │
+└──────────────────────┬──────────────────────┘
+                       ↓
+┌─────────────────────────────────────────────┐
+│ isCommandAvailable 可用性过滤               │
+│ （exportImage 没有 predicate，总是可用）     │
+└──────────────────────┬──────────────────────┘
+                       ↓
+用户输入 "export" 进行搜索
+    ↓
+模糊匹配命中 "Export Image" 命令
+    ↓
+用户点击或按 Enter 选择
+    ↓
+executeCommand(command, event)
+    ↓
+command.perform()
+    ↓
+┌─────────────────────────────────────────────┐
+│ ⚠️ 直接执行 UI 逻辑！                        │
+│ ❌ 不调用 executeAction                      │
+│ ❌ 不调用 action.perform（根本没有 action）  │
+│ ✅ 直接 setAppState 打开导出弹窗             │
+└──────────────────────┬──────────────────────┘
+                       ↓
+setAppState({ openDialog: { name: "imageExport" } })
+    ↓
+状态由 React 状态管理系统处理
+    ↓
+打开导出弹窗 UI
+```
+
+### 7.7 四个入口 + 两层命令执行路径对比总结
+
+```
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                        五个独立入口触发                                        │
+├───────────────┬───────────────┬───────────────┬─────────────────┬───────────┤
+│   Delete 键   │  右键菜单     │  工具栏按钮   │ 命令面板 Layer 1│ 命令面板   │
+│   (快捷键)    │  "Delete"     │  (垃圾桶)     │  "Delete"       │ Layer 2   │
+│               │               │               │                 │ "Export"  │
+└───────┬───────┴───────┬───────┴───────┬───────┴─────────────────┴────┬──────┘
+        │               │               │                              │
+        │               │               │                              │
+        ▼               ▼               │                              ▼
+ handleKeyDown     onClick 菜单项        │                        选中命令项
+        │               │               │                              │
+        │               │               │                              │
+        │               └───────────────┼──────────────────────────────┘
         │                               │
         │                               ▼
         │                    executeAction("deleteSelectedElements")
@@ -1137,32 +1379,44 @@ updater(actionResult)
         └───────────────────────────────┘
                         │
                         ▼
-              ┌─────────────────────┐
-              │ action.perform()    │  ← 业务逻辑只在这里！
-              │ (删除元素逻辑)      │
-              └───────────┬─────────┘
-                          │
-                          ▼
-              ┌─────────────────────┐
-              │     updater()       │  ← 统一执行落点
-              │ 更新 elements       │
-              │ 更新 appState       │
-              └─────────────────────┘
+              ┌─────────────────────────┐
+              │    action.perform()     │ ← Layer 1 最终汇聚点
+              │  (业务逻辑唯一核心)     │
+              └─────────────┬───────────┘
+                            │
+                            ▼
+              ┌─────────────────────────┐
+              │       updater()         │ ← Layer 1 统一落点
+              │  更新 elements/appState │
+              └─────────────────────────┘
+
+                                vs
+
+              ┌─────────────────────────┐
+              │   直接 UI 操作           │ ← Layer 2 独立路径
+              │  setAppState / ...     │
+              │  (不经过 Action 系统)   │
+              └─────────────────────────┘
 ```
 
-**核心结论：**
+**核心结论对照表：**
 
-| 特性 | 快捷键 | 命令面板 | 右键菜单 | 工具栏 |
-|------|--------|---------|---------|-------|
-| **遍历全部 Action** | ✅ 是 | ❌ 固定集合 | ❌ 传入 items | ❌ 按 name 查找 |
-| **走 executeAction** | ❌ 否 | ✅ 是 | ✅ 是 | ❌ 否 |
-| **自动调用 predicate** | ❌ 否 | ✅ 是 | ✅ 是 | ⚠️ 分散控制 |
-| **有 keyTest 匹配** | ✅ 是 | ❌ 否 | ❌ 否 | ❌ 否 |
-| **业务逻辑 perform** | ✅ 唯一定义 | ✅ 唯一定义 | ✅ 唯一定义 | ✅ 唯一定义 |
+| 特性 | 快捷键 | 命令面板 Layer 1 | 命令面板 Layer 2 | 右键菜单 | 工具栏 |
+|------|--------|-----------------|-----------------|---------|-------|
+| **遍历全部 Action** | ✅ 是 | ❌ 固定集合 | ❌ 手动定义 | ❌ 传入 items | ❌ 按 name 查找 |
+| **走 executeAction** | ❌ 否 | ✅ 是 | ❌ 否 | ✅ 是 | ❌ 否 |
+| **自动调用 predicate** | ❌ 否 | ✅ 是 | ✅ 是（如有） | ✅ 是 | ⚠️ 分散控制 |
+| **有 keyTest 匹配** | ✅ 是 | ❌ 否 | ❌ 否 | ❌ 否 | ❌ 否 |
+| **经过 action.perform** | ✅ 是 | ✅ 是 | ❌ **否** | ✅ 是 | ✅ 是 |
+| **有 Action 对象定义** | ✅ 是 | ✅ 是 | ❌ **否** | ✅ 是 | ✅ 是 |
+| **trackEvent 追踪** | ✅ 有 | ✅ 有 | ❌ **无** | ✅ 有 | ✅ 有 |
+| **经过 updater** | ✅ 是 | ✅ 是 | ❌ **否** | ✅ 是 | ✅ 是 |
+| **返回 ActionResult** | ✅ 是 | ✅ 是 | ❌ **无返回值** | ✅ 是 | ✅ 是 |
+| **业务逻辑 perform** | ✅ 唯一定义 | ✅ 唯一定义 | ❌ **内联 UI 逻辑** | ✅ 唯一定义 | ✅ 唯一定义 |
 
 ---
 
-## 七、核心文件索引
+## 八、核心文件索引
 
 | 文件路径 | 核心职责 |
 |---------|---------|
@@ -1171,7 +1425,7 @@ updater(actionResult)
 | `packages/excalidraw/actions/manager.tsx` | ActionManager 核心引擎（executeAction、handleKeyDown、renderAction） |
 | `packages/excalidraw/actions/shortcuts.ts` | 快捷键映射表、getShortcutFromShortcutName 工具 |
 | `packages/excalidraw/shortcut.ts` | 跨平台快捷键适配工具（getShortcutKey） |
-| `packages/excalidraw/components/CommandPalette/CommandPalette.tsx` | 命令面板实现 - 固定动作集合 + 额外命令模式 |
+| `packages/excalidraw/components/CommandPalette/CommandPalette.tsx` | 命令面板实现 - 固定动作集合 + 额外命令模式 + Layer 1/Layer 2 分层 |
 | `packages/excalidraw/components/CommandPalette/defaultCommandPaletteItems.ts` | 默认命令面板项 |
 | `packages/excalidraw/components/ContextMenu.tsx` | 右键菜单实现 - predicate 过滤模式 |
 | `packages/excalidraw/components/Actions.tsx` | 工具栏动作渲染 - renderAction + PanelComponent 模式 |
@@ -1180,35 +1434,84 @@ updater(actionResult)
 
 ---
 
-## 总结
+## 总结（校正版）
 
-Excalidraw 的指令派发机制是一个设计精良但也相当复杂的架构：
+Excalidraw 的指令派发机制是一个设计精良但也相当复杂的架构，核心可以概括为**"一个核心，两个分层，四个入口，五种路径"**：
 
-### ✅ 统一的方面
-1. **业务逻辑唯一** - `action.perform()` 只定义一次，所有入口共享
-2. **执行落点统一** - 无论从哪来，最终都通过 `updater` 更新状态
-3. **Action 定义统一** - 所有动作遵循相同的接口规范
+### ✅ 统一的方面（一个核心）
+1. **业务逻辑唯一** - `action.perform()` 只在 Action 中定义一次，所有 Layer 1 入口共享
+2. **Action 定义统一** - 所有动作遵循相同的接口规范
+3. **执行落点统一** - Layer 1 入口最终都通过 `updater` 更新 `elements` 和 `appState`
 
-### ⚠️ 不统一的方面（容易踩坑）
-1. **执行入口不统一**
-   - 命令面板/右键菜单 → `executeAction` 统一入口
-   - 工具栏/快捷键 → 直接调用 `perform`，跳过 `executeAction`
+### ⚠️ 命令分层（两个分层）
+1. **Layer 1: Action 命令**
+   - 有对应的 Action 对象定义
+   - 走 `executeAction` → `action.perform` → `updater` 完整路径
+   - 支持 `trackEvent` 事件追踪
+   - 包含约 50+ 个核心业务操作（删除、组合、缩放、撤销等）
 
-2. **上下文判定不统一**
-   - 命令面板 → `isCommandAvailable` 统一过滤
-   - 右键菜单 → 渲染前 `predicate` 过滤
-   - 工具栏 → 分散在外部条件渲染 + PanelComponent disabled
-   - 快捷键 → ❌ 不自动调用 `predicate`，依赖 `keyTest` + `perform` 内部
+2. **Layer 2: 非 Action 命令**
+   - 仅存在于命令面板中，没有对应的 Action 对象
+   - 直接执行 UI 逻辑（打开弹窗、切换侧边栏、设置工具等）
+   - 绕过整个 Action 系统，不经过 `executeAction` 和 `action.perform`
+   - 不支持统一的事件追踪（需要手动埋点）
+   - 包含约 10+ 个 UI 操作命令（导出、库、颜色选择器等）
 
-3. **命令面板不是遍历全部 Action**
-   - 手动维护了 `elementsCommands`、`toolCommands`、`editorCommands`、`exportCommands` 四个固定集合
-   - 额外添加 `additionalCommands` 自定义命令
-   - 新 Action 不会自动出现在命令面板中，需要手动添加到对应集合
+### ⚠️ 入口差异（四个入口，五种路径）
+1. **命令面板路径最复杂**
+   - 不是遍历所有 Action，而是维护 4 个固定集合 + 额外命令
+   - 同时包含 Layer 1 和 Layer 2 两种命令类型
+   - Layer 1 走完整 Action 路径，Layer 2 跳过 Action 系统
 
-### 💡 架构设计启示
-这种设计的好处是**灵活性高**（每个入口可以有自己的判定逻辑），但代价是**一致性差**（容易出现"命令面板能用但快捷键不能用"之类的不一致问题）。
+2. **右键菜单路径最纯净**
+   - 只包含 Layer 1 Action 命令
+   - 所有项都走 `executeAction` 统一入口
+   - 渲染前统一做 `predicate` 过滤
 
-如果追求更统一的架构，可以考虑：
-1. 所有入口都走 `executeAction` 统一入口
-2. `executeAction` 内部统一调用 `predicate` 进行可用性检查
-3. 命令面板自动遍历所有 Action 而不是手动维护集合
+3. **工具栏路径绕过统一入口**
+   - 只包含有 `PanelComponent` 的 Action
+   - 通过 `updateData` 回调直接调用 `action.perform`
+   - 跳过 `executeAction`，trackEvent 在回调内部手动调用
+   - 可用性判定最分散（外部条件渲染 + 组件 disabled + perform 内部）
+
+4. **快捷键路径最特殊**
+   - 只包含有 `keyTest` 的 Action
+   - 遍历所有 Action 进行按键匹配
+   - 跳过 `executeAction`，直接调用 `action.perform`
+   - ❌ **不自动调用 predicate**，上下文判定完全依赖 perform 内部逻辑
+   - 有单独的 `viewMode` 权限检查层
+
+### 💡 架构设计启示与改进建议
+
+**当前架构的优点：**
+- 灵活性极高，每个入口可以按需定制判定逻辑和执行路径
+- Layer 2 命令可以快速添加纯 UI 操作，无需定义完整 Action
+- Action 系统足够健壮，核心业务逻辑得到良好封装
+
+**当前架构的隐患：**
+- 一致性差，容易出现"命令面板能用但快捷键不能用"之类的问题
+- Layer 2 命令无法通过快捷键和右键菜单触发，功能入口不一致
+- 快捷键不自动调用 predicate，容易遗漏边界情况处理
+- 五种不同的执行路径增加了理解和维护成本
+
+**改进建议（追求更统一的架构）：**
+1. **所有入口都走 `executeAction` 统一入口**
+   - 工具栏的 `updateData` 改为调用 `executeAction`
+   - 快捷键的 `handleKeyDown` 改为调用 `executeAction`
+
+2. **`executeAction` 内部统一调用 `predicate` 进行可用性检查**
+   - 确保快捷键也能正确处理上下文判定
+   - 消除 perform 内部的重复判定逻辑
+
+3. **命令面板自动遍历所有 Action**
+   - 去掉手动维护的 4 个固定集合
+   - 通过 `category` 字段自动分类
+   - 新 Action 自动出现在命令面板中
+
+4. **Layer 2 命令也支持 Action 化**
+   - 纯 UI 操作也可以定义为 Action
+   - `perform` 内部只做状态变更，不修改 elements
+   - 这样所有命令都可以通过四个入口触发，实现真正的一致性
+
+---
+*文档基于 Excalidraw v0.17.x 源码分析，最后更新于 2026-05-12*
