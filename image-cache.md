@@ -159,22 +159,28 @@ imageCache: Map<
 └──────────────────────────┬──────────────────────────────────────────┘
                            ↓
 ┌─────────────────────────────────────────────────────────────────────┐
-│  4. 剪贴板封装：copyToClipboard                                     │
+│  4. 剪贴板封装入口：copyToClipboard                                  │
 │     位置：clipboard.ts:194-209                                      │
-│     步骤：                                                          │
-│     - serializeAsClipboardJSON({ elements, files })                │
-│     - copyTextToSystemClipboard(json, clipboardEvent)              │
+│     ┌─────────────────────────────────────────────────────────────┐ │
+│     │  子步骤 4a) **去重发生点**：serializeAsClipboardJSON           │ │
+│     │     位置：clipboard.ts:142-192                                │ │
+│     │     核心逻辑：reduce 遍历元素，相同 fileId 只保留一份         │ │
+│     │     输出：序列化 json 字符串（包含去重后的 files 集合）        │ │
+│     └─────────────────────────────────────────────────────────────┘ │
+│                          ↓                                           │
+│     子步骤 4b) 构造双 MIME 参数对象：                               │
+│     {                                                               │
+│       [MIME_TYPES.excalidrawClipboard]: json,                      │
+│       [MIME_TYPES.text]: json,                                     │
+│     }                                                               │
+│                          ↓                                           │
+│     子步骤 4c) 调用 copyTextToSystemClipboard(对象, clipboardEvent) │
 └──────────────────────────┬──────────────────────────────────────────┘
                            ↓
 ┌─────────────────────────────────────────────────────────────────────┐
-│  5. **去重发生点**：serializeAsClipboardJSON                        │
-│     位置：clipboard.ts:142-192                                      │
-│     核心逻辑：reduce 遍历元素，相同 fileId 只保留一份               │
-└──────────────────────────┬──────────────────────────────────────────┘
-                           ↓
-┌─────────────────────────────────────────────────────────────────────┐
-│  6. 写入系统剪贴板：copyTextToSystemClipboard                       │
-│     位置：clipboard.ts:586+                                         │
+│  5. 写入系统剪贴板：copyTextToSystemClipboard                       │
+│     位置：clipboard.ts:202-208（调用），clipboard.ts:586-636（定义）│
+│     遍历对象的每个 MIME 键值对，调用 clipboardData.setData          │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -182,13 +188,13 @@ imageCache: Map<
 
 ### 4.2 复制入口与代码位置对应表
 
-| 调用顺序 | 函数/方法 | 代码位置 | 职责 |
-|---------|----------|---------|------|
-| 1 | `onCopy` | `App.tsx:3606-3616` | 事件入口，判断是否激活 Excalidraw |
-| 2 | `actionCopy.perform` | `actions/actionClipboard.tsx:28-52` | 获取选中元素，调用复制逻辑 |
-| 3 | `copyToClipboard` | `clipboard.ts:194-209` | 封装剪贴板数据格式 |
-| 4 | `serializeAsClipboardJSON` | `clipboard.ts:142-192` | **去重发生点**，打包文件 |
-| 5 | `copyTextToSystemClipboard` | `clipboard.ts:586+` | 写入系统剪贴板 |
+| 调用顺序 | 函数/方法 | 代码位置 | 职责 | 关键参数 |
+|---------|----------|---------|------|----------|
+| 1 | `onCopy` | `App.tsx:3606-3616` | 事件入口，判断是否激活 Excalidraw | `event: ClipboardEvent` |
+| 2 | `actionCopy.perform` | `actions/actionClipboard.tsx:28-52` | 获取选中元素，调用复制逻辑 | 传递 `clipboardEvent` |
+| 3 | `copyToClipboard` | `clipboard.ts:194-209` | 封装剪贴板数据格式 | `elements, files, clipboardEvent` |
+| 4 | `serializeAsClipboardJSON` | `clipboard.ts:142-192` | **去重发生点**，打包文件 | 返回序列化 `json` |
+| 5 | `copyTextToSystemClipboard` | `clipboard.ts:202-208`（调用）<br>`clipboard.ts:586-636`（定义） | 双 MIME 类型写入系统剪贴板 | **对象参数**：<br>`{ excalidrawClipboard: json, text: json }, clipboardEvent` |
 
 ---
 
@@ -242,7 +248,87 @@ export const serializeAsClipboardJSON = ({
 
 ---
 
-### 4.4 复制流程图示
+### 4.4 双 MIME 类型写入机制
+
+#### 真实调用前后关系
+
+```
+前置步骤（去重完成）
+    ↓
+serializeAsClipboardJSON({ elements, files })  → 返回字符串 json
+    ↓
+copyToClipboard 内部构造双 MIME 对象
+    ↓
+┌─────────────────────────────────────────────────────────────┐
+│  **真实参数结构（对象）**：                                   │
+│  {                                                           │
+│    [MIME_TYPES.excalidrawClipboard]: json,  // 键 1：专用格式 │
+│    [MIME_TYPES.text]: json,                 // 键 2：纯文本格式 │
+│  }                                                           │
+│  两份值完全相同，都是同一份序列化后的 json 字符串              │
+└─────────────────────────────────────────────────────────────┘
+    ↓
+copyTextToSystemClipboard(对象, clipboardEvent)
+    ↓
+clipboardData.setData(mimeType, value)  // 遍历两个键分别写入
+    ↓
+写入系统剪贴板完成
+```
+
+#### 核心代码位置
+
+**调用处（clipboard.ts:194-209）**：
+```typescript
+export const copyToClipboard = async (
+  elements: readonly NonDeletedExcalidrawElement[],
+  files: BinaryFiles | null,
+  clipboardEvent?: ClipboardEvent | null,
+) => {
+  const json = serializeAsClipboardJSON({ elements, files });
+
+  await copyTextToSystemClipboard(
+    {
+      [MIME_TYPES.excalidrawClipboard]: json,
+      [MIME_TYPES.text]: json,
+    },
+    clipboardEvent,
+  );
+};
+```
+
+**定义处（clipboard.ts:586-636）**：
+```typescript
+export const copyTextToSystemClipboard = async <
+  MimeType extends ValueOf<typeof STRING_MIME_TYPES>,
+>(
+  text: string | { [K in MimeType]: string } | null,  // ← 支持对象参数
+  clipboardEvent?: ClipboardEvent | null,
+) => {
+  text = text || "";
+
+  const entries = Object.entries(
+    typeof text === "string" ? { [MIME_TYPES.text]: text } : text,
+  );
+
+  // 遍历对象的每个键值对，分别写入剪贴板
+  if (clipboardEvent) {
+    for (const [mimeType, value] of entries) {
+      clipboardEvent.clipboardData?.setData(mimeType, value);
+    }
+    return;
+  }
+  // ... navigator.clipboard 降级方案
+};
+```
+
+**双 MIME 设计目的**：
+- `excalidrawClipboard`：供 Excalidraw 自身识别，可完整还原元素+文件
+- `text`：纯文本格式，供其他应用粘贴（如文本编辑器、邮件等）
+- 两份值完全相同，保证兼容性的同时不增加数据量
+
+---
+
+### 4.5 复制流程图示
 
 ```
 用户选中图片元素（Img1、Img2、Img3）
@@ -265,9 +351,15 @@ serializeAsClipboardJSON({ elements, files })  clipboard.ts:142
 │  结果：acc = { X: data, Y: data }  ← 去重完成       │
 └─────────────────────────────────────────────────────┘
     ↓
-copyTextToSystemClipboard(json, event)  clipboard.ts:202
+copyTextToSystemClipboard(
+  {
+    [MIME_TYPES.excalidrawClipboard]: json,  // 专用格式
+    [MIME_TYPES.text]: json,                 // 兼容格式
+  },
+  event
+)  clipboard.ts:202-208
     ↓
-写入系统剪贴板完成
+同时写入两个 MIME 键到系统剪贴板完成
 ```
 
 ## 五、粘贴阶段：去重落库调用链
