@@ -379,22 +379,46 @@ perform: (elements, appState, _, app) => {
 
 #### 2.5.3 解组与锁定过滤的联动
 
-锁定状态在解组过程中的影响节点：
+**源码验证结论**：`element.locked` 在解组链路的所有核心函数中**均无专门分支**，锁定状态不影响解组过程中的 `groupIds` 更新、`frameId` 变更和 index 重排。
 
-1. **`getElementsInResizingFrame` 阶段**
-   - 锁定元素（`element.locked === true`）在判定 Frame 成员时会被特殊处理
-   - 如果组内包含锁定元素，且该元素部分在 Frame 外，可能导致整组被排除
-   - 解锁状态下，组采用"整体包含"判定；锁定状态下可能采用"个体判定"
+| 函数 | 是否有 `locked` 分支 | 锁定元素处理方式 |
+|------|---------------------|----------------|
+| `removeFromSelectedGroups` (`groups.ts:319-322`) | ❌ 无 | 与非锁定元素一致，`groupIds` 被过滤 |
+| `getElementsInResizingFrame` (`frame.ts:278-370`) | ❌ 无 | 无特殊处理，按相同几何规则判定成员 |
+| `addElementsToFrame` (`frame.ts:536-630`) | ❌ 无 | `frameId` 会被修改（第 586-588 行） |
+| `syncMovedIndices` (`fractionalIndex.ts:158-199`) | ❌ 无 | index 会被重新分配（第 191 行 `mutateElement`） |
+| `getMovedIndicesGroups` (`fractionalIndex.ts:244-272`) | ❌ 无 | 仅通过 `movedElements.has(elements[i].id)` 判定 |
 
-2. **`replaceAllElementsInFrame` 阶段**
-   - 锁定元素的 `frameId` 不会被修改（除非整组被强制移出）
-   - 解组后锁定元素保留在原 Frame 层级，不会参与重新排序
-   - 这是为了防止意外修改锁定元素的层级关系
+**各阶段锁定元素的实际行为**：
 
-3. **z-index 重排阶段**
-   - 解组调用 `addElementsToFrame` 时，会通过 `syncMovedIndices` 同步 fractional index
-   - 锁定元素的 index 不会被更新，保持原有层级
-   - 非锁定元素按几何位置重新分配 index，可能导致与锁定元素的层级交叉
+1. **`removeFromSelectedGroups` 阶段**
+   - 源码：`groupIds.filter((groupId) => !selectedGroupIds[groupId])`（`groups.ts:322`）
+   - 行为：锁定元素的 `groupIds` 与非锁定元素一样被过滤，无特殊保护
+
+2. **`getElementsInResizingFrame` 阶段**
+   - 源码：仅基于几何相交（`isElementIntersectingFrame`）、包含关系（`isElementContainingFrame`）和组归属判定，无 `locked` 引用
+   - 行为：锁定元素与非锁定元素按完全相同的规则判定是否属于 Frame
+
+3. **`replaceAllElementsInFrame` → `addElementsToFrame` 阶段**
+   - 源码（`frame.ts:585-589`）：
+     ```typescript
+     if (element.frameId !== frame.id) {
+       mutateElement(element, elementsMap, {
+         frameId: frame.id,
+       });
+     }
+     ```
+   - 行为：锁定元素的 `frameId` 会被无条件修改，无锁定保护
+
+4. **z-index 重排阶段（`syncMovedIndices`）**
+   - 源码：`getMovedIndicesGroups` 仅检查 `movedElements.has(elements[i].id)`，无 `locked` 判断
+   - 源码（`fractionalIndex.ts:190-192`）：
+     ```typescript
+     for (const [element, { index }] of elementsUpdates) {
+       mutateElement(element, elementsMap, { index });
+     }
+     ```
+   - 行为：属于 `finalElementsToAdd` 集合的锁定元素，其 `index` 会被重新分配，无锁定保护
 
 #### 2.5.4 解组对 z-index 结果的影响
 
