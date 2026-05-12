@@ -710,13 +710,39 @@ switch (event.origin) {
 }
 ```
 
-#### 1.4 主动发送消息的边界总结
+#### 1.4 YouTube 状态枚举与 falsy 陷阱
 
-| 触发动作 | 目标平台 | 允许的命令 | 安全措施 |
+```typescript
+// YouTube IFrame Player API 标准状态枚举
+export const YOUTUBE_STATES = {
+  UNSTARTED: -1,   // 未开始 - truthy
+  ENDED: 0,        // 播放结束 - ❗ FALSY (0)
+  PLAYING: 1,      // 播放中 - truthy
+  PAUSED: 2,       // 已暂停 - truthy
+  BUFFERING: 3,    // 缓冲中 - truthy
+  CUED: 5,         // 已入队 - truthy
+} as const;
+```
+
+`if (!state)` 真值表：
+
+| 状态值 | state = ? | `!state` 结果 | 是否发送 listening |
+|-------|----------|-------------|-------------------|
+| 未初始化 | `undefined` | `true` | ✅ 发送 |
+| ENDED | `0` | `true` | ✅ **也会发送** |
+| UNSTARTED | `-1` | `false` | ❌ 不发送 |
+| PLAYING | `1` | `false` | ❌ 不发送 |
+| PAUSED | `2` | `false` | ❌ 不发送 |
+| BUFFERING | `3` | `false` | ❌ 不发送 |
+| CUED | `5` | `false` | ❌ 不发送 |
+
+#### 1.5 主动发送消息的边界总结
+
+| 触发动作 | 目标平台 | 允许的命令 | 边界描述 |
 |---------|---------|----------|---------|
-| 首次点击 iframe | YouTube | `listening`（注册监听） | 仅发送一次，后续不再重复注册 |
-| 点击播放/暂停 | YouTube | `playVideo` / `pauseVideo` | 基于本地状态机判断，不盲目发送 |
-| 点击播放/暂停 | Vimeo | `paused`（状态切换） | 无状态维护，直接发送 |
+| 点击 iframe（首次或播放结束后） | YouTube | `listening`（注册监听） | **非仅一次**：`undefined` 或 `ENDED = 0` 时发送 |
+| 点击播放/暂停 | YouTube | `playVideo` / `pauseVideo` | `PLAYING`/`BUFFERING` 发送暂停；其余状态（含 `ENDED=0`）发送播放 |
+| 点击播放/暂停 | Vimeo | `paused`（状态切换） | 无状态维护，每次点击都发送 |
 | 任何其他动作 | 所有平台 | - | ❌ 禁止发送任何其他命令 |
 
 > **关键安全特性**：父页面主动发送的消息 **不携带任何敏感数据**，仅包含固定的播放器控制命令字符串。`targetOrigin` 设置为 `"*"` 是安全的，因为：
