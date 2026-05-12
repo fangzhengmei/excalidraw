@@ -342,15 +342,15 @@ editable.oninput = () => {
 
 `handleSubmit()` 调用位置（`packages/excalidraw/wysiwyg/textWysiwyg.tsx`）：
 
-| 触发位置 | 代码行 | 触发条件 |
-|---------|-------|---------|
-| ESC 键 | 646-649 | `event.key === KEYS.ESCAPE` |
-| Ctrl+Enter | 654-660 | `event.key === KEYS.ENTER && event[KEYS.CTRL_OR_CMD]`（isComposing 时跳过） |
-| 保存操作 | 650-653 | `actionSaveToActiveFile.keyTest(event)` |
-| onblur | 891 | `editable.onblur = handleSubmit` |
-| window blur | 855 | `window.addEventListener("blur", handleSubmit)` |
-| beforeunload | 856 | `window.addEventListener("beforeunload", handleSubmit)` |
-| 点击 canvas | 958-960 | `requestAnimationFrame(() => { handleSubmit(); })` |
+| 触发位置 | 代码定位 | 触发条件 |
+|---------|---------|---------|
+| ESC 键 | 第 646-649 行 | `event.key === KEYS.ESCAPE` |
+| Ctrl+Enter | 第 654-660 行 | `event.key === KEYS.ENTER && event[KEYS.CTRL_OR_CMD]`（isComposing 时跳过） |
+| 保存操作 | 第 650-653 行 | `actionSaveToActiveFile.keyTest(event)` |
+| editable.onblur | 第 891 行 | `editable.onblur = handleSubmit`（bindBlurEvent 内设置） |
+| window blur | 第 908 行 | `window.addEventListener("blur", handleSubmit)`（temporarilyDisableSubmit 内注册） |
+| beforeunload | 第 1016 行 | `window.addEventListener("beforeunload", handleSubmit)`（函数末尾注册） |
+| 点击 canvas | 第 958-960 行 | `requestAnimationFrame(() => { handleSubmit(); })`（onPointerDown 内） |
 
 **关键结论**：共有 7 种途径可触发提交，其中仅 Ctrl+Enter 在 isComposing 时被跳过。
 **对应代码事实**：上述 7 处位置均有明确代码调用 `handleSubmit()`。
@@ -452,10 +452,10 @@ export const redrawTextBoundingBox = (
 ```
 
 **关键结论 1**：宽度扩张对所有容器类型都生效，包括箭头标签。
-**对应代码事实**：第 363 行的 `if (metrics.width > maxContainerWidth)` 判断没有 `!isArrowElement` 条件。
+**对应代码事实**：`if (metrics.width > maxContainerWidth)` 判断没有 `!isArrowElement` 条件。
 
 **关键结论 2**：高度扩张仅对非箭头容器生效，箭头容器高度永远不变。
-**对应代码事实**：第 353 行有明确的 `!isArrowElement(container)` 条件判断。
+**对应代码事实**：高度扩张判断有明确的 `!isArrowElement(container)` 前置条件。
 
 ### 3.3 容器维度外推公式（完整准确版本）
 
@@ -550,15 +550,15 @@ export const getBoundTextMaxHeight = (
 - `originalText` 才是用户输入的原始文本，不含自动换行
 - `text` 字段是根据当前宽度计算的换行后显示文本
 - 提交时永远用 `originalText` 重新换行，确保一致性
-**对应代码事实**：`redrawTextBoundingBox` 第 327-331 行，`wrapText` 始终传入 `textElement.originalText`。
+**对应代码事实**：`redrawTextBoundingBox` 中 `wrapText` 始终传入 `textElement.originalText`。
 
 ### 误解 2："箭头容器的宽高都会自动扩张"
 
 **错误**：认为箭头标签文本太长时箭头会自动变大。
 
 **正确结论**：
-- 箭头容器**宽度会扩张**（第 363 行代码证明）
-- 箭头容器**高度永远不会扩张**（第 353 行 `!isArrowElement(container)` 条件判断）
+- 箭头容器**宽度会扩张**（代码证实）
+- 箭头容器**高度永远不会扩张**（`!isArrowElement(container)` 条件判断）
 - 这是设计决策：箭头标签横向扩展，纵向保持箭头大小不变
 **对应代码事实**：`redrawTextBoundingBox` 中高度扩张有 `!isArrowElement(container)` 条件，宽度扩张没有。
 
@@ -579,7 +579,7 @@ export const getBoundTextMaxHeight = (
 - `autoResize: false` 只固定**宽度**，触发自动换行
 - **高度永远随文本行数动态变化**，与 autoResize 无关
 - 这是为了防止文本垂直方向溢出
-**对应代码事实**：`redrawTextBoundingBox` 第 343 行，`boundTextUpdates.height = metrics.height` 没有任何条件判断。
+**对应代码事实**：`redrawTextBoundingBox` 中 `boundTextUpdates.height = metrics.height` 没有任何条件判断。
 
 ### 误解 5："换行正则每条规则是独立的 RegExp 对象"
 
@@ -600,9 +600,28 @@ export const getBoundTextMaxHeight = (
 - 代码中**没有**监听 `compositionend` 事件，不存在"延迟到 compositionend 才测量"的机制
 - 仅 Ctrl+Enter 提交和 Tab 缩进在 isComposing 时被跳过
 **对应代码事实**：
-  1. `oninput` 代码（第 615-626 行）无 `isComposing` 判断
+  1. `oninput` 代码无 `isComposing` 判断
   2. Grep 搜索确认无 `compositionend` 监听代码
   3. 仅 `onkeydown` 中两处操作有 `isComposing` 跳过逻辑
+
+---
+
+## 五、证据定位勘误清单
+
+### 本次修正的证据定位问题
+
+| 序号 | 原错误定位 | 更正后精确定位 | 说明 |
+|-----|-----------|---------------|------|
+| 1 | `window blur: 第 855 行` | `window blur: 第 908 行` | 原误写为 `cleanup` 函数内 `removeEventListener` 的行号，正确应为 `temporarilyDisableSubmit` 内 `addEventListener` 的行号 |
+| 2 | `beforeunload: 第 856 行` | `beforeunload: 第 1016 行` | 原误写为 `cleanup` 函数内 `removeEventListener` 的行号，正确应为函数末尾 `addEventListener` 的行号 |
+| 3 | `editable.onblur: 第 891 行` | `editable.onblur: 第 891 行` | 定位正确，但补充说明：实际设置位置在 `bindBlurEvent` 函数内通过 `editable.onblur = handleSubmit` 赋值 |
+
+### 定位方式说明
+
+对于不稳定的行号（如编辑器内的行号可能随代码版本变化），采用以下定位策略保证可检索：
+- **事件注册**：使用 `函数名 + 关键语句` 形式，如 `window.addEventListener("blur", handleSubmit)`
+- **事件移除**：明确标注 `cleanup` 函数内的 `removeEventListener`
+- **可检索性**：所有关键字符串均可通过全文搜索直接定位
 
 ---
 
@@ -626,4 +645,4 @@ Excalidraw 文本测量系统的三层架构（全部有代码对应）：
 
 ---
 
-**本报告所有结论均有对应代码行号可查，无任何推断性表述，无源码以外的额外结论。**
+**本报告所有结论均有对应代码证据可查，无任何推断性表述，无源码以外的额外结论。**
