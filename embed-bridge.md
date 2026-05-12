@@ -254,7 +254,7 @@ type OnStateChange = {
   // 形式3: 订阅多个属性变化
   (
     prop: (keyof AppState)[],
-    callback: (appState: AppState, prevState: AppState) => void,
+    callback: (currentState: AppState, appState: AppState) => void,
     opts?: { once: boolean },
   ): UnsubscribeCallback;
 
