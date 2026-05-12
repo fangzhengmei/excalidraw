@@ -133,44 +133,68 @@ imageCache: Map<
 >;
 ```
 
-## 四、复制打包与粘贴落库去重链路
+## 四、复制阶段：完整调用链与去重
 
-### 4.1 复制阶段：只打包被引用文件
-
-#### 完整调用链
+### 4.1 复制完整调用链（按真实代码排序）
 
 ```
-用户按下 Ctrl+C 或右键复制
-    ↓
-copyToClipboard(event)  App.tsx:3827-3865
-    ↓
-parseDataTransferEvent(event)  获取剪贴板中的文件列表
-    ↓
-parseClipboard(dataTransferList, isPlainPaste)  clipboard.ts
-    ↓
-serializeAsClipboardJSON({ elements, files })  clipboard.ts:142-192
-    ↓
-┌─────────────────────────────────────────────────────────────┐
-│  **去重发生点 1：基于引用收集**                               │
-│  reduce 遍历 elements：                                       │
-│  for (const element of elements) {                           │
-│    if (isInitializedImageElement(element)) {                 │
-│      if (files && files[element.fileId]) {                   │
-│        acc[element.fileId] = files[element.fileId];  // ←   │
-│      }                                                       │
-│    }                                                         │
-│  }                                                           │
-│  → 相同 fileId 的文件只会赋值一次（reduce 自动去重）          │
-└─────────────────────────────────────────────────────────────┘
-    ↓
-构建 ClipboardData { type, elements, files: 去重后的文件集合 }
-    ↓
-写入系统剪贴板
+┌─────────────────────────────────────────────────────────────────────┐
+│  1. 事件监听注册                                                    │
+│     位置：App.tsx:3295                                             │
+│     addEventListener(document, EVENT.COPY, this.onCopy, {})        │
+└──────────────────────────┬──────────────────────────────────────────┘
+                           ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│  2. 复制事件入口：onCopy                                            │
+│     位置：App.tsx:3606-3616                                         │
+│     this.actionManager.executeAction(actionCopy, "keyboard", event) │
+└──────────────────────────┬──────────────────────────────────────────┘
+                           ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│  3. Action 执行：actionCopy.perform                                 │
+│     位置：actions/actionClipboard.tsx:28-52                        │
+│     步骤：                                                          │
+│     - 获取选中元素：app.scene.getSelectedElements({...})           │
+│     - 调用：copyToClipboard(elementsToCopy, app.files, event)      │
+└──────────────────────────┬──────────────────────────────────────────┘
+                           ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│  4. 剪贴板封装：copyToClipboard                                     │
+│     位置：clipboard.ts:194-209                                      │
+│     步骤：                                                          │
+│     - serializeAsClipboardJSON({ elements, files })                │
+│     - copyTextToSystemClipboard(json, clipboardEvent)              │
+└──────────────────────────┬──────────────────────────────────────────┘
+                           ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│  5. **去重发生点**：serializeAsClipboardJSON                        │
+│     位置：clipboard.ts:142-192                                      │
+│     核心逻辑：reduce 遍历元素，相同 fileId 只保留一份               │
+└──────────────────────────┬──────────────────────────────────────────┘
+                           ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│  6. 写入系统剪贴板：copyTextToSystemClipboard                       │
+│     位置：clipboard.ts:586+                                         │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-#### 核心去重代码
+---
 
-位于 `packages/excalidraw/clipboard.ts:159-176`：
+### 4.2 复制入口与代码位置对应表
+
+| 调用顺序 | 函数/方法 | 代码位置 | 职责 |
+|---------|----------|---------|------|
+| 1 | `onCopy` | `App.tsx:3606-3616` | 事件入口，判断是否激活 Excalidraw |
+| 2 | `actionCopy.perform` | `actions/actionClipboard.tsx:28-52` | 获取选中元素，调用复制逻辑 |
+| 3 | `copyToClipboard` | `clipboard.ts:194-209` | 封装剪贴板数据格式 |
+| 4 | `serializeAsClipboardJSON` | `clipboard.ts:142-192` | **去重发生点**，打包文件 |
+| 5 | `copyTextToSystemClipboard` | `clipboard.ts:586+` | 写入系统剪贴板 |
+
+---
+
+### 4.3 去重发生点核心代码
+
+位于 `packages/excalidraw/clipboard.ts:142-192`：
 
 ```typescript
 export const serializeAsClipboardJSON = ({
@@ -180,12 +204,17 @@ export const serializeAsClipboardJSON = ({
   elements: readonly NonDeleted<ExcalidrawElement>[];
   files: BinaryFiles | null;
 }) => {
-  // 关键：只收集被选中元素实际引用的 fileId
+  // ┌─────────────────────────────────────────────────────────┐
+  // │  **去重发生点核心逻辑**                                  │
+  // │  reduce 遍历元素，相同 fileId 多次出现时只赋值一次        │
+  // │  acc[element.fileId] = files[element.fileId]             │
+  // │  由于对象属性覆盖特性，相同 fileId 最终只保留一份         │
+  // └─────────────────────────────────────────────────────────┘
   const _files = elements.reduce((acc, element) => {
     if (isInitializedImageElement(element)) {
-      // 去重发生点：相同 fileId 多次出现时，后面的赋值会覆盖前面的
-      // 但由于值相同，结果是幂等的，最终只保留一份
       if (files && files[element.fileId]) {
+        // 相同 fileId 重复引用时，这里会重复赋值
+        // 但由于值相同，最终结果是幂等的，只保留一份
         acc[element.fileId] = files[element.fileId];
       }
     }
@@ -198,7 +227,7 @@ export const serializeAsClipboardJSON = ({
       // frameId 清理逻辑...
       return element;
     }),
-    files: files ? _files : undefined,  // 只打包被引用的文件
+    files: files ? _files : undefined,  // 去重后的文件集合
   };
 
   return JSON.stringify(contents);
@@ -206,24 +235,51 @@ export const serializeAsClipboardJSON = ({
 ```
 
 **复制阶段去重特性**：
-- 基于引用收集，只包含被选中图片元素实际引用的文件
-- reduce 遍历自动去重，相同 fileId 只保留一份
-- 剪贴板 JSON 的 files 字段无冗余数据
+- **输入**：N 个图片元素（可能 M 个唯一 fileId）
+- **输出**：M 个文件数据（fileId 唯一）
+- **机制**：reduce + 对象属性覆盖自动去重
+- **结果**：剪贴板中无冗余文件数据
 
 ---
 
-### 4.2 粘贴阶段：利用 fileId 去重落库
-
-#### 完整调用链
+### 4.4 复制流程图示
 
 ```
-用户按下 Ctrl+V 或右键粘贴
+用户选中图片元素（Img1、Img2、Img3）
+    ↓  其中 Img1.fileId = Img2.fileId = X, Img3.fileId = Y
+用户按下 Ctrl+C
+    ↓
+document COPY 事件触发 → onCopy()  App.tsx:3606
+    ↓
+actionCopy.perform()  actionClipboard.tsx:28
+    ↓
+copyToClipboard([Img1, Img2, Img3], files, event)  clipboard.ts:194
+    ↓
+serializeAsClipboardJSON({ elements, files })  clipboard.ts:142
+    ↓
+┌─────────────────────────────────────────────────────┐
+│  reduce 遍历：                                        │
+│  Img1 (fileId=X) → acc[X] = files[X]                │
+│  Img2 (fileId=X) → acc[X] = files[X]  (覆盖，值相同) │
+│  Img3 (fileId=Y) → acc[Y] = files[Y]                │
+│  结果：acc = { X: data, Y: data }  ← 去重完成       │
+└─────────────────────────────────────────────────────┘
+    ↓
+copyTextToSystemClipboard(json, event)  clipboard.ts:202
+    ↓
+写入系统剪贴板完成
+```
+
+## 五、粘贴阶段：去重落库调用链
+
+### 5.1 粘贴完整调用链（按真实代码排序）
+
+```
+用户按下 Ctrl+V
     ↓
 pasteFromClipboard(event)  App.tsx:3867-3918
     ↓
-parseDataTransferEvent(event)  获取剪贴板内容
-    ↓
-parseClipboard(dataTransferList, isPlainPaste)  解析剪贴板 JSON
+parseClipboard(dataTransferList, isPlainPaste)  clipboard.ts
     ↓
 extract elements 和 files 从剪贴板数据
     ↓
@@ -235,41 +291,43 @@ if (data.elements) → 执行元素粘贴
     ↓
 addElementsFromPasteOrLibrary({ elements, files, ... })  App.tsx:3920-4020
     ↓
-┌─────────────────────────────────────────────────────────────┐
-│  **复制元素，保留 fileId 引用**                               │
-│  duplicateElements({ elements, ... })  为每个元素生成新 ID   │
-│  → 元素 id 会变，但 fileId 引用保持不变                      │
-└─────────────────────────────────────────────────────────────┘
-    ↓
+┌─────────────────────────────────────────────────────────┐
+│  复制元素，保留 fileId 引用                               │
+│  duplicateElements({ elements, ... })                    │
+│  → 元素 id 会变，但 fileId 引用保持不变                   │
+└──────────────────────────┬───────────────────────────────┘
+                           ↓
 将 duplicatedElements 添加到场景
     ↓
-┌─────────────────────────────────────────────────────────────┐
-│  **去重发生点 2：文件去重落库**                               │
-│  if (opts.files) {                                           │
-│    this.addMissingFiles(opts.files);  // ← 关键              │
-│  }                                                           │
-│  addMissingFiles(files)  App.tsx:4536-4573                   │
-│  → 遍历每个 file，if (nextFiles[file.id]) → 跳过             │
-│  → 不存在则添加到 this.files                                 │
-└─────────────────────────────────────────────────────────────┘
-    ↓
-┌─────────────────────────────────────────────────────────────┐
-│  **去重发生点 3：渲染缓存去重**                               │
-│  this.setState({}, () => {                                   │
-│    this.addNewImagesToImageCache();  // ← 关键               │
-│  });                                                         │
-│  addNewImagesToImageCache()  App.tsx:11926-11954             │
-│  → 只处理 !element.isDeleted && !imageCache.has(fileId)     │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│  **去重发生点 2：文件去重落库**                           │
+│  if (opts.files) {                                       │
+│    this.addMissingFiles(opts.files);  // 关键            │
+│  }                                                       │
+│  addMissingFiles(files)  App.tsx:4536-4573               │
+│  → 遍历每个 file，if (nextFiles[file.id]) → 跳过         │
+│  → 不存在则添加到 this.files                              │
+└──────────────────────────┬───────────────────────────────┘
+                           ↓
+┌─────────────────────────────────────────────────────────┐
+│  **去重发生点 3：渲染缓存去重**                           │
+│  this.setState({}, () => {                               │
+│    this.addNewImagesToImageCache();  // 关键              │
+│  });                                                     │
+│  addNewImagesToImageCache()  App.tsx:11926-11954         │
+│  → 只处理 !element.isDeleted && !imageCache.has(fileId)  │
+└─────────────────────────────────────────────────────────┘
     ↓
 选中新粘贴的元素
     ↓
 粘贴完成
 ```
 
-#### 核心去重代码
+---
 
-**去重发生点 2：文件数据去重**
+### 5.2 粘贴去重核心代码
+
+**去重发生点 2：文件数据去重落库**
 
 位于 `packages/excalidraw/components/App.tsx:4536-4573`：
 
@@ -286,7 +344,7 @@ private addMissingFiles = (
   for (const fileData of _files) {
     // 关键：基于 fileId 的存在性检查
     if (nextFiles[fileData.id]) {
-      continue;  // 已存在，跳过
+      continue;  // 已存在，跳过，实现去重
     }
 
     addedFiles[fileData.id] = fileData;
@@ -334,35 +392,36 @@ private addNewImagesToImageCache = async (
 
 ---
 
-### 4.3 复制粘贴去重流程图示
+### 5.3 粘贴去重流程图示
 
 ```
-复制阶段 (serializeAsClipboardJSON)
-┌─────────────────────────────────────────────────────┐
-│  选中元素: [ImgA(fileId=X), ImgB(fileId=X), ImgC(fileId=Y)]  │
-│  ↓ reduce 遍历                                                │
-│  files: { X: dataX, Y: dataY }  ← 去重后只剩 2 个文件        │
-└──────────────────────────────────────────────────────────────┘
-                              ↓
-                        写入剪贴板
-                              ↓
-粘贴阶段 (addElementsFromPasteOrLibrary)
-┌──────────────────────────────────────────────────────────────┐
-│  duplicateElements → [ImgA'(id=new, fileId=X),               │
-│                        ImgB'(id=new, fileId=X),               │
-│                        ImgC'(id=new, fileId=Y)]               │
-│  ↓                                                            │
-│  addMissingFiles({ X: dataX, Y: dataY })                      │
-│    if !this.files[X] → 添加                                    │
-│    if !this.files[Y] → 添加                                    │
-│  ↓                                                            │
-│  结果：3 个元素共享 2 个文件数据                               │
-└──────────────────────────────────────────────────────────────┘
+剪贴板数据：elements = [ImgA(X), ImgB(X), ImgC(Y)], files = { X: data, Y: data }
+    ↓
+pasteFromClipboard()  App.tsx:3867
+    ↓
+parseClipboard() → 解析出 elements 和 files
+    ↓
+insertClipboardContent()  App.tsx:3700
+    ↓
+addElementsFromPasteOrLibrary({ elements, files })  App.tsx:3920
+    ↓
+duplicateElements()
+    → [ImgA'(id=new, fileId=X), ImgB'(id=new, fileId=X), ImgC'(id=new, fileId=Y)]
+    ↓
+addMissingFiles({ X: data, Y: data })
+    ├─ if !this.files[X] → 添加
+    └─ if !this.files[Y] → 添加
+    ↓
+addNewImagesToImageCache()
+    ├─ if !imageCache.has(X) → 加载并缓存
+    └─ if !imageCache.has(Y) → 加载并缓存
+    ↓
+结果：3 个元素共享 2 个文件数据，无冗余
 ```
 
-## 五、缓存回收机制（基于真实代码）
+## 六、缓存回收机制（基于真实代码）
 
-### 5.1 回收触发时序
+### 6.1 回收触发时序
 
 #### 触发事件：场景初次加载完成后
 
@@ -413,7 +472,7 @@ loadImages(data, /* isInitialLoad */ true)  App.tsx:529
 
 ---
 
-### 5.2 回收判断逻辑（真实代码）
+### 6.2 回收判断逻辑（真实代码）
 
 位于 `excalidraw-app/data/LocalData.ts:54-70`：
 
@@ -450,7 +509,7 @@ class LocalFileManager extends FileManager {
 
 ---
 
-### 5.3 lastRetrieved 更新时机
+### 6.3 lastRetrieved 更新时机
 
 位于 `excalidraw-app/data/LocalData.ts:179-198`：
 
@@ -489,7 +548,7 @@ getFiles(ids) {
 
 ---
 
-### 5.4 回收机制总结
+### 6.4 回收机制总结
 
 | 项目 | 真实值 |
 |------|--------|
@@ -526,9 +585,9 @@ getFiles(ids) {
   del(id, filesStore)  保留
 ```
 
-## 六、文件插入去重机制
+## 七、文件插入去重机制
 
-### 6.1 图片初始化时去重
+### 7.1 图片初始化时去重
 
 位于 `packages/excalidraw/components/App.tsx:11684-11804`：
 
@@ -559,9 +618,9 @@ private initializeImage = async (placeholder, imageFile) => {
 };
 ```
 
-## 七、性能与空间效率总结
+## 八、性能与空间效率总结
 
-### 7.1 空间效率
+### 8.1 空间效率
 
 | 场景 | 无去重 | 有去重 | 节省比例 |
 |------|--------|--------|----------|
@@ -569,14 +628,14 @@ private initializeImage = async (placeholder, imageFile) => {
 | 导出包含重复图片的场景 | N 份文件 | M 个唯一文件 | (N-M)/N |
 | 协作同步重复图片 | 每次同步全量 | 只同步缺失的 | 视重复率而定 |
 
-### 7.2 性能优化点
+### 8.2 性能优化点
 
 1. **缓存命中**：重复插入相同图片时跳过下载、压缩、解码等耗时操作
 2. **批量更新**：`updateImageCache` 批量处理，避免重复加载
 3. **状态追踪**：`FileManager` 避免重复网络请求
 4. **延迟解码**：图片仅在实际渲染时才解码为 `HTMLImageElement`
 
-### 7.3 边界情况处理
+### 8.3 边界情况处理
 
 | 情况 | 处理方式 |
 |------|----------|
