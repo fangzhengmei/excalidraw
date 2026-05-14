@@ -206,13 +206,12 @@ initializeRoom({ fetchScene: true, roomLinkData })
    3. ✨ resetScene() 重要：强制清空本地场景
    4. loadFromFirebase(roomId, roomKey, socket)
         ↓
-        ├─→ 成功：返回 elements
+        ├─→ 成功：返回 { elements, scrollToContent: true }
         │    - setLastBroadcastedOrReceivedSceneVersion()
-        │    - scenePromise.resolve(elements)
         │    - 设置 socketInitialized = true
-        └─→ 失败：log error 并继续
+        └─→ 失败 / 无数据：log error → 返回 null
              - socketInitialized = true
-             - scenePromise 可能永远 pending？
+             - scenePromise.resolve(null) ✅ 不会挂起
 ```
 
 **链路 2：连接错误回退**
