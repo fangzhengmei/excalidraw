@@ -6,10 +6,10 @@ Excalidraw 的撤销重做系统基于 **增量式 delta 快照** 机制实现�
 
 | 组件 | 职责 | 位置 |
 |------|------|------|
-| `History` | 管理 undo/redo 栈，执行撤销重做操作 | `packages/excalidraw/history.ts` |
-| `Store` | 状态快照管理、delta 计算、增量发射 | `packages/excalidraw/element/src/store.ts` |
-| `StoreDelta` | 封装元素与应用状态的变化增量 | `packages/excalidraw/element/src/store.ts` |
-| `HistoryDelta` | 历史专用增量，继承自 StoreDelta | `packages/excalidraw/history.ts` |
+| `History` | 管理 undo/redo 栈，执行撤销重做操作 | `packages/excalidraw/history.ts:90-249` |
+| `Store` | 状态快照管理、delta 计算、增量发射 | `packages/element/src/store.ts:78-427` |
+| `StoreDelta` | 封装元素与应用状态的变化增量 | `packages/element/src/store.ts:497-637` |
+| `HistoryDelta` | 历史专用增量，继承自 StoreDelta | `packages/excalidraw/history.ts:15-81` |
 
 ---
 
@@ -43,9 +43,11 @@ undoStack[6] = 删除选中元素
 **选择状态变化总是独立记录**，这是历史分组的关键特性：
 
 ```typescript
-// store.ts:813-840 - getObservedAppState 定义了需要观察的应用状态
-const getObservedAppState = (appState: AppState): ObservedAppState => {
-  return {
+// packages/element/src/store.ts:1006-1032 - getObservedAppState 定义了需要观察的应用状态
+export const getObservedAppState = (
+  appState: AppState | ObservedAppState,
+): ObservedAppState => {
+  const observedAppState = {
     name: appState.name,
     editingGroupId: appState.editingGroupId,
     viewBackgroundColor: appState.viewBackgroundColor,
@@ -56,6 +58,7 @@ const getObservedAppState = (appState: AppState): ObservedAppState => {
     activeLockedId: appState.activeLockedId,
     lockedMultiSelections: appState.lockedMultiSelections,
   };
+  // ...
 };
 ```
 
@@ -70,6 +73,7 @@ const getObservedAppState = (appState: AppState): ObservedAppState => {
 这是历史分组的 **核心控制机制**：
 
 ```typescript
+// packages/element/src/store.ts:38-69
 export const CaptureUpdateAction = {
   /**
    * 立即可撤销
@@ -100,7 +104,7 @@ export const CaptureUpdateAction = {
 ### 3.2 动作优先级与调度
 
 ```typescript
-// store.ts:391-406 - getScheduledMacroAction
+// packages/element/src/store.ts:391-406 - getScheduledMacroAction
 private getScheduledMacroAction() {
   if (this.scheduledMacroActions.has(CaptureUpdateAction.IMMEDIATELY)) {
     // IMMEDIATELY 优先级最高
@@ -125,35 +129,139 @@ private getScheduledMacroAction() {
 
 ## 四、撤销重做执行机制
 
-### 4.1 迭代跳过无可见变化的条目
+### 4.1 核心执行流程：跨条目跳过与反向推入
 
-执行 undo/redo 时，系统会 **自动跳过不产生可见变化的历史条目**：
+这是历史分组策略最精妙的部分，一次 undo/redo 调用可能跨越多个历史条目：
 
 ```typescript
-// history.ts:179-219 - perform 方法中的迭代逻辑
-while (historyDelta) {
-  [nextElements, nextAppState, containsVisibleChange] = 
-    historyDelta.applyTo(nextElements, nextAppState, prevSnapshot);
-  
-  // ... 应用 delta ...
-  
-  if (containsVisibleChange) {
-    break;  // 遇到可见变化，停止迭代
+// packages/excalidraw/history.ts:157-229 - perform 方法核心循环
+private perform(
+  elements: SceneElementsMap,
+  appState: AppState,
+  pop: () => HistoryDelta | null,          // 从源栈弹出
+  push: (entry: HistoryDelta) => void,     // 推入目标栈（undo->redo 或 redo->undo）
+): [SceneElementsMap, AppState] | void {
+  try {
+    let historyDelta = pop();
+
+    if (historyDelta === null) {
+      return;
+    }
+
+    const action = CaptureUpdateAction.IMMEDIATELY;
+    let prevSnapshot = this.store.snapshot;
+    let nextElements = elements;
+    let nextAppState = appState;
+    let containsVisibleChange = false;
+
+    // 🔄 关键循环：迭代跳过无可见变化的条目
+    while (historyDelta) {
+      try {
+        // 1️⃣ 应用当前 delta，判断是否产生可见变化
+        [nextElements, nextAppState, containsVisibleChange] =
+          historyDelta.applyTo(nextElements, nextAppState, prevSnapshot);
+
+        // 2️⃣ 创建新快照用于后续增量计算
+        const prevElements = prevSnapshot.elements;
+        const nextSnapshot = prevSnapshot.maybeClone(
+          action,
+          nextElements,
+          nextAppState,
+        );
+
+        // 3️⃣ 计算 store change 并调度微动作
+        const change = StoreChange.create(prevSnapshot, nextSnapshot);
+        const delta = HistoryDelta.applyLatestChanges(
+          historyDelta,
+          prevElements,
+          nextElements,
+        );
+
+        if (!delta.isEmpty()) {
+          this.store.scheduleMicroAction({ action, change, delta });
+          historyDelta = delta;
+        }
+
+        prevSnapshot = nextSnapshot;
+      } finally {
+        // 🔄 无论是否产生可见变化，都将当前条目反转后推入目标栈
+        push(historyDelta);
+      }
+
+      // ⏭️ 终止条件：产生可见变化则停止迭代
+      if (containsVisibleChange) {
+        break;
+      }
+
+      // 🚀 无可见变化，继续弹出下一个条目继续处理
+      historyDelta = pop();
+    }
+
+    return [nextElements, nextAppState];
+  } finally {
+    // 仅触发一次历史变更事件
+    this.onHistoryChangedEmitter.trigger(
+      new HistoryChangedEvent(this.isUndoStackEmpty, this.isRedoStackEmpty),
+    );
   }
-  
-  historyDelta = pop();  // 继续弹出下一个条目
 }
 ```
 
-**关键行为**：
-- 纯选择变化在某些情况下可能被判断为"无可见变化"
-- 系统会连续跳过多个条目，直到找到产生可见变化的条目
-- 被跳过的条目仍然会被推入相反方向的栈中（undo→redo，redo→undo）
+### 4.2 跨条目跳过机制详解
 
-### 4.2 Redo 栈的清空策略
+#### 流程图解
+
+```
+用户发起 Undo
+    ↓
+[Undo 栈] 弹出 Entry A → 应用 → 检查可见变化
+    ↓ 无可见变化
+    ├─ Entry A 反转后推入 [Redo 栈] ✅
+    ↓
+[Undo 栈] 弹出 Entry B → 应用 → 检查可见变化
+    ↓ 无可见变化
+    ├─ Entry B 反转后推入 [Redo 栈] ✅
+    ↓
+[Undo 栈] 弹出 Entry C → 应用 → 检查可见变化
+    ↓ 有可见变化 🎯
+    ├─ Entry C 反转后推入 [Redo 栈] ✅
+    └─ 停止循环，返回最终状态
+
+最终效果：1 次 Undo 操作跨越了 3 个历史条目
+         但用户只看到 Entry C 带来的视觉变化
+```
+
+#### 关键设计要点
+
+| 特性 | 实现位置 | 说明 |
+|------|---------|------|
+| **finally 确保推入** | `history.ts:210-212` | 无论成功失败、无论是否可见，每个弹出的条目都会被推入反向栈 |
+| **迭代终止条件** | `history.ts:214-216` | 遇到第一个产生可见变化的条目即停止 |
+| **累积状态传递** | `history.ts:174-176, 209` | nextElements/nextAppState 在循环中累积传递 |
+| **栈对称性保证** | `history.ts:245-248` | push 时自动反转 delta，保证 undo/redo 可往返 |
+
+#### 栈操作的原子性
 
 ```typescript
-// history.ts:127-131 - record 方法中的 redo 栈清空逻辑
+// packages/excalidraw/history.ts:231-248 - pop/push 辅助函数
+private static pop(stack: HistoryDelta[]): HistoryDelta | null {
+  if (!stack.length) return null;
+  const entry = stack.pop();
+  return entry !== undefined ? entry : null;
+}
+
+private static push(stack: HistoryDelta[], entry: HistoryDelta) {
+  const inversedEntry = HistoryDelta.inverse(entry); // 🔄 关键：推入前反转
+  return stack.push(inversedEntry);
+}
+```
+
+**重要性质**：每个条目从源栈 `pop()` 后，必然在 `finally` 块中 `push()` 到目标栈，保证了历史记录的完整性，不会因为异常或跳过逻辑丢失条目。
+
+### 4.3 Redo 栈的清空策略
+
+```typescript
+// packages/excalidraw/history.ts:127-132 - record 方法中的 redo 栈清空逻辑
 if (!historyDelta.elements.isEmpty()) {
   // 只有当元素发生变化时才清空 redo 栈
   // 纯应用状态变化（如点击取消选择）不会丢失 redo 历史
@@ -180,10 +288,11 @@ if (!historyDelta.elements.isEmpty()) {
 ### 5.1 HistoryDelta 组成
 
 ```typescript
+// packages/excalidraw/history.ts:15-81
 class HistoryDelta extends StoreDelta {
   elements: ElementsDelta;  // 元素变化（新增、删除、更新）
   appState: AppStateDelta;  // 应用状态变化
-  
+
   applyTo(elements, appState, snapshot): [SceneElementsMap, AppState, boolean]
   // 返回值第三个参数：是否产生可见变化
 }
@@ -192,7 +301,7 @@ class HistoryDelta extends StoreDelta {
 ### 5.2 增量的反向应用
 
 ```typescript
-// history.ts:245-248 - push 时自动反转 delta
+// packages/excalidraw/history.ts:245-248 - push 时自动反转 delta
 private static push(stack: HistoryDelta[], entry: HistoryDelta) {
   const inversedEntry = HistoryDelta.inverse(entry);
   return stack.push(inversedEntry);
@@ -214,12 +323,13 @@ private static push(stack: HistoryDelta[], entry: HistoryDelta) {
 2. **协作友好**：基于增量的设计天然支持多人协作
 3. **性能优化**：EVENTUALLY 避免了拖拽等连续操作产生大量历史条目
 4. **用户体验优化**：纯选择变化不清空 redo 栈，保留重做可能性
+5. **健壮的异常处理**：finally 块保证栈操作的原子性，异常也不会丢失历史
 
 ### ⚠️ 潜在问题
 
 1. **历史栈膨胀**：选择变化作为独立条目，导致历史条目数量较多
    - 三个元素的创建 + 删除可能产生 6-7 个条目
-   
+
 2. **用户预期差异**：用户可能期望"一次撤销"回退到"上一个有意义的状态"，而不是精确的每一步
 
 3. **无变化迭代**：多次撤销可能需要跳过多个无可见变化的条目才能看到实际效果
@@ -245,14 +355,16 @@ private static push(stack: HistoryDelta[], entry: HistoryDelta) {
 
 | 功能 | 文件 | 行号 |
 |------|------|------|
-| 历史栈核心逻辑 | `packages/excalidraw/history.ts` | 90-250 |
-| 捕获动作类型定义 | `packages/excalidraw/element/src/store.ts` | 38-69 |
-| Store 提交逻辑 | `packages/excalidraw/element/src/store.ts` | 183-201 |
-| 动作优先级调度 | `packages/excalidraw/element/src/store.ts` | 391-406 |
-| 观察的应用状态 | `packages/excalidraw/element/src/store.ts` | 813-840 |
-| 快照克隆逻辑 | `packages/excalidraw/element/src/store.ts` | 761-811 |
-| 撤销迭代跳过逻辑 | `packages/excalidraw/history.ts` | 179-219 |
-| Redo 栈清空策略 | `packages/excalidraw/history.ts` | 127-131 |
+| 历史栈核心逻辑 | `packages/excalidraw/history.ts` | 90-249 |
+| perform 核心循环（含跳过机制） | `packages/excalidraw/history.ts` | 157-229 |
+| finally 块确保反向推入 | `packages/excalidraw/history.ts` | 210-212 |
+| pop/push 辅助函数 | `packages/excalidraw/history.ts` | 231-248 |
+| redo 栈清空策略 | `packages/excalidraw/history.ts` | 127-132 |
+| 捕获动作类型定义 | `packages/element/src/store.ts` | 38-69 |
+| Store commit 逻辑 | `packages/element/src/store.ts` | 183-201 |
+| 动作优先级调度 | `packages/element/src/store.ts` | 391-406 |
+| 观察的应用状态定义 | `packages/element/src/store.ts` | 1006-1032 |
+| StoreSnapshot maybeClone | `packages/element/src/store.ts` | 761-811 |
 
 ---
 
@@ -262,7 +374,7 @@ Excalidraw 的历史分组策略采用 **"精确记录 + 智能跳过"** 的混�
 
 1. **分组原则**：基于用户交互的原子性，每个选择变化都是独立边界
 2. **状态保留**：通过三种捕获动作精确控制哪些变化进入历史、哪些更新快照
-3. **执行策略**：撤销重做时自动跳过无可见变化的条目
+3. **执行策略**：撤销重做时自动迭代跳过无可见变化的条目，**finally 块保证每个弹出条目都被推入反向栈**
 4. **特殊处理**：纯应用状态变化不清空 redo 栈，优化用户体验
 
-这种设计在 **协作支持**、**精确恢复** 和 **性能** 之间取得了平衡，虽然历史条目数量较多，但保证了状态变化的完整性和可追溯性。
+这种设计在 **协作支持**、**精确恢复** 和 **性能** 之间取得了平衡，虽然历史条目数量较多，但保证了状态变化的完整性和可追溯性。**跨条目的智能跳过机制** 是其核心创新点，既保留了细粒度的历史记录，又避免用户因选择变化等"看不见"的操作而频繁按撤销。
