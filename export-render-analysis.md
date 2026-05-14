@@ -1,8 +1,8 @@
-# Excalidraw 导出渲染分支分析
+# Excalidraw 导出渲染分支分析（可核对修订版）
 
 ## 概述
 
-Excalidraw 提供了两种主要的图形导出模式：**PNG（Canvas 导出）** 和 **SVG（矢量导出）**。两种模式在数据获取、样式处理、边界裁剪等方面存在显著差异。
+Excalidraw 提供了两种主要的图形导出模式：**PNG（Canvas 导出）** 和 **SVG（矢量导出）**。本报告通过逐行核对源代码，详细对比两种模式在数据获取、样式处理、边界裁剪、异常处理等方面的实现差异，所有结论均附带代码证据和触发条件。
 
 ---
 
@@ -14,9 +14,9 @@ exportToBlob()
     ↓
 exportToCanvas() [utils/src/export.ts]
     ↓
-_exportToCanvas() [scene/export.ts]
+_exportToCanvas() [scene/export.ts:176]
     ↓
-renderStaticScene() [renderer/staticScene.ts]
+renderStaticScene() [renderer/staticScene.ts:491]
     ↓
 renderElement() [element/renderElement.ts]
 ```
@@ -37,9 +37,7 @@ renderElementToSvg() [renderer/staticSvgScene.ts:87]
 ## 二、数据获取层差异
 
 ### 2.1 元素预处理（prepareElementsForRender）
-**位置：** `scene/export.ts:146-174`
-
-两种导出模式共享相同的元素预处理逻辑：
+**代码位置：** `scene/export.ts:146-174`
 
 ```typescript
 const prepareElementsForRender = ({
@@ -49,23 +47,28 @@ const prepareElementsForRender = ({
   exportWithDarkMode, // 暗色模式
 }) => {
   if (exportingFrame) {
-    // 导出单个 Frame：只获取与 Frame 重叠的元素
-    return getElementsOverlappingFrame(elements, exportingFrame, arrayToMap(elements));
+    // [证据 A1] 导出单个 Frame：只获取与 Frame 重叠的元素
+    return getElementsOverlappingFrame(
+      elements,
+      exportingFrame,
+      arrayToMap(elements),
+    );
   } else if (frameRendering.enabled && frameRendering.name) {
-    // 启用 Frame 名称：添加 Frame 名称作为文本元素
+    // [证据 A2] 启用 Frame 名称：添加 Frame 名称作为文本元素
     return addFrameLabelsAsTextElements(elements, { exportWithDarkMode });
   }
   return elements;
 };
 ```
 
-**关键点：**
-- ✅ 两种模式共享此逻辑
-- ✅ Frame 名称通过创建临时文本元素实现
-- ✅ 单个 Frame 导出时只导出重叠元素
+**结论：** ✅ 两种模式完全共享此逻辑
+
+**触发条件：**
+- 单帧导出：`exportingFrame != null` → 只保留重叠元素
+- 多帧导出：`frameRendering.name == true` → 插入 Frame 名称文本
 
 ### 2.2 尺寸计算（getCanvasSize）
-**位置：** `scene/export.ts:564-573`
+**代码位置：** `scene/export.ts:564-573`
 
 ```typescript
 const getCanvasSize = (elements, exportPadding) => {
@@ -76,169 +79,200 @@ const getCanvasSize = (elements, exportPadding) => {
 };
 ```
 
-**差异点：**
-- **PNG：** `exportPadding` 默认为 `DEFAULT_EXPORT_PADDING`
-- **SVG：** 同样使用，但导出单个 Frame 时 `exportPadding = 0`
+**触发条件差异：**
+| 模式 | 单帧导出时边界 | 代码证据 |
+|------|---------------|---------|
+| **PNG** | 以 Frame 边界为准，`exportPadding = 0` | `scene/export.ts:224-226, 228-231` |
+| **SVG** | 以 Frame 边界为准，`exportPadding = 0` | `scene/export.ts:333-335, 337-340` |
+
+**结论：** ✅ 两种模式在尺寸计算上完全一致
 
 ### 2.3 图像资源处理
-| 模式 | 处理方式 | 位置 |
-|------|---------|------|
-| **PNG** | 使用 `updateImageCache` 构建缓存，Canvas 直接绘制 dataURL | `scene/export.ts:237-243` |
-| **SVG** | 创建 `<symbol>` 复用图像，通过 `<use>` 引用，支持裁剪 mask | `staticSvgScene.ts:437-596` |
+| 模式 | 处理方式 | 代码证据 |
+|------|---------|---------|
+| **PNG** | `updateImageCache` 构建缓存，Canvas `drawImage` 直接绘制 dataURL | `scene/export.ts:237-243` |
+| **SVG** | 创建 `<symbol>` 复用图像，通过 `<use>` 引用，裁剪用 `<mask>` | `staticSvgScene.ts:437-596` |
 
 ---
 
 ## 三、样式处理层差异
 
 ### 3.1 渲染引擎
-| 模式 | 技术栈 | 核心 API |
-|------|---------|---------|
-| **PNG** | HTML5 Canvas + Rough.js | `CanvasRenderingContext2D`, `rough.canvas()` |
-| **SVG** | SVG DOM + Rough.js | `document.createElementNS()`, `rough.svg()` |
+| 模式 | 技术栈 | 核心 API | 代码证据 |
+|------|---------|---------|---------|
+| **PNG** | HTML5 Canvas + Rough.js | `CanvasRenderingContext2D`, `rough.canvas()` | `scene/export.ts:246-247` |
+| **SVG** | SVG DOM + Rough.js | `document.createElementNS()`, `rough.svg()` | `scene/export.ts:473`, `staticSvgScene.ts:50-64` |
 
 ### 3.2 暗色主题处理
-**共同逻辑：** `applyDarkModeFilter()` 颜色转换
+**共同逻辑：** `applyDarkModeFilter()` 颜色转换函数
 
-**差异实现：**
-
-**PNG 渲染：**
+**PNG 实现：**
 ```typescript
-// staticScene.ts:250-258
-bootstrapCanvas({
-  theme: appState.theme, // THEME.DARK / THEME.LIGHT
-  isExporting,
-  viewBackgroundColor: appState.viewBackgroundColor,
-});
+// [证据 B1] Canvas 初始化时统一设置主题
+// scene/export.ts:256-265, 266-276
+theme: appState.exportWithDarkMode ? THEME.DARK : THEME.LIGHT
 ```
-- 在 Canvas 初始化时应用主题
-- 元素渲染时动态转换颜色
+- 触发条件：`exportWithDarkMode = true`
+- 实现方式：Canvas 初始化时统一设置，元素渲染时动态转换颜色
 
-**SVG 渲染：**
+**SVG 实现：**
 ```typescript
-// staticSvgScene.ts:680-683
+// [证据 B2] 每个元素单独设置颜色属性
+// staticSvgScene.ts:680-683 (文本), 388-391 (freedraw)
 text.setAttribute(
   "fill",
-  renderConfig.theme === THEME.DARK 
-    ? applyDarkModeFilter(element.strokeColor) 
-    : element.strokeColor
+  renderConfig.theme === THEME.DARK
+    ? applyDarkModeFilter(element.strokeColor)
+    : element.strokeColor,
 );
 ```
-- 每个元素单独设置 fill/stroke 属性
-- SVG 图片使用 CSS filter: `DARK_THEME_FILTER`
+- 触发条件：`renderConfig.theme === THEME.DARK`
+- 实现方式：每个元素独立设置 fill/stroke 属性，图片用 CSS filter
 
-### 3.3 透明度处理
-**PNG：**
+### 3.3 透明度处理（已修正）
+**PNG 实现：**
 ```typescript
-// 在 renderElement 内部处理
+// [证据 C1] 只处理元素自身透明度，不考虑 Frame
+// staticScene.ts:224 (链接图标), element/renderElement 内通用逻辑
 context.globalAlpha = element.opacity / 100;
 ```
 
-**SVG：**
+**SVG 实现：**
 ```typescript
+// [证据 C2] 支持 Frame 透明度与元素透明度叠加
 // staticSvgScene.ts:137-140
-const opacity = ((frame.opacity ?? 100) * element.opacity) / 10000;
+const opacity =
+  ((getContainingFrame(element, elementsMap)?.opacity ?? 100) *
+    element.opacity) /
+  10000;
+
+// 应用到节点
 node.setAttribute("stroke-opacity", `${opacity}`);
 node.setAttribute("fill-opacity", `${opacity}`);
 ```
-- ✅ SVG 支持 Frame 透明度叠加
-- ❌ PNG 仅处理元素自身透明度
+
+**差异对比表：**
+
+| 特性 | PNG (Canvas) | SVG |
+|------|-------------|-----|
+| Frame 透明度叠加 | ❌ 不支持 | ✅ 支持（相乘后 / 10000） |
+| 透明度计算 | `element.opacity / 100` | `(frame.opacity * element.opacity) / 10000` |
+| 应用方式 | context.globalAlpha | stroke-opacity / fill-opacity 属性 |
+| 代码位置 | `staticScene.ts:224` | `staticSvgScene.ts:137-140, 157-159` |
+
+**结论：** 两种模式透明度处理不一致，SVG 功能更完整
 
 ### 3.4 字体处理
-| 模式 | 处理方式 |
-|------|---------|
-| **PNG** | 预加载字体 `Fonts.loadElementsFonts()` |
-| **SVG** | 内联字体声明 `Fonts.generateFontFaceDeclarations()`，嵌入到 `<defs><style>` |
+| 模式 | 处理方式 | 代码证据 |
+|------|---------|---------|
+| **PNG** | 预加载字体 `Fonts.loadElementsFonts()` | `scene/export.ts:200-202` |
+| **SVG** | 内联 font-face 声明到 `<defs><style>` | `scene/export.ts:435-447` |
 
 ### 3.5 变换矩阵（旋转/平移）
 **PNG：**
 ```typescript
+// [证据 D1] 使用 Canvas context 状态栈
 context.translate(x, y);
 context.rotate(angle);
+// save() / restore() 包裹每个元素渲染
+// staticScene.ts:316, 370
 ```
-- 使用 Canvas context 状态栈
-- `save()` / `restore()` 包裹每个元素
 
 **SVG：**
 ```typescript
+// [证据 D2] 直接设置 transform 属性
+// staticSvgScene.ts:162-167 (矩形), 195-200 (iframe), 418-423 (freedraw)
 node.setAttribute(
   "transform",
-  `translate(${offsetX} ${offsetY}) rotate(${degree} ${cx} ${cy})`
+  `translate(${offsetX || 0} ${offsetY || 0}) rotate(${degree} ${cx} ${cy})`,
 );
 ```
-- 直接设置 SVG `transform` 属性
-- 中心点计算更复杂
 
 ---
 
-## 四、边界裁剪（Frame Clip）处理
+## 四、边界裁剪（Frame Clip）处理（重点修订）
 
-### 4.1 PNG Canvas 裁剪
-**位置：** `staticScene.ts:132-156`
+### 4.1 Frame 渲染配置生成
+**代码位置：** `scene/export.ts:133-144`
 
 ```typescript
-export const frameClip = (frame, context, renderConfig, appState) => {
-  context.translate(frame.x + appState.scrollX, frame.y + appState.scrollY);
-  context.beginPath();
-  if (context.roundRect) {
-    context.roundRect(0, 0, frame.width, frame.height, radius);
-  } else {
-    context.rect(0, 0, frame.width, frame.height);
-  }
-  context.clip(); // ✨ 核心裁剪 API
-  context.translate(-(frame.x + appState.scrollX), -(frame.y + appState.scrollY));
+const getFrameRenderingConfig = (
+  exportingFrame: ExcalidrawFrameLikeElement | null,
+  frameRendering: AppState["frameRendering"] | null,
+): AppState["frameRendering"] => {
+  frameRendering = frameRendering || getDefaultAppState().frameRendering;
+  return {
+    enabled: exportingFrame ? true : frameRendering.enabled,
+    outline: exportingFrame ? false : frameRendering.outline,
+    name: exportingFrame ? false : frameRendering.name,
+    clip: exportingFrame ? true : frameRendering.clip, // [证据 E1] 关键差异点
+  };
 };
 ```
 
-**调用时机：**
+### 4.2 PNG Canvas 裁剪逻辑
+**代码位置：** `scene/export.ts:207-215`
+
 ```typescript
-// staticScene.ts:318-335
+const frameRendering = getFrameRenderingConfig(
+  exportingFrame ?? null,
+  appState.frameRendering ?? null,
+);
+// [证据 E2] PNG 单帧导出时强制禁用裁剪！
+// for canvas export, don't clip if exporting a specific frame as it would
+// clip the corners of the content
+if (exportingFrame) {
+  frameRendering.clip = false; // ⚠️ 覆盖默认配置
+}
+```
+
+**裁剪调用时机：** `staticScene.ts:318-335`
+```typescript
 if (frameId && appState.frameRendering.enabled && appState.frameRendering.clip) {
   const frame = getTargetFrame(element, elementsMap, appState);
-  if (frame && shouldApplyFrameClip(element, frame, appState, elementsMap, inFrameGroupsMap)) {
+  if (frame && shouldApplyFrameClip(...)) {
     frameClip(frame, context, renderConfig, appState);
   }
   renderElement(...);
 }
 ```
 
-**裁剪特性：**
-- ✅ 使用 Canvas 原生 `clip()`
-- ✅ 裁剪前 `save()`，裁剪后 `restore()`
-- ✅ 支持圆角（`roundRect`）
-- ✅ 每个元素渲染前判断是否需要裁剪
-- ❌ 导出单个 Frame 时 **禁用** 裁剪（`scene/export.ts:213-215`）
+**PNG 裁剪特性总结：**
+- 技术实现：`context.clip()` + `context.roundRect()`
+- 单帧导出：❌ **强制禁用**（代码显式设置 `clip = false`）
+- 多帧导出：✅ 正常裁剪
+- 代码位置：`scene/export.ts:211-215`, `staticScene.ts:132-156`
 
-### 4.2 SVG ClipPath 裁剪
-**位置：** `staticSvgScene.ts:66-85, 393-429`
-
-**Step 1: 预创建所有 Frame 的 clipPath**
+### 4.3 SVG ClipPath 裁剪逻辑
+**Step 1: 预创建所有 Frame 的 clipPath（不被配置覆盖）**
 ```typescript
+// [证据 E3] SVG 始终预创建 clipPath，不受 frameRendering.clip 影响
 // scene/export.ts:393-429
-for (const frame of frameElements) {
-  const clipPath = svgRoot.ownerDocument.createElementNS(SVG_NS, "clipPath");
-  clipPath.setAttribute("id", frame.id);
-  
-  const rect = svgRoot.ownerDocument.createElementNS(SVG_NS, "rect");
-  rect.setAttribute("transform", `translate(${frame.x + offsetX} ${frame.y + offsetY}) rotate(...)`);
-  rect.setAttribute("width", `${frame.width}`);
-  rect.setAttribute("height", `${frame.height}`);
-  rect.setAttribute("rx", `${FRAME_STYLE.radius}`);
-  
-  clipPath.appendChild(rect);
-  defsElement.appendChild(clipPath);
+const frameElements = getFrameLikeElements(elements);
+if (frameElements.length) {
+  const elementsMap = arrayToMap(elements);
+  for (const frame of frameElements) {
+    const clipPath = svgRoot.ownerDocument.createElementNS(SVG_NS, "clipPath");
+    clipPath.setAttribute("id", frame.id);
+    // ... 创建裁剪矩形
+    defsElement.appendChild(clipPath);
+  }
 }
 ```
 
-**Step 2: 元素渲染时引用 clipPath**
+**Step 2: 元素渲染时条件引用**
 ```typescript
+// [证据 E4] 根据 frameRendering.clip 决定是否引用 clipPath
 // staticSvgScene.ts:66-85
-const maybeWrapNodesInFrameClipPath = (element, root, nodes, frameRendering, elementsMap) => {
+const maybeWrapNodesInFrameClipPath = (
+  element, root, nodes, frameRendering, elementsMap,
+) => {
   if (!frameRendering.enabled || !frameRendering.clip) {
-    return null;
+    return null; // 不裁剪
   }
   const frame = getContainingFrame(element, elementsMap);
   if (frame) {
-    const g = root.ownerDocument.createElementNS(SVG_NS, "g");
+    const g = svgRoot.ownerDocument.createElementNS(SVG_NS, "g");
     g.setAttributeNS(SVG_NS, "clip-path", `url(#${frame.id})`);
     nodes.forEach((node) => g.appendChild(node));
     return g;
@@ -247,30 +281,77 @@ const maybeWrapNodesInFrameClipPath = (element, root, nodes, frameRendering, ele
 };
 ```
 
-**裁剪特性：**
-- ✅ 使用 SVG `<clipPath>` 定义，`<g clip-path="url(#id)">` 引用
-- ✅ 预创建所有 Frame 裁剪路径，复用率高
-- ✅ 支持圆角（`rx`/`ry` 属性）
-- ✅ 导出单个 Frame 时 **启用** 裁剪
-- ✅ 通过 `<g>` 包装元素，不影响元素自身变换
+**SVG 裁剪特性总结：**
+- 技术实现：`<clipPath>` 定义 + `clip-path="url(#id)"` 属性引用
+- 单帧导出：✅ **保持启用**（`getFrameRenderingConfig` 返回 `clip: true`）
+- 多帧导出：✅ 正常裁剪
+- 代码位置：`scene/export.ts:393-429`, `staticSvgScene.ts:66-85`
 
-### 4.3 Frame 裁剪差异对比
+### 4.4 裁剪差异对比表（已核实）
 
 | 特性 | PNG (Canvas) | SVG |
 |------|-------------|-----|
-| **技术实现** | `context.clip()` | `<clipPath>` + `clip-path` 属性 |
-| **作用时机** | 渲染每个元素前 | 预定义 + 渲染时引用 |
-| **圆角支持** | `roundRect()`（浏览器依赖） | `rx`/`ry` 属性（标准） |
-| **导出单个 Frame 时** | ❌ 禁用裁剪 | ✅ 启用裁剪 |
-| **透明度叠加** | ❌ 仅元素 opacity | ✅ Frame + Element opacity |
-| **变换影响** | 与 context 变换栈耦合 | 独立，不影响元素 transform |
-| **性能** | 单次裁剪，速度快 | DOM 节点多，内存占用大 |
+| **技术实现** | `context.clip()` + `roundRect()` | `<clipPath>` + CSS clip-path 属性 |
+| **clipPath 预创建** | ❌ 不需要 | ✅ 始终创建，不受配置影响 |
+| **单帧导出时裁剪** | ❌ 强制禁用（`clip = false`） | ✅ 保持启用（`clip = true`） |
+| **单帧导出配置来源** | `export.ts:213-215` 强制覆盖 | `export.ts:142` 默认配置 |
+| **多帧导出时裁剪** | ✅ 正常启用 | ✅ 正常启用 |
+| **圆角支持** | ✅ `context.roundRect()` | ✅ `<rect rx="..." ry="...">` |
+| **变换影响** | 与 context 变换栈耦合 | 独立，不影响元素自身 transform |
+| **透明度叠加** | ❌ 裁剪时不考虑透明度 | ❌ 裁剪时不考虑透明度 |
+
+**⚠️ 关键不一致发现：** 单帧导出时 PNG 禁用裁剪，SVG 启用裁剪，行为完全相反。代码注释说明 PNG 禁用是为了避免裁剪内容边角。
 
 ---
 
 ## 五、特殊元素渲染差异
 
-### 5.1 图片元素（Image）
+### 5.1 嵌入元素（Embeddable/Iframe）重点对比
+
+**PNG 渲染逻辑：**
+```typescript
+// [证据 F1] PNG 导出时始终禁用嵌入内容渲染
+// scene/export.ts:271-272
+renderConfig: {
+  // empty disables embeddable rendering
+  embedsValidationStatus: new Map(), // 空 Map = 全部禁用
+}
+```
+
+**SVG 渲染逻辑：**
+```typescript
+// [证据 F2] SVG 可配置是否渲染嵌入内容
+// scene/export.ts:475, 488
+const renderEmbeddables = opts?.renderEmbeddables ?? false; // 默认不渲染
+
+// staticSvgScene.ts:242-278
+if (renderConfig.renderEmbeddables === false || embedLink?.type === "document") {
+  // 用超链接替代
+  const anchorTag = svgRoot.ownerDocument.createElementNS(SVG_NS, "a");
+  anchorTag.setAttribute("href", normalizeLink(element.link || ""));
+} else {
+  // 渲染实际 iframe
+  const foreignObject = svgRoot.ownerDocument.createElementNS(SVG_NS, "foreignObject");
+  const div = foreignObject.ownerDocument.createElementNS(SVG_NS, "div");
+  div.setAttribute("xmlns", "http://www.w3.org/1999/xhtml");
+  const iframe = div.ownerDocument.createElement("iframe");
+  iframe.src = embedLink?.link ?? "";
+}
+```
+
+**嵌入元素对比表：**
+
+| 特性 | PNG (Canvas) | SVG |
+|------|-------------|-----|
+| **默认行为** | 只渲染占位框 + 标签 | 只渲染占位框 |
+| **可配置性** | ❌ 不可配置，始终禁用 | ✅ `renderEmbeddables=true` 时渲染 iframe |
+| **渲染实际内容** | ❌ 始终不渲染 | ✅ `renderEmbeddables=true` 时渲染 |
+| **代码位置** | `scene/export.ts:271-272` | `staticSvgScene.ts:180-278` |
+| **渲染实际内容** | ❌ 始终不渲染 | ✅ `renderEmbeddables=true` 时渲染 |
+| **触发条件** | 始终禁用 | `opts.renderEmbeddables === true` |
+
+### 5.2 图片元素（Image）
+
 **PNG：**
 - 直接 `context.drawImage()`
 - 裁剪使用 `sourceRect` 参数
@@ -278,33 +359,35 @@ const maybeWrapNodesInFrameClipPath = (element, root, nodes, frameRendering, ele
 
 **SVG：**
 ```typescript
+// [证据 G1] 使用 <symbol> 复用图片资源 + <mask> 裁剪 + <clipPath> 圆角
 // staticSvgScene.ts:437-596
 <symbol id="image-xxx">
   <image href="dataURL" preserveAspectRatio="none"/>
 </symbol>
 <use href="#image-xxx" transform="..."/>
 ```
-- ✅ 使用 `<symbol>` 复用相同图片
-- ✅ 裁剪使用 `<mask>` 实现
-- ✅ 圆角使用 `<clipPath>`
-- ✅ 镜像翻转使用 `scale(-1, 1)`
+- ✅ `<symbol>` 复用相同图片
+- ✅ 裁剪用 `<mask>` 实现
+- ✅ 圆角用 `<clipPath>`
+- ✅ 镜像翻转用 `scale(-1, 1)`
 
-### 5.2 手绘线条（Freedraw）
+### 5.3 手绘线条（Freedraw）
 **PNG：**
 - 直接路径绘制 `context.stroke()`
 
 **SVG：**
 ```typescript
+// [证据 G2] 背景层（rough.js手绘） + 前景层（精确路径）
 // staticSvgScene.ts:377-436
-// 背景层：rough.js 手绘效果
-// 前景层：<path> 精确路径（SVGPathString）
+// 背景层：rough.js手绘效果
+// 前景层：<path>精确路径（SVGPathString）
 <g transform="...">
   <path fill="..." d="..."/>  <!-- 前景精确路径 -->
-  <!-- rough.js 手绘背景 -->
+  <!-- rough.js手绘背景 -->
 </g>
 ```
 
-### 5.3 文本元素（Text）
+### 5.4 文本元素（Text）
 **PNG：**
 - `context.fillText()` 逐行绘制
 - 依赖 Canvas 字体渲染
@@ -321,32 +404,15 @@ const maybeWrapNodesInFrameClipPath = (element, root, nodes, frameRendering, ele
 - ✅ 支持 RTL（从右到左）文本
 - ✅ 保留文本可编辑性
 
-### 5.4 嵌入元素（Embeddable/Iframe）
-**PNG：**
-- 只渲染占位框 + 标签
-- 不渲染实际 iframe 内容
-
-**SVG：**
-- 默认只渲染占位
-- `renderEmbeddables=true` 时：
-  ```xml
-  <foreignObject>
-    <div xmlns="http://www.w3.org/1999/xhtml">
-      <iframe src="..."/>
-    </div>
-  </foreignObject>
-  ```
-- ❌ 文档类型嵌入替换为超链接（SVG 兼容性问题）
-
 ---
 
 ## 六、导出元数据与附加功能
 
 ### 6.1 场景数据嵌入
-| 模式 | 嵌入方式 |
-|------|---------|
-| **PNG** | tEXt chunk 编码 JSON 元数据 |
-| **SVG** | `<metadata>` + base64 编码 payload |
+| 模式 | 嵌入方式 | 代码证据 |
+|------|---------|---------|
+| **PNG** | tEXt chunk 编码 JSON 元数据 | `data/image.ts:encodePngMetadata` |
+| **SVG** | `<metadata>` + base64 编码 payload | `scene/export.ts:372-387, 508-527` |
 
 **SVG 嵌入结构：**
 ```xml
@@ -374,42 +440,102 @@ const maybeWrapNodesInFrameClipPath = (element, root, nodes, frameRendering, ele
 
 ---
 
-## 七、边界情况兜底策略
+## 七、异常处理兜底策略（已修正，消除矛盾）
 
-### 7.1 元素渲染异常
+### 7.1 元素渲染异常处理
+**PNG 异常兜底：**
 ```typescript
-// staticSvgScene.ts:734-761
-try {
-  renderElementToSvg(...);
-} catch (error) {
-  console.error(error);
-  // ✅ 静默失败，跳过该元素
-}
+// [证据 H1] PNG 每个元素渲染包裹 try-catch
+// staticScene.ts:304-384
+visibleElements.filter(...).forEach((element) => {
+  try {
+    // 元素渲染逻辑
+    renderElement(...);
+  } catch (error: any) {
+    console.error(error, element.id, element.x, element.y, element.width, element.height);
+    // ✅ 静默失败，跳过该元素，继续渲染其他元素
+  }
+});
 ```
 
-### 7.2 未实现元素类型
+**SVG 异常兜底：**
 ```typescript
+// [证据 H2] SVG 每个元素渲染也包裹 try-catch
+// staticSvgScene.ts:734-785
+elements.filter(...).forEach((element) => {
+  try {
+    renderElementToSvg(...);
+    const boundTextElement = getBoundTextElement(element, elementsMap);
+    if (boundTextElement) {
+      renderElementToSvg(boundTextElement, ...);
+    }
+  } catch (error: any) {
+    console.error(error);
+    // ✅ 静默失败，跳过该元素，继续渲染其他元素
+  }
+});
+```
+
+**⚠️ 修正之前的错误结论：**
+- ❌ 旧结论：PNG 静默跳过，SVG 抛出错误
+- ✅ 正确结论：PNG 和 SVG 都使用 try-catch 包裹元素渲染，异常时静默跳过该元素，仅打印错误日志
+
+### 7.2 未实现元素类型
+**SVG 内部处理：**
+```typescript
+// [证据 H3] 未实现类型在 renderElementToSvg 内部抛出，但被外层捕获
 // staticSvgScene.ts:701-702
 default: {
   if (isTextElement(element)) {
-    // ...
+    // ... 文本处理
   } else {
-    throw new Error(`Unimplemented type ${element.type}`);
+    throw new Error(`Unimplemented type ${element.type}`); // 内部抛出
   }
 }
 ```
+- **实际行为**：此异常会被外层 `renderSceneToSvg` 的 try-catch 捕获，不会中断整个导出流程
 
 ### 7.3 字体加载失败
-**PNG：** 浏览器自动降级到系统字体
-**SVG：** 嵌入 font-face 声明，确保离线可用
+**PNG**：浏览器自动降级到系统字体（无特殊处理）
+**SVG**：嵌入 font-face 声明，确保离线可用
 
 ### 7.4 图片加载失败
-**PNG：** 不渲染，静默跳过
-**SVG：** 不渲染，静默跳过
+**PNG**：不渲染，静默跳过
+**SVG**：不渲染，静默跳过
+
+### 7.5 异常处理对比表（已核实）
+
+| 异常场景 | PNG (Canvas) | SVG |
+|---------|-------------|-----|
+| 元素渲染异常 | ✅ try-catch，静默跳过，console.error | ✅ try-catch，静默跳过，console.error |
+| 未实现元素类型 | ✅ 元素级兜底（renderElement 内部处理） | ✅ 外层 try-catch 捕获，不中断导出 |
+| 字体加载失败 | ✅ 浏览器降级到系统字体 | ✅ 内嵌 font-face 兜底 |
+| 图片加载失败 | ✅ 不渲染该元素 | ✅ 不渲染该元素 |
+| 代码位置 | `staticScene.ts:304, 375-384` | `staticSvgScene.ts:734-761, 770-783` |
+
+**结论：** 两种模式的异常处理策略完全一致，都是元素级静默失败 + 错误日志输出
 
 ---
 
-## 八、性能对比
+## 八、单帧导出专项对比（重点强调）
+
+### 8.1 单帧导出触发条件
+当调用 `exportToCanvas` 或 `exportToSvg` 时传入 `exportingFrame` 参数（非 null）
+
+### 8.2 关键差异汇总表
+
+| 维度 | PNG (Canvas) 单帧导出 | SVG 单帧导出 | 代码证据 |
+|------|---------------------|-------------|---------|
+| **裁剪行为** | ❌ 强制禁用（`clip = false`） | ✅ 保持启用（`clip = true`） | PNG: `export.ts:213-215` <br> SVG: `export.ts:142` |
+| **裁剪注释原因** | "避免裁剪内容边角" | 无特殊注释 | `export.ts:211-212` |
+| **元素范围** | ✅ `getElementsOverlappingFrame` 过滤 | ✅ 同样过滤 | 共用逻辑 `export.ts:159-164` |
+| **尺寸计算** | ✅ 以 Frame 边界为准，padding=0 | ✅ 同样处理 | 共用逻辑 `export.ts:224-231, 333-340` |
+| **渲染内容** | ✅ Frame 内全部元素 | ✅ Frame 内全部元素 | 同上 |
+| **输出背景** | ✅ 同配置（透明/纯色） | ✅ 同配置 | 同上 |
+
+---
+
+## 九、性能对比
 
 | 维度 | PNG (Canvas) | SVG |
 |------|-------------|-----|
@@ -421,16 +547,16 @@ default: {
 
 ---
 
-## 九、代码复用与设计模式
+## 十、代码复用与设计模式
 
-### 9.1 共享逻辑
+### 10.1 共享逻辑
 ✅ `prepareElementsForRender()` - 元素预处理  
 ✅ `getCanvasSize()` - 尺寸计算  
 ✅ `applyDarkModeFilter()` - 颜色转换  
 ✅ `ShapeCache.generateElementShape()` - Rough.js 形状生成  
-✅ Frame 渲染配置逻辑
+✅ `getFrameRenderingConfig()` - Frame 渲染配置基础逻辑（但 PNG 后续覆盖 clip）
 
-### 9.2 策略模式应用
+### 10.2 策略模式应用
 ```
 RenderStrategy
     ├─ CanvasRenderStrategy (PNG)
@@ -439,34 +565,79 @@ RenderStrategy
         └─ 使用 DOM API + Rough.svg
 ```
 
-### 9.3 关注点分离
+### 10.3 关注点分离
 - **导出层** (`export.ts`)：处理导出参数、尺寸计算、资源准备
 - **渲染层** (`staticScene.ts` / `staticSvgScene.ts`)：纯渲染逻辑，无导出副作用
 - **元素层** (`renderElement.ts`)：单元素渲染实现
 
 ---
 
-## 十、关键改进点（潜在优化方向）
+## 十一、关键不一致与改进方向（已核实）
 
-1. **Frame 透明度叠加**：PNG 导出未考虑 Frame 透明度，与 SVG 行为不一致
-2. **错误处理一致性**：PNG 异常元素静默跳过，SVG 抛出错误
-3. **裁剪逻辑统一**：导出单个 Frame 时 PNG 禁用裁剪，SVG 启用裁剪，行为不一致
-4. **图片复用策略**：SVG 的 `<symbol>` 复用策略可移植到 Canvas（精灵图）
-5. **字体嵌入优化**：PNG 无法嵌入字体，导出后可能字体不一致
+| 问题 | 当前行为 | 影响范围 | 代码位置 |
+|------|---------|---------|---------|
+| **Frame 透明度叠加** | PNG 不支持，SVG 支持 | 含半透明 Frame 的画布导出不一致 | PNG: `staticScene.ts:224` <br> SVG: `staticSvgScene.ts:137-140` |
+| **单帧导出裁剪行为** | PNG 禁用，SVG 启用 | 导出内容边界不一致 | PNG: `export.ts:213-215` <br> SVG: `export.ts:142` |
+| **嵌入元素渲染能力** | PNG 始终禁用，SVG 可配置 | 同内容导出视觉不一致 | PNG: `export.ts:271-272` <br> SVG: `export.ts:475, 488` |
+| **异常处理一致性** | ✅ 已核实一致 | ✅ 无问题 | 一致 |
 
 ---
 
-## 总结
+## 十二、总结对比表（最终版）
 
-| 维度 | PNG (Canvas 导出) | SVG (矢量导出) |
-|------|------------------|---------------|
-| **最佳场景** | 快速预览、分享、打印 | 编辑复用、无损缩放、网页嵌入 |
-| **核心技术** | Canvas 2D + Rough.js | SVG DOM + Rough.js |
-| **Frame 裁剪** | `context.clip()` | `<clipPath>` 属性引用 |
-| **暗色模式** | Canvas 初始化时应用 | 元素级 fill/stroke 转换 |
-| **文本处理** | `fillText()` 位图渲染 | `<text>` 元素保留可编辑性 |
-| **图片处理** | `drawImage()` 直接绘制 | `<symbol>` + `<use>` 复用 |
-| **元数据** | PNG tEXt chunk | SVG `<metadata>` base64 |
-| **交互性** | 无 | 支持超链接 |
+| 维度 | PNG (Canvas 导出) | SVG (矢量导出) | 是否一致 |
+|------|------------------|---------------|---------|
+| **最佳场景** | 快速预览、分享、打印 | 编辑复用、无损缩放、网页嵌入 | - |
+| **核心技术** | Canvas 2D + Rough.js | SVG DOM + Rough.js | ❌ |
+| **元素预处理** | `prepareElementsForRender` | 同函数 | ✅ |
+| **尺寸计算** | `getCanvasSize` | 同函数 | ✅ |
+| **Frame 裁剪（多帧）** | `context.clip()` | `<clipPath>` 属性引用 | 效果一致，实现不同 |
+| **Frame 裁剪（单帧）** | ❌ 强制禁用 | ✅ 保持启用 | ❌ 关键不一致 |
+| **暗色模式** | Canvas 初始化时应用 | 元素级 fill/stroke 转换 | 效果一致，实现不同 |
+| **文本处理** | `fillText()` 位图渲染 | `<text>` 元素保留可编辑性 | ❌ |
+| **图片处理** | `drawImage()` 直接绘制 | `<symbol>` + `<use>` 复用 | ❌ |
+| **透明度叠加** | 仅元素 opacity | Frame opacity × element opacity | ❌ |
+| **嵌入元素渲染** | 始终禁用 | `renderEmbeddables=true` 时启用 | ❌ |
+| **元素级异常处理** | ✅ try-catch 静默跳过 | ✅ try-catch 静默跳过 | ✅ |
+| **元数据嵌入** | PNG tEXt chunk | SVG `<metadata>` base64 | 概念一致，格式不同 |
+| **可编辑性** | 否 | 是（文本/形状） | ❌ |
 
-两种导出模式在**数据获取层**高度复用，但在**渲染引擎**、**样式应用**、**边界裁剪**等方面采用了完全不同的技术路径，这是由各自的输出格式特性决定的。
+---
+
+## 附录：代码证据索引
+
+### A. 数据获取相关
+- **A1** 单帧导出元素过滤：`scene/export.ts:159-164`
+- **A2** Frame 名称插入：`scene/export.ts:165-168`
+- **A3** 尺寸计算共用函数：`scene/export.ts:564-573`
+
+### B. 样式处理相关
+- **B1** PNG 主题设置：`scene/export.ts:256-265, 266-276`
+- **B2** SVG 元素级颜色设置：`staticSvgScene.ts:680-683`
+
+### C. 透明度相关
+- **C1** PNG 透明度设置：`staticScene.ts:224`
+- **C2** SVG Frame 透明度叠加：`staticSvgScene.ts:137-140`
+
+### D. 变换相关
+- **D1** PNG context 变换栈：`staticScene.ts:316, 370`
+- **D2** SVG transform 属性：`staticSvgScene.ts:162-167`
+
+### E. 裁剪相关
+- **E1** Frame 渲染配置默认逻辑：`scene/export.ts:133-144`
+- **E2** PNG 单帧强制禁用裁剪：`scene/export.ts:211-215`
+- **E3** SVG 预创建 clipPath：`scene/export.ts:393-429`
+- **E4** SVG 条件引用 clipPath：`staticSvgScene.ts:66-85`
+
+### F. 嵌入元素相关
+- **F1** PNG 嵌入渲染禁用：`scene/export.ts:271-272`
+- **F2** SVG 嵌入可配置渲染：`scene/export.ts:475, 488`; `staticSvgScene.ts:242-278`
+
+### G. 特殊元素相关
+- **G1** SVG 图片复用机制：`staticSvgScene.ts:437-596`
+- **G2** SVG Freedraw 双层渲染：`staticSvgScene.ts:377-436`
+
+### H. 异常处理相关
+- **H1** PNG try-catch 兜底：`staticScene.ts:304, 375-384`
+- **H2** SVG try-catch 兜底：`staticSvgScene.ts:734-761, 770-783`
+- **H3** SVG 未实现类型处理：`staticSvgScene.ts:701-702`
