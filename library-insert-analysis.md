@@ -26,12 +26,11 @@ Excalidraw Library 资源插入流程主要包含两种触发方式：
 |---------|--------|--------|---------|
 | `scene.elements` | 原有元素数组 | 原有 + 新插入元素 | 新元素追加到末尾 |
 | `scene.elementsMap` | 原有元素 Map | 新增元素 ID 映射 | Map 中新增条目 |
-| `appState.selectedElementIds` | 可能为空 | 新元素 ID 集合 | 排除 Frame 内元素和绑定文本 |
-| `appState.selectedGroupIds` | 可能为空 | 新元素所属分组 | 根据 `selectGroupsForSelectedElements` 计算 |
+| `appState.selectedElementIds` | 可能为空 | 新元素 ID 集合 | **排除 Frame 内元素和绑定文本** |
+| `appState.selectedGroupIds` | 可能为空 | 新元素所属组的最外层组 ID | **选中单个元素即扩展选中整个组** |
 | `appState.editingGroupId` | 可能有值 | null | 插入后退出组编辑模式 |
 | `appState.openSidebar` | 可能打开 | null (非固定模式) | 非固定侧边栏自动关闭 |
 | `appState.activeTool.type` | 可能为 selection | selection | 强制切回选择工具 |
-| `element.index` (fractional) | 无 | 新生成索引 | `syncMovedIndices` 重新计算 Z-index |
 
 ---
 
@@ -245,7 +244,7 @@ onDragStart={(event) => {
 ```
 
 **失败分支**：
-- 无 `id` 时调用 `preventDefault()` 阻止拖拽（静默失败，用户无感知）
+- 无 `id` 时调用 `preventDefault()` 阻止拖拽（静默失败）
 
 ---
 
@@ -339,11 +338,11 @@ private handleAppOnDrop = async (event: React.DragEvent<HTMLDivElement>) => {
 - 异步数据获取：`getLatestLibrary()` 是异步操作，等待队列中的所有更新完成
 
 **失败分支处理**：
-1. **JSON 解析失败**：`JSON.parse` 抛出错误 → 捕获并显示 errorMessage（显式报错）
-2. **Library Item 查找失败**：ID 不存在 → `libraryItems` 为空，静默跳过（静默失败）
-3. **getLatestLibrary 失败**：异步获取异常 → 进入 catch 块（显式报错）
-4. **parseLibraryJSON 失败**：外部库数据格式错误 → 进入 catch 块（显式报错）
-5. **duplicateElements 失败**：元素复制异常 → 进入 catch 块（显式报错）
+1. **JSON 解析失败**：`JSON.parse` 抛出错误 → 捕获并设置 `errorMessage`（**弹出模态错误对话框**）
+2. **Library Item 查找失败**：ID 不存在 → `libraryItems` 为空，静默跳过（**完全无反馈**）
+3. **getLatestLibrary 失败**：异步获取异常 → 进入 catch 块（**弹出模态错误对话框**）
+4. **parseLibraryJSON 失败**：外部库数据格式错误 → 进入 catch 块（**弹出模态错误对话框**）
+5. **duplicateElements 失败**：元素复制异常 → 进入 catch 块（**弹出模态错误对话框**）
 
 ---
 
@@ -378,7 +377,7 @@ private handleAppOnDrop = async (event: React.DragEvent<HTMLDivElement>) => {
   │   ├─ distributeLibraryItemsOnSquareGrid 布局
   │   └─ addElementsFromPasteOrLibrary 插入
   └─ ❌ 失败：
-      └─ setState({ errorMessage }) 显示错误
+      └─ setState({ errorMessage }) → ErrorDialog 模态框
 ```
 
 ---
@@ -428,8 +427,8 @@ const elements = restoreElements(opts.elements, null, {
 - 输出：规范化后的 elements 数组
 
 **失败分支**：
-- `restoreElements` 内部可能抛出格式错误（显式报错）
-- 元素数据损坏可能导致静默删除（deleteInvisibleElements，静默失败）
+- `restoreElements` 内部可能抛出格式错误（**React 错误边界捕获，可能白屏**）
+- 元素数据损坏可能导致静默删除（deleteInvisibleElements，**完全无反馈但元素消失**）
 
 ---
 
@@ -534,8 +533,8 @@ nextElements = mappedNewSceneElements || nextElements;
 - 可选：`nextElements` 可能被宿主应用修改
 
 **失败分支**：
-- 宿主应用 `onDuplicate` 抛出异常（未捕获，显式报错）
-- 返回无效数据结构（静默失败，可能导致后续错误）
+- 宿主应用 `onDuplicate` 抛出异常（未捕获，**React 错误边界捕获**）
+- 返回无效数据结构（静默失败，**可能导致后续错误**）
 
 ---
 
@@ -563,8 +562,8 @@ syncMovedIndices(nextElements, arrayToMap(duplicatedElements));
 - 原有元素的 `index` 保持不变
 
 **失败分支**：
-- 索引生成失败 → 触发 `syncInvalidIndices` 回退（静默失败，全部重排）
-- 验证失败 → 同样回退到全量同步（静默失败）
+- 索引生成失败 → 触发 `syncInvalidIndices` 回退（**完全无反馈，所有元素 Z-index 被重排**）
+- 验证失败 → 同样回退到全量同步（**完全无反馈**）
 
 ---
 
@@ -618,7 +617,7 @@ this.scene.replaceAllElements(nextElements);
 - 所有元素的引用变更（React 重渲染触发点）
 
 **失败分支**：
-- 数据结构异常导致 Scene 内部状态不一致（静默失败，可能渲染异常）
+- 数据结构异常导致 Scene 内部状态不一致（**完全无反馈，可能渲染异常**）
 
 ---
 
@@ -663,7 +662,7 @@ if (isSafari) {
 - 可能触发重渲染（文本样式变化）
 
 **失败分支**：
-- Promise 被 reject 但未 catch（潜在静默失败，控制台警告）
+- Promise 被 reject 但未 catch（**仅控制台输出错误，用户不可见**）
 
 ---
 
@@ -706,21 +705,75 @@ const nextElementsToSelect =
 ),
 ```
 
-**selectGroupsForSelectedElements 核心逻辑** (groups.ts:65-160)：
+**selectGroupsForSelectedElements 核心逻辑** (groups.ts:65-158)：
 
-1. **缓存检查**：使用闭包缓存上次结果，避免重复计算
-2. **组 ID 收集**：遍历所有选中元素，收集所有 groupIds
-3. **完整组判断**：如果组内所有元素都被选中，则标记为 selectedGroupIds
-4. **编辑组处理**：嵌套组时只处理到编辑组层级
-5. **结果返回**：`{ selectedGroupIds, editingGroupId, selectedElementIds }`
+> **⚠️ 事实校准：不需要整组全选才标记！只要选中组内任一元素，就扩展选中整个组**
+
+**三步算法**：
+
+1. **收集团组 ID** (groups.ts:91-106)：
+```tsx
+for (const selectedElement of selectedElements) {
+  let groupIds = selectedElement.groupIds;
+  if (appState.editingGroupId) {
+    // 处理嵌套组：只处理到编辑组层级
+    const indexOfEditingGroup = groupIds.indexOf(appState.editingGroupId);
+    if (indexOfEditingGroup > -1) {
+      groupIds = groupIds.slice(0, indexOfEditingGroup);
+    }
+  }
+  if (groupIds.length > 0) {
+    // 标记该元素的**最外层组**为选中
+    const lastSelectedGroup = groupIds[groupIds.length - 1];
+    selectedGroupIds[lastSelectedGroup] = true;
+  }
+}
+```
+
+2. **扩展选中组内所有元素** (groups.ts:108-131)：
+```tsx
+const selectedElementIdsInGroups = elements.reduce(
+  (acc: Record<string, true>, element) => {
+    // 检查元素的任意组是否在 selectedGroupIds 中
+    const groupId = element.groupIds.find((id) => selectedGroupIds[id]);
+    if (groupId) {
+      acc[element.id] = true;  // 只要属于任一选中组，就选中该元素
+    }
+    return acc;
+  },
+  {},
+);
+```
+
+3. **单元素组降级处理** (groups.ts:133-140)：
+```tsx
+for (const groupId of Object.keys(groupElementsIndex)) {
+  // 如果组内只有 1 个元素，不认为是真正的组
+  if (groupElementsIndex[groupId].length < 2) {
+    if (selectedGroupIds[groupId]) {
+      selectedGroupIds[groupId] = false;  // 取消组标记
+    }
+  }
+}
+```
+
+**关键规则详解**：
+
+| 规则 | 说明 |
+|------|------|
+| **任一元素选中 = 整个组选中** | 只要组内有一个元素被选中，`selectedGroupIds[groupId] = true` |
+| **选中最外层组** | 取 `groupIds[groupIds.length - 1]`，即最外层的组 |
+| **嵌套组截止** | 编辑模式下只处理到 `editingGroupId` 层级，更深的组不处理 |
+| **组内元素全选中** | 一旦组被标记，该组的所有元素都加入 `selectedElementIds` |
+| **单元素不算组** | 组内元素 < 2 时，即使标记也会取消，避免假阳性 |
 
 **排除规则**：
 - Frame 内的元素不直接选中（通过 Frame 选中）
 - 绑定到容器的文本（`isBoundToContainer`）不直接选中
 
 **状态变化**：
-- `selectedElementIds` - 新插入元素的 ID 集合
-- `selectedGroupIds` - 新插入元素所属的完整组 ID 集合
+- `selectedElementIds` - 新插入元素的 ID 集合（含组扩展）
+- `selectedGroupIds` - 新插入元素所属的完整组 ID 集合（只要组内有元素被插入即标记）
 - `editingGroupId` - 重置为 null（退出组编辑模式）
 
 ---
@@ -769,8 +822,8 @@ this.setState(
 **状态变化汇总**：
 | 字段 | 变化 |
 |------|------|
-| `selectedElementIds` | 更新为新元素 ID 集合 |
-| `selectedGroupIds` | 更新为新元素所属组 |
+| `selectedElementIds` | 更新为新元素 ID 集合（含组扩展） |
+| `selectedGroupIds` | 更新为新元素所属组的最外层组 |
 | `editingGroupId` | 设为 null |
 | `openSidebar` | 非固定模式下设为 null |
 | 其他字段 | 保持不变 |
@@ -808,7 +861,37 @@ if (opts.fitToContent) {
 
 ---
 
-### 5.3 addElementsFromPasteOrLibrary 完整流程图
+### 5.3 错误展示链路说明
+
+**⚠️ 事实校准：所有 `setState({ errorMessage })` 最终都会弹出模态错误对话框**
+
+**展示链路**：
+```tsx
+// 1. 任意位置设置 errorMessage
+this.setState({ errorMessage: error.message })
+
+// 2. LayerUI.tsx 检测到 errorMessage 存在
+{appState.errorMessage && (
+  <ErrorDialog onClose={() => setAppState({ errorMessage: null })}>
+    {appState.errorMessage}
+  </ErrorDialog>
+)}
+
+// 3. ErrorDialog.tsx 渲染模态框
+<Dialog size="small" onCloseRequest={handleClose} title={t("errorDialog.title")}>
+  <div style={{ whiteSpace: "pre-wrap" }}>{children}</div>
+</Dialog>
+```
+
+**用户可见表现**：
+- 屏幕中央弹出小模态对话框
+- 标题为本地化的 "Error" 或对应语言
+- 显示错误消息文本（支持换行）
+- 用户点击关闭按钮或 ESC 键可关闭
+
+---
+
+### 5.4 addElementsFromPasteOrLibrary 完整流程图
 
 ```
 调用 addElementsFromPasteOrLibrary
@@ -852,7 +935,7 @@ if (opts.fitToContent) {
   └─ redrawTextBoundingBox
       ↓
 11. Safari 字体加载（异步）
-  └─ Fonts.loadElementsFonts
+  └─ Fonts.loadElementsFonts → 失败仅控制台输出
       ↓
 12. 文件资源处理（如有）
   └─ addMissingFiles
@@ -860,15 +943,15 @@ if (opts.fitToContent) {
 13. selectGroupsForSelectedElements 计算选择状态
   ├─ 排除 Frame 内元素
   ├─ 排除绑定文本
-  ├─ 收集组 ID
-  └─ 生成 selectedGroupIds
+  ├─ 选中任一元素 → 标记其最外层组
+  └─ 组内所有元素加入选中集合
       ↓
 14. openSidebar 状态处理
   └─ 非固定模式 → 关闭侧边栏
       ↓
 15. setState 更新 AppState
-  ├─ selectedElementIds
-  ├─ selectedGroupIds
+  ├─ selectedElementIds（含组扩展）
+  ├─ selectedGroupIds（只要组内有元素被插入即标记）
   ├─ editingGroupId: null
   └─ openSidebar
       ↓
@@ -881,61 +964,76 @@ if (opts.fitToContent) {
 
 ---
 
-## 6. 失败分支重分组分析
+## 6. 失败分支重分组与事实校准
 
-### 6.1 显式报错（用户可见）
+### 6.1 错误展示链路总览
 
-| 失败点 | 位置 | 触发条件 | 用户可见现象 | 错误处理方式 |
-|--------|------|---------|-------------|-------------|
-| **JSON.parse 解析失败** | App.tsx:12134 | 拖拽数据格式损坏、MIME 类型不匹配 | 顶部红色错误提示条显示错误信息 | try/catch → setState({ errorMessage }) |
-| **getLatestLibrary 异步失败** | App.tsx:12137 | Library 更新队列异常、Promise reject | 顶部红色错误提示条 | try/catch → setState({ errorMessage }) |
-| **parseLibraryJSON 失败** | App.tsx:12143 | 外部库文件格式损坏、版本不兼容 | 顶部红色错误提示条 | try/catch → setState({ errorMessage }) |
-| **duplicateElements 失败** | App.tsx:12149 | 元素结构异常、循环引用 | 顶部红色错误提示条 | try/catch → setState({ errorMessage }) |
-| **restoreElements 恢复失败** | App.tsx:3928 | 元素 schema 版本过旧、数据损坏 | React 错误边界捕获，可能白屏 | 未捕获，向上抛出 |
-| **宿主 onDuplicate 异常** | App.tsx:3974 | 宿主应用回调抛出错误 | React 错误边界捕获 | 未捕获，向上抛出 |
+| 展示方式 | 触发方式 | 用户可见表现 |
+|---------|---------|-------------|
+| **弹出模态错误对话框** | `this.setState({ errorMessage: ... })` | 屏幕中央弹出 ErrorDialog，需手动关闭 |
+| **仅控制台输出** | `console.error/warn()` | 普通用户不可见，开发者工具可见 |
+| **完全无反馈** | 无任何错误处理 | 用户不知道发生了错误 |
+| **React 错误边界** | 未捕获的异常抛出 | 白屏或应用崩溃 |
 
 ---
 
-### 6.2 静默失败（用户无感知或现象微妙）
+### 6.2 点击插入失败分支（事实校准）
 
-| 失败点 | 位置 | 触发条件 | 用户可见现象 | 风险等级 |
-|--------|------|---------|-------------|---------|
-| **LibraryUnit 无 elements** | LibraryUnit.tsx:61 | Library 项目数据不完整 | 点击无反应，元素无任何变化 | 中 |
-| **onDragStart 无 id** | LibraryUnit.tsx:72 | Library 项目 ID 缺失 | 拖拽不起作用，鼠标样式不变 | 低 |
-| **Item ID 查找不到** | App.tsx:12138 | 拖拽后 Library 已被修改、ID 失效 | 放置后无元素出现，无任何提示 | 高 |
-| **deleteInvisibleElements** | App.tsx:3928 | 插入数据包含已删除标记元素 | 部分元素"消失"，用户困惑 | 中 |
-| **syncMovedIndices 回退** | fractionalIndex.ts:193 | 索引生成算法失败、边界情况 | 所有元素 Z-index 被重排，可能改变堆叠顺序 | 高 |
-| **Frame 嵌套过滤** | App.tsx:3985 | 某些元素不满足 Frame 子元素条件 | 部分元素不在 Frame 内，布局偏离预期 | 中 |
-| **字体加载 Promise reject** | App.tsx:4011 | 网络问题、字体文件损坏 | 文本显示为默认字体，控制台警告 | 低 |
-| **坐标计算 NaN** | App.tsx:3931 | 边界框计算异常、空元素数组 | 元素位置异常（可能在画布外） | 高 |
-| **Scene 状态不一致** | App.tsx:3997 | 数据结构异常、replaceAllElements 失败 | 渲染异常、选择框错位、不可操作 | 极高 |
+| 失败点 | 位置 | 触发条件 | 展示方式 | 用户可见现象 |
+|--------|------|---------|---------|-------------|
+| **LibraryUnit 无 elements** | LibraryUnit.tsx:61 | Library 项目数据不完整，elements 为空数组 | 完全无反馈 | onClick 未绑定，点击无任何反应 |
+| **duplicateElements 预处理失败** | LibraryMenuItems.tsx:199 | 元素结构异常、循环引用、ID 冲突 | React 错误边界 | 应用崩溃、白屏 |
+| **distributeLibraryItems 布局异常** | library.ts:405-495 | 边界框计算错误、坐标计算溢出 | 完全无反馈 | 元素位置错乱、可能在画布外 |
+| **restoreElements 恢复失败** | App.tsx:3928 | 元素 schema 版本过旧、数据格式损坏 | React 错误边界 | 应用崩溃、白屏 |
+| **deleteInvisibleElements 过滤** | App.tsx:3928 | 插入数据包含 isDeleted=true 的元素 | 完全无反馈 | 部分元素"消失"，用户困惑 |
+| **宿主 onDuplicate 异常** | App.tsx:3974 | 宿主应用回调抛出错误 | React 错误边界 | 应用崩溃、白屏 |
+| **syncMovedIndices 回退** | fractionalIndex.ts:193 | 索引生成算法失败、边界情况 | 完全无反馈 | 所有元素 Z-index 被重排，堆叠顺序改变 |
+| **Scene 状态不一致** | App.tsx:3997 | 数据结构异常、replaceAllElements 失败 | 完全无反馈 | 渲染异常、选择框错位、不可操作 |
 
 ---
 
-### 6.3 静默失败的典型用户场景
+### 6.3 拖拽插入失败分支（事实校准）
 
-**场景 1：拖拽 ID 失效问题**
+| 失败点 | 位置 | 触发条件 | 展示方式 | 用户可见现象 |
+|--------|------|---------|---------|-------------|
+| **onDragStart 无 id** | LibraryUnit.tsx:72 | Library 项目 ID 缺失 | 完全无反馈 | 拖拽不起作用，鼠标样式不变 |
+| **JSON.parse 解析失败** | App.tsx:12134 | 拖拽数据格式损坏、MIME 类型不匹配 | 弹出模态错误对话框 | 屏幕中央弹出 ErrorDialog，显示错误信息 |
+| **getLatestLibrary 异步失败** | App.tsx:12137 | Library 更新队列异常、Promise reject | 弹出模态错误对话框 | 屏幕中央弹出 ErrorDialog，显示错误信息 |
+| **Item ID 查找不到** | App.tsx:12138 | 拖拽后 Library 已被修改、ID 失效、协作冲突 | **完全无反馈** | 放置后无元素出现，无任何提示，用户以为"放上去了" |
+| **parseLibraryJSON 失败** | App.tsx:12143 | 外部库文件格式损坏、版本不兼容 | 弹出模态错误对话框 | 屏幕中央弹出 ErrorDialog，显示错误信息 |
+| **duplicateElements 失败** | App.tsx:12149 | 元素结构异常、循环引用 | 弹出模态错误对话框 | 屏幕中央弹出 ErrorDialog，显示错误信息 |
+| **字体加载 Promise reject** | App.tsx:4011 | 网络问题、字体文件损坏 | 仅控制台输出 | 文本显示为默认字体，控制台有错误日志 |
+
+---
+
+### 6.4 静默失败的典型用户场景
+
+**场景 1: 拖拽 ID 失效问题（协作环境）**
 ```
-用户 A：在 Library 中选中项目，开始拖拽 → onItemDrag 序列化 ID
-用户 B：（协作场景）删除了该 Library 项目 → Library 状态更新
-用户 A：放置到画布 → getLatestLibrary 获取最新状态 → ID 查找失败
-结果：静默跳过，用户以为"放上去了"但实际什么都没发生
+用户 A：在 Library 中选中项目，开始拖拽 → onItemDrag 序列化 ID [ "item123" ]
+用户 B：（同时在线）删除了 item123 并保存 → Library 状态更新
+用户 A：放置到画布 → getLatestLibrary 获取最新状态 → filter 结果为空数组
+结果：if (libraryItems?.length) 判断不通过 → 整个插入逻辑静默跳过
+用户感知：鼠标松开后什么都没发生，没有任何提示，反复尝试几次后放弃
 ```
 
-**场景 2：Fractional Index 回退问题**
+**场景 2: Fractional Index 回退问题（复杂插入）**
 ```
-用户：插入一个复杂的 Library 项目（含 50+ 元素）
-内部：syncMovedIndices → 某个边界情况触发异常 → catch 块
-内部：syncInvalidIndices 重新生成所有元素的 index
-结果：用户发现之前精心调整的图层顺序全乱了，但不知道为什么
+用户：精心调整了 30 个元素的图层顺序，花了 10 分钟
+用户：插入一个包含 15 个元素的复杂 Library 项目
+内部：syncMovedIndices → 某个边界情况触发异常 → catch 块静默捕获
+内部：syncInvalidIndices 按照字母顺序重新生成所有元素的 index
+结果：用户发现之前精心调整的堆叠顺序全乱了，但不知道为什么，也没有任何提示
+用户感知："我的图层怎么乱了？我刚才做了什么？"
 ```
 
-**场景 3：元素被静默删除**
+**场景 3: 元素被静默删除（旧版本数据）**
 ```
-用户：从旧版本导出的 Library 文件（含 isDeleted=true 的元素）
+用户：从一年前的备份文件中导出 Library（旧版格式，部分元素标记 isDeleted=true）
 用户：导入并插入到画布
-内部：restoreElements deleteInvisibleElements: true → 过滤掉标记元素
-结果：用户纳闷"我明明看到 Library 里有这个形状，怎么插进来少了？"
+内部：restoreElements deleteInvisibleElements: true → 过滤掉 3 个标记元素
+结果：用户在 Library 预览中明明看到 10 个形状，但插进来只剩 7 个，无任何提示
+用户感知："是我数错了？还是 bug？"
 ```
 
 ---
@@ -997,9 +1095,9 @@ if (opts.fitToContent) {
 
 | 阶段 | 错误处理方式 |
 |------|-------------|
-| 拖拽放置阶段 | try/catch + errorMessage（用户友好） |
+| 拖拽放置阶段 | try/catch + errorMessage → 模态对话框（用户友好） |
 | 点击插入阶段 | 大多未捕获，依赖 React 错误边界（开发者友好） |
-| 核心插入逻辑 | 大多未捕获，部分静默失败 |
+| 核心插入逻辑 | 大多未捕获，部分完全无反馈的静默失败 |
 
 **设计意图推测**：
 - 拖拽涉及外部数据，失败概率高，需要友好提示
@@ -1054,8 +1152,8 @@ if (opts.fitToContent) {
     │               │                   │──────────────────>│
     │               │                   │                   │ setState
     │               │                   │                   │───┐
-    │               │                   │                   │   │ selectedElementIds
-    │               │                   │                   │   │ selectedGroupIds
+    │               │                   │                   │   │ selectedElementIds（组扩展）
+    │               │                   │                   │   │ selectedGroupIds（任一元素即标记）
     │               │                   │                   │   │ editingGroupId: null
     │               │                   │                   │   │ openSidebar?: null
     │               │                   │                   │<──┘
@@ -1072,26 +1170,33 @@ if (opts.fitToContent) {
 
 ## 9. 改进建议
 
-### 9.1 错误处理增强
+### 9.1 错误处理增强（优先级：高）
 
-1. **统一错误捕获**：在 `onInsertElements` 入口添加 try/catch，确保点击插入也有友好提示
-2. **ID 查找失败告警**：`libraryItems.filter(...).length === 0` 时给出提示，如"该 Library 项目已被移除"
+1. **统一错误捕获**：在 `onInsertElements` 入口添加 try/catch，确保点击插入也有模态错误提示
+2. **ID 查找失败告警**：`libraryItems.filter(...).length === 0` 时给出友好提示，如 `"选中的 Library 项目已被移除，请重新选择"`
 3. **Promise 错误处理**：Safari 字体加载添加 catch 分支，避免控制台 unhandled rejection
-4. **静默失败日志**：开发模式下对所有静默失败点输出详细的 console.warn，包含调用栈
+4. **静默失败日志**：开发模式下对所有静默失败点输出详细的 console.warn，包含调用栈和元素信息
+5. **图层重排提示**：`syncInvalidIndices` 回退时在开发模式下给出提示，方便开发者复现 bug
 
-### 9.2 性能优化
+### 9.2 分组选择用户体验优化
+
+1. **组选中视觉反馈**：当整个组被选中时，提供更明显的视觉提示（如组边界高亮）
+2. **嵌套组指示**：显示当前选中的是哪一层组，帮助用户理解嵌套结构
+3. **单元素组提示**：当检测到组内只有一个元素时，给出提示
+
+### 9.3 性能优化
 
 1. **避免重复复制**：评估是否真的需要两次 `duplicateElements`。如果只是为了 ID 唯一性，可以在传输前保证一次即可
 2. **大型 Library 分批处理**：元素超过一定阈值时分批插入，避免 UI 阻塞
 3. **索引生成优化**：fractional index 算法的边界情况处理优化，减少回退到 `syncInvalidIndices` 的概率
 
-### 9.3 状态一致性
+### 9.4 状态一致性
 
 1. **拖拽时锁定状态**：开始拖拽时对 Library 做快照（保存 elements 副本），放置时使用快照而非重新查询
-2. **版本校验**：拖拽数据中包含 Library 版本戳，放置时验证版本是否匹配
+2. **版本校验**：拖拽数据中包含 Library 版本戳，放置时验证版本是否匹配，不匹配时给出提示
 3. **乐观更新 UI**：拖拽开始时在画布上显示半透明预览，给用户即时反馈
 
-### 9.4 用户体验
+### 9.5 用户体验
 
 1. **加载指示器**：`getLatestLibrary()` 异步获取时在画布上显示小加载动画
 2. **失败回退**：ID 查找失败时尝试降级方案（如从拖拽预览缓存恢复）
@@ -1110,21 +1215,24 @@ Library 资源插入流程是一个**多阶段、有状态转换、涉及多个�
 Library 存储 → (ID 序列化) → 拖拽数据传输 → (ID 查找) → 元素复制 → 网格布局 → Scene 更新 → AppState 更新
 ```
 
-### 10.2 关键保证
+### 10.2 关键保证（经事实校准）
 
 | 保证 | 实现机制 |
 |------|---------|
 | **ID 唯一性** | 两次 `duplicateElements` 调用 |
-| **Z-index 正确性** | `syncMovedIndices` + 回退机制 |
-| **分组选择正确** | `selectGroupsForSelectedElements` 缓存计算 |
+| **Z-index 正确性** | `syncMovedIndices` + 失败回退机制 |
+| **分组选择正确** | `selectGroupsForSelectedElements`：**选中任一元素 → 扩展选中整个组** |
+| **组内元素全选中** | 遍历所有元素，属于任一选中组的元素全部加入选择集合 |
 | **Frame 嵌套正确** | 坐标检测 + 元素过滤 |
+| **错误提示可见** | `errorMessage` state → ErrorDialog 模态框 |
 
 ### 10.3 主要风险点
 
-1. **静默失败**：ID 查找失败、索引回退、元素被过滤
-2. **状态不一致**：拖拽数据与实际 Library 状态不同步
+1. **静默失败**：ID 查找失败、索引回退、元素被过滤 → **用户完全无感知**
+2. **状态不一致**：拖拽数据与实际 Library 状态不同步（协作场景高发）
 3. **性能瓶颈**：大型 Library 项目的多次复制和索引计算
 4. **调试困难**：ID 多次转换、异步流程、无中间状态快照
+5. **错误处理不均**：拖拽有模态提示，点击可能直接崩溃
 
 理解这个流程的每个细节对于调试 Library 相关 bug、优化插入性能以及改进用户体验至关重要。
 
@@ -1132,3 +1240,4 @@ Library 存储 → (ID 序列化) → 拖拽数据传输 → (ID 查找) → 元
 
 *最后更新：2026-05-14*
 *分析基于代码版本：packages/excalidraw@HEAD*
+*事实校准标记：✓ selectGroupsForSelectedElements ✓ 错误展示链路 ✓ 失败分支分类*
