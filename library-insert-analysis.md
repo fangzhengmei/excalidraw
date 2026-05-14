@@ -555,19 +555,204 @@ syncMovedIndices(nextElements, arrayToMap(duplicatedElements));
 **关键特性**：
 - 新元素默认放在最上层（Z-index 最高）
 - 保持原有元素的相对顺序不变
-- 支持边界情况（第一个元素、最后一个元素）
 
 **状态变化**：
 - 每个新元素的 `index` 字段被设置为有效的 fractional index
 - 原有元素的 `index` 保持不变
 
 **失败分支**：
-- 索引生成失败 → 触发 `syncInvalidIndices` 回退（**完全无反馈，所有元素 Z-index 被重排**）
+- 索引生成失败 → 触发 `syncInvalidIndices` 回退（**完全无反馈，可能改变部分元素堆叠顺序**）
 - 验证失败 → 同样回退到全量同步（**完全无反馈**）
 
 ---
 
-#### 步骤 7: Frame 嵌套处理
+#### 步骤 7: syncInvalidIndices 回退路径深度分析（单独一节）
+
+> **⚠️ 本节基于源码实证分析，删除所有无依据推断**
+
+**触发条件** (fractionalIndex.ts:193-196)：
+```tsx
+catch (e) {
+  // fallback to default sync
+  syncInvalidIndices(elements);
+}
+```
+**源码证据** ✓：`syncMovedIndices` 在 try/catch 块中捕获任何异常时触发回退
+
+---
+
+##### 7.1 回退路径执行流程（四步法）
+
+```
+异常捕获 → 分组识别 → 生成索引 → 批量更新
+```
+
+---
+
+###### 步骤 1: 异常捕获与入口
+
+**源码证据** (fractionalIndex.ts:206-218)：
+```tsx
+export const syncInvalidIndices = (
+  elements: readonly ExcalidrawElement[],
+): OrderedExcalidrawElement[] => {
+  const elementsMap = arrayToMap(elements);
+  const indicesGroups = getInvalidIndicesGroups(elements);  // 分组
+  const elementsUpdates = generateIndices(elements, indicesGroups);  // 生成
+
+  for (const [element, { index }] of elementsUpdates) {
+    mutateElement(element, elementsMap, { index });  // 更新
+  }
+
+  return elements as OrderedExcalidrawElement[];
+};
+```
+**源码证据** ✓：无排序操作，直接在传入的 `elements` 数组上操作
+
+---
+
+###### 步骤 2: getInvalidIndicesGroups - 分组识别
+
+**源码证据** (fractionalIndex.ts:279-377)：
+```tsx
+const getInvalidIndicesGroups = (elements: readonly ExcalidrawElement[]) => {
+  let i = 0;
+  while (i < elements.length) {
+    const current = elements[i].index;
+    [lowerBound, lowerBoundIndex] = getLowerBound(i);
+    [upperBound, upperBoundIndex] = getUpperBound(i);
+
+    if (!isValidFractionalIndex(current, lowerBound, upperBound)) {
+      // 发现无效索引，开始收集连续的无效索引组
+      const indicesGroup = [lowerBoundIndex, i];
+      
+      while (++i < elements.length) {
+        const current = elements[i].index;
+        // 检查下一个元素是否也无效
+        if (isValidFractionalIndex(current, nextLowerBound, nextUpperBound)) {
+          break;
+        }
+        indicesGroup.push(i);  // 收集连续的无效索引位置
+      }
+      
+      indicesGroup.push(upperBoundIndex);  // 添加上边界
+      indicesGroups.push(indicesGroup);
+    } else {
+      i++;
+    }
+  }
+  return indicesGroups;
+};
+```
+
+**关键发现**：
+1. **遍历顺序**：**从左到右按数组顺序遍历**，即 `elements[0]` 到 `elements[n-1]`
+   - **源码证据** ✓：`while (i < elements.length)` + `i++` 顺序遍历
+2. **分组逻辑**：将**连续相邻的无效索引**归为同一组
+   - **源码证据** ✓：内层 while 循环，遇到有效索引才 break
+3. **边界标记**：每个组第一个元素是 lowerBound 位置，最后一个是 upperBound 位置
+   - **源码证据** ✓：`indicesGroup = [lowerBoundIndex, i]` + `indicesGroup.push(upperBoundIndex)`
+
+---
+
+###### 步骤 3: generateIndices - 索引生成
+
+**源码证据** (fractionalIndex.ts:413-442)：
+```tsx
+const generateIndices = (
+  elements: readonly ExcalidrawElement[],
+  indicesGroups: number[][],
+) => {
+  const elementsUpdates = new Map();
+
+  for (const indices of indicesGroups) {
+    const lowerBoundIndex = indices.shift()!;    // 取出下边界
+    const upperBoundIndex = indices.pop()!;      // 取出上边界
+
+    // 生成 N 个介于两者之间的索引值
+    const fractionalIndices = generateNKeysBetween(
+      elements[lowerBoundIndex]?.index,
+      elements[upperBoundIndex]?.index,
+      indices.length,  // N = 组内元素数量
+    );
+
+    // 按数组顺序分配新索引
+    for (let i = 0; i < indices.length; i++) {
+      const element = elements[indices[i]];
+      elementsUpdates.set(element, {
+        index: fractionalIndices[i],  // 按顺序分配，保持相对位置
+      });
+    }
+  }
+  return elementsUpdates;
+};
+```
+
+**关键发现**：
+1. **索引分配顺序**：**严格按组内元素在原数组中的顺序分配**
+   - **源码证据** ✓：`for (let i = 0; i < indices.length; i++)` + `fractionalIndices[i]`
+2. **相对顺序保持**：`fractionalIndices` 是递增序列，因此组内元素保持相对顺序
+   - **源码证据** ✓：`generateNKeysBetween(a, b, n)` 返回 n 个递增的索引值 `a < x1 < x2 < ... < xn < b`
+3. **只更新无效索引**：只有被标记为无效的元素才会获得新索引
+   - **源码证据** ✓：只有在 `indicesGroups` 中的元素才会被更新，其他元素保持原 index
+
+---
+
+###### 步骤 4: mutateElement - 批量更新
+
+**源码证据** (fractionalIndex.ts:213-215)：
+```tsx
+for (const [element, { index }] of elementsUpdates) {
+  mutateElement(element, elementsMap, { index });
+}
+```
+
+**关键发现**：
+- 直接修改元素对象，不改变数组顺序
+- **源码证据** ✓：仅修改 `index` 属性，不做任何排序或重排操作
+
+---
+
+##### 7.2 索引重建顺序的实证结论
+
+> **基于源码的确定性结论，无推断成分**
+
+| 结论 | 证据类型 | 源码位置 |
+|------|---------|---------|
+| **元素数组顺序本身不会被改变** | ✓ 直接证明 | fractionalIndex.ts:213-215，仅修改 index 属性 |
+| **无效元素保持其在数组中的相对顺序** | ✓ 直接证明 | fractionalIndex.ts:432-437，按数组顺序分配递增索引 |
+| **有效元素的索引完全不变** | ✓ 直接证明 | fractionalIndex.ts:413-442，只有 indicesGroups 内的元素被更新 |
+| **无效元素组保持与有效元素的相对边界** | ✓ 直接证明 | fractionalIndex.ts:426-429，使用 lowerBound/upperBound 生成介于其间的索引 |
+| **遍历按数组从左到右顺序** | ✓ 直接证明 | fractionalIndex.ts:343，`while (i < elements.length)` + `i++` |
+
+---
+
+##### 7.3 需要谨慎标注为「推断」的内容
+
+以下内容**没有直接源码证据**，只能基于逻辑推断：
+
+| 内容 | 推断依据 | 置信度 |
+|------|---------|--------|
+| 「所有元素 Z-index 被重排」 | ❌ 错误结论，已删除 - 实际上只有无效索引的元素被重排，有效元素完全不变 | - |
+| 「按字母顺序重建」 | ❌ 错误结论，已删除 - 没有任何排序逻辑，完全按数组顺序 | - |
+| 「时间复杂度 O(n log n)」 | ❌ 无依据，已删除 - 实际是 O(n) 线性遍历 + 分组处理 | - |
+
+---
+
+##### 7.4 回退路径对用户体验的实际影响
+
+**✅ 有源码证据的影响**：
+1. **只有无效索引的元素会被重新分配 Z-index**，有效元素的堆叠顺序完全不变
+2. **无效元素之间的相对顺序保持不变**（按数组顺序分配递增索引）
+3. **无效元素组整体被插入到其上下边界之间**，保持与周围有效元素的层级关系
+
+**⚠️ 仍需观测的潜在影响（无直接证据）**：
+1. 如果无效元素跨多个不连续组，各组之间的相对层级关系可能发生微妙变化
+2. 如果 lowerBound 或 upperBound 本身也是无效的，可能产生连锁修复效应
+
+---
+
+#### 步骤 8: Frame 嵌套处理
 
 ```tsx
 const topLayerFrame = this.getTopLayerFrameAtSceneCoords({ x, y });
@@ -596,7 +781,7 @@ if (topLayerFrame) {
 
 ---
 
-#### 步骤 8: Scene.replaceAllElements - 正式更新场景
+#### 步骤 9: Scene.replaceAllElements - 正式更新场景
 
 ```tsx
 this.scene.replaceAllElements(nextElements);
@@ -621,7 +806,7 @@ this.scene.replaceAllElements(nextElements);
 
 ---
 
-#### 步骤 9: 文本元素绑定重绘
+#### 步骤 10: 文本元素绑定重绘
 
 ```tsx
 duplicatedElements.forEach((newElement) => {
@@ -645,7 +830,7 @@ duplicatedElements.forEach((newElement) => {
 
 ---
 
-#### 步骤 10: Safari 字体加载处理
+#### 步骤 11: Safari 字体加载处理
 
 ```tsx
 if (isSafari) {
@@ -666,7 +851,7 @@ if (isSafari) {
 
 ---
 
-#### 步骤 11: 文件资源处理（如有）
+#### 步骤 12: 文件资源处理（如有）
 
 ```tsx
 if (opts.files) {
@@ -678,7 +863,7 @@ if (opts.files) {
 
 ---
 
-#### 步骤 12: selectGroupsForSelectedElements - 计算选择状态
+#### 步骤 13: selectGroupsForSelectedElements - 计算选择状态
 
 ```tsx
 const nextElementsToSelect =
@@ -690,15 +875,14 @@ const nextElementsToSelect =
   {
     editingGroupId: null,
     selectedElementIds: nextElementsToSelect.reduce(
-      (acc: Record<ExcalidrawElement["id"], true>, element) => {
-        if (!isBoundToContainer(element)) {
-          acc[element.id] = true;
-        }
-        return acc;
-      },
-      {},
-    ),
-  },
+    (acc: Record<ExcalidrawElement["id"], true>, element) => {
+      if (!isBoundToContainer(element)) {
+        acc[element.id] = true;
+      }
+      return acc;
+    },
+    {},
+  ),
   this.scene.getNonDeletedElements(),
   this.state,
   this,
@@ -778,7 +962,7 @@ for (const groupId of Object.keys(groupElementsIndex)) {
 
 ---
 
-#### 步骤 13: openSidebar 状态处理
+#### 步骤 14: openSidebar 状态处理
 
 ```tsx
 openSidebar:
@@ -802,7 +986,7 @@ openSidebar:
 
 ---
 
-#### 步骤 14: setState - 更新 AppState
+#### 步骤 15: setState - 更新 AppState
 
 ```tsx
 this.setState(
@@ -830,7 +1014,7 @@ this.setState(
 
 ---
 
-#### 步骤 15: setActiveTool - 切换到选择工具
+#### 步骤 16: setActiveTool - 切换到选择工具
 
 ```tsx
 this.setActiveTool({ type: this.state.preferredSelectionTool.type }, true);
@@ -845,7 +1029,7 @@ this.setActiveTool({ type: this.state.preferredSelectionTool.type }, true);
 
 ---
 
-#### 步骤 16: fitToContent - 可选视口调整
+#### 步骤 17: fitToContent - 可选视口调整
 
 ```tsx
 if (opts.fitToContent) {
@@ -920,7 +1104,7 @@ this.setState({ errorMessage: error.message })
   ├─ getMovedIndicesGroups 分组
   ├─ generateIndices 生成新索引
   ├─ validateFractionalIndices 验证
-  └─ ❌ 失败 → syncInvalidIndices 回退
+  └─ ❌ 失败 → syncInvalidIndices 回退（仅无效索引元素被重排）
       ↓
 8. Frame 嵌套检测
   ├─ getTopLayerFrameAtSceneCoords
@@ -987,7 +1171,7 @@ this.setState({ errorMessage: error.message })
 | **restoreElements 恢复失败** | App.tsx:3928 | 元素 schema 版本过旧、数据格式损坏 | React 错误边界 | 应用崩溃、白屏 |
 | **deleteInvisibleElements 过滤** | App.tsx:3928 | 插入数据包含 isDeleted=true 的元素 | 完全无反馈 | 部分元素"消失"，用户困惑 |
 | **宿主 onDuplicate 异常** | App.tsx:3974 | 宿主应用回调抛出错误 | React 错误边界 | 应用崩溃、白屏 |
-| **syncMovedIndices 回退** | fractionalIndex.ts:193 | 索引生成算法失败、边界情况 | 完全无反馈 | 所有元素 Z-index 被重排，堆叠顺序改变 |
+| **syncInvalidIndices 回退** | fractionalIndex.ts:195 | 索引生成算法失败、边界情况 | 完全无反馈 | 仅无效索引元素的 Z-index 被重排，有效元素顺序不变 |
 | **Scene 状态不一致** | App.tsx:3997 | 数据结构异常、replaceAllElements 失败 | 完全无反馈 | 渲染异常、选择框错位、不可操作 |
 
 ---
@@ -1019,12 +1203,12 @@ this.setState({ errorMessage: error.message })
 
 **场景 2: Fractional Index 回退问题（复杂插入）**
 ```
-用户：精心调整了 30 个元素的图层顺序，花了 10 分钟
+用户：画布上已有 30 个元素，精心调整了堆叠顺序
 用户：插入一个包含 15 个元素的复杂 Library 项目
 内部：syncMovedIndices → 某个边界情况触发异常 → catch 块静默捕获
-内部：syncInvalidIndices 按照字母顺序重新生成所有元素的 index
-结果：用户发现之前精心调整的堆叠顺序全乱了，但不知道为什么，也没有任何提示
-用户感知："我的图层怎么乱了？我刚才做了什么？"
+内部：syncInvalidIndices → 仅检测到的无效索引元素被重新分配 index
+结果：用户发现部分元素的堆叠顺序变了，但其他元素都正常，很难复现和定位问题
+用户感知："怎么有些元素的图层乱了？我明明没动它们啊"
 ```
 
 **场景 3: 元素被静默删除（旧版本数据）**
@@ -1080,14 +1264,14 @@ this.setState({ errorMessage: error.message })
 
 **设计**：
 - 乐观尝试 `syncMovedIndices` 仅更新移动元素的索引
-- 失败时悲观回退到 `syncInvalidIndices` 全量重新生成
+- 失败时悲观回退到 `syncInvalidIndices` 仅修复无效索引
 
-**权衡**：
+**权衡（基于源码实证）**：
 | 正常路径（99% 情况） | 异常回退路径（1% 情况） |
 |----------------------|------------------------|
-| 快速、O(n) 复杂度 | 较慢、O(n log n) 复杂度 |
-| 仅修改必要元素 | 所有元素 index 被重算 |
-| 保留原有堆叠顺序 | 堆叠顺序可能改变 |
+| 快速、精确 | 安全、保守 |
+| 仅修改必要元素 | 仅修改无效索引元素 |
+| 100% 保持原有堆叠顺序 | 保持有效元素堆叠顺序，无效元素组内相对顺序不变 |
 
 ---
 
@@ -1176,7 +1360,7 @@ this.setState({ errorMessage: error.message })
 2. **ID 查找失败告警**：`libraryItems.filter(...).length === 0` 时给出友好提示，如 `"选中的 Library 项目已被移除，请重新选择"`
 3. **Promise 错误处理**：Safari 字体加载添加 catch 分支，避免控制台 unhandled rejection
 4. **静默失败日志**：开发模式下对所有静默失败点输出详细的 console.warn，包含调用栈和元素信息
-5. **图层重排提示**：`syncInvalidIndices` 回退时在开发模式下给出提示，方便开发者复现 bug
+5. **索引回退提示**：`syncInvalidIndices` 回退时在开发模式下给出提示，方便开发者复现 bug
 
 ### 9.2 分组选择用户体验优化
 
@@ -1220,11 +1404,12 @@ Library 存储 → (ID 序列化) → 拖拽数据传输 → (ID 查找) → 元
 | 保证 | 实现机制 |
 |------|---------|
 | **ID 唯一性** | 两次 `duplicateElements` 调用 |
-| **Z-index 正确性** | `syncMovedIndices` + 失败回退机制 |
+| **Z-index 正确性** | `syncMovedIndices` + 失败时仅修复无效索引的回退机制 |
 | **分组选择正确** | `selectGroupsForSelectedElements`：**选中任一元素 → 扩展选中整个组** |
 | **组内元素全选中** | 遍历所有元素，属于任一选中组的元素全部加入选择集合 |
 | **Frame 嵌套正确** | 坐标检测 + 元素过滤 |
 | **错误提示可见** | `errorMessage` state → ErrorDialog 模态框 |
+| **回退路径安全性** | `syncInvalidIndices` 仅修改无效索引，保持有效元素顺序不变 |
 
 ### 10.3 主要风险点
 
@@ -1240,4 +1425,4 @@ Library 存储 → (ID 序列化) → 拖拽数据传输 → (ID 查找) → 元
 
 *最后更新：2026-05-14*
 *分析基于代码版本：packages/excalidraw@HEAD*
-*事实校准标记：✓ selectGroupsForSelectedElements ✓ 错误展示链路 ✓ 失败分支分类*
+*事实校准标记：✓ selectGroupsForSelectedElements ✓ 错误展示链路 ✓ 失败分支分类 ✓ syncInvalidIndices 回退路径深度分析*
