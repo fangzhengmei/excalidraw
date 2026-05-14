@@ -38,9 +38,9 @@ undoStack[5] = 多选 [rect2, rect3]
 undoStack[6] = 删除选中元素
 ```
 
-### 2.2 选择变化作为独立边界
+### 2.2 选择变化的记录机制
 
-**选择状态变化总是独立记录**，这是历史分组的关键特性：
+**选择状态变化可能独立记录，也可能与元素变化合并**，取决于 commit 时机：
 
 ```typescript
 // packages/element/src/store.ts:1006-1032 - getObservedAppState 定义了需要观察的应用状态
@@ -53,7 +53,13 @@ export const getObservedAppState = (
     viewBackgroundColor: appState.viewBackgroundColor,
     selectedElementIds: appState.selectedElementIds,  // 选择状态
     selectedGroupIds: appState.selectedGroupIds,      // 组选择状态
-    selectedLinearElement: appState.selectedLinearElement,
+    // selectedLinearElement 不是直接透传，而是拆出 elementId 和 isEditing
+    selectedLinearElement: appState.selectedLinearElement
+      ? {
+          elementId: appState.selectedLinearElement.elementId,
+          isEditing: !!appState.selectedLinearElement.isEditing,
+        }
+      : null,
     croppingElementId: appState.croppingElementId,
     activeLockedId: appState.activeLockedId,
     lockedMultiSelections: appState.lockedMultiSelections,
@@ -62,7 +68,7 @@ export const getObservedAppState = (
 };
 ```
 
-**设计意图**：选择状态是用户交互的重要上下文，撤销时需要精确恢复到之前的选择状态。
+**记录规则**：选择状态变化独立记录的前提是——在两次元素变化 commit 之间存在单独的选择变化 commit。如果选择变化和元素变化在同一个 commit 周期内发生，则会被合并到同一个 delta 条目中。
 
 ---
 
@@ -235,10 +241,10 @@ private perform(
 
 | 特性 | 实现位置 | 说明 |
 |------|---------|------|
-| **finally 确保推入** | `history.ts:210-212` | 无论成功失败、无论是否可见，每个弹出的条目都会被推入反向栈 |
-| **迭代终止条件** | `history.ts:214-216` | 遇到第一个产生可见变化的条目即停止 |
-| **累积状态传递** | `history.ts:174-176, 209` | nextElements/nextAppState 在循环中累积传递 |
-| **栈对称性保证** | `history.ts:245-248` | push 时自动反转 delta，保证 undo/redo 可往返 |
+| **finally 确保推入** | `packages/excalidraw/history.ts:210-212` | 无论成功失败、无论是否可见，每个弹出的条目都会被推入反向栈 |
+| **迭代终止条件** | `packages/excalidraw/history.ts:214-216` | 遇到第一个产生可见变化的条目即停止 |
+| **累积状态传递** | `packages/excalidraw/history.ts:174-176, 209` | nextElements/nextAppState 在循环中累积传递 |
+| **栈对称性保证** | `packages/excalidraw/history.ts:245-248` | push 时自动反转 delta，保证 undo/redo 可往返 |
 
 #### 栈操作的原子性
 
@@ -327,7 +333,7 @@ private static push(stack: HistoryDelta[], entry: HistoryDelta) {
 
 ### ⚠️ 潜在问题
 
-1. **历史栈膨胀**：选择变化作为独立条目，导致历史条目数量较多
+1. **历史栈膨胀**：选择变化常作为独立条目，导致历史条目数量较多
    - 三个元素的创建 + 删除可能产生 6-7 个条目
 
 2. **用户预期差异**：用户可能期望"一次撤销"回退到"上一个有意义的状态"，而不是精确的每一步
@@ -353,18 +359,18 @@ private static push(stack: HistoryDelta[], entry: HistoryDelta) {
 
 ## 七、关键代码位置索引
 
-| 功能 | 文件 | 行号 |
-|------|------|------|
-| 历史栈核心逻辑 | `packages/excalidraw/history.ts` | 90-249 |
-| perform 核心循环（含跳过机制） | `packages/excalidraw/history.ts` | 157-229 |
-| finally 块确保反向推入 | `packages/excalidraw/history.ts` | 210-212 |
-| pop/push 辅助函数 | `packages/excalidraw/history.ts` | 231-248 |
-| redo 栈清空策略 | `packages/excalidraw/history.ts` | 127-132 |
-| 捕获动作类型定义 | `packages/element/src/store.ts` | 38-69 |
-| Store commit 逻辑 | `packages/element/src/store.ts` | 183-201 |
-| 动作优先级调度 | `packages/element/src/store.ts` | 391-406 |
-| 观察的应用状态定义 | `packages/element/src/store.ts` | 1006-1032 |
-| StoreSnapshot maybeClone | `packages/element/src/store.ts` | 761-811 |
+| 功能 | 位置 |
+|------|------|
+| 历史栈核心逻辑 | `packages/excalidraw/history.ts:90-249` |
+| perform 核心循环（含跳过机制） | `packages/excalidraw/history.ts:157-229` |
+| finally 块确保反向推入 | `packages/excalidraw/history.ts:210-212` |
+| pop/push 辅助函数 | `packages/excalidraw/history.ts:231-248` |
+| redo 栈清空策略 | `packages/excalidraw/history.ts:127-132` |
+| 捕获动作类型定义 | `packages/element/src/store.ts:38-69` |
+| Store commit 逻辑 | `packages/element/src/store.ts:183-201` |
+| 动作优先级调度 | `packages/element/src/store.ts:391-406` |
+| 观察的应用状态定义 | `packages/element/src/store.ts:1006-1032` |
+| StoreSnapshot maybeClone | `packages/element/src/store.ts:761-811` |
 
 ---
 
@@ -372,7 +378,7 @@ private static push(stack: HistoryDelta[], entry: HistoryDelta) {
 
 Excalidraw 的历史分组策略采用 **"精确记录 + 智能跳过"** 的混合模式：
 
-1. **分组原则**：基于用户交互的原子性，每个选择变化都是独立边界
+1. **分组原则**：基于用户交互的原子性，选择状态变化可能独立记录也可能合并记录，取决于 commit 时机
 2. **状态保留**：通过三种捕获动作精确控制哪些变化进入历史、哪些更新快照
 3. **执行策略**：撤销重做时自动迭代跳过无可见变化的条目，**finally 块保证每个弹出条目都被推入反向栈**
 4. **特殊处理**：纯应用状态变化不清空 redo 栈，优化用户体验
