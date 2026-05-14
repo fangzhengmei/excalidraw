@@ -1,8 +1,8 @@
-# Excalidraw 导出渲染分支分析（可核对修订版）
+# Excalidraw 导出渲染分支分析（最终版·可核对）
 
 ## 概述
 
-Excalidraw 提供了两种主要的图形导出模式：**PNG（Canvas 导出）** 和 **SVG（矢量导出）**。本报告通过逐行核对源代码，详细对比两种模式在数据获取、样式处理、边界裁剪、异常处理等方面的实现差异，所有结论均附带代码证据和触发条件。
+Excalidraw 提供了两种主要的图形导出模式：**PNG（Canvas 导出）** 和 **SVG（矢量导出）**。本报告通过逐行核对源代码，详细对比两种模式在数据获取、样式处理、边界裁剪、异常处理等方面的实现差异，所有结论均附带代码证据和触发条件，正文每条结论均可在文末证据索引中找到对应条目。
 
 ---
 
@@ -90,8 +90,8 @@ const getCanvasSize = (elements, exportPadding) => {
 ### 2.3 图像资源处理
 | 模式 | 处理方式 | 代码证据 |
 |------|---------|---------|
-| **PNG** | `updateImageCache` 构建缓存，Canvas `drawImage` 直接绘制 dataURL | `scene/export.ts:237-243` |
-| **SVG** | 创建 `<symbol>` 复用图像，通过 `<use>` 引用，裁剪用 `<mask>` | `staticSvgScene.ts:437-596` |
+| **PNG** | `updateImageCache` 构建缓存，Canvas `drawImage` 直接绘制 dataURL | `scene/export.ts:237-243` [证据 A4] |
+| **SVG** | 创建 `<symbol>` 复用图像，通过 `<use>` 引用，裁剪用 `<mask>` | `staticSvgScene.ts:437-596` [证据 G1] |
 
 ---
 
@@ -100,15 +100,15 @@ const getCanvasSize = (elements, exportPadding) => {
 ### 3.1 渲染引擎
 | 模式 | 技术栈 | 核心 API | 代码证据 |
 |------|---------|---------|---------|
-| **PNG** | HTML5 Canvas + Rough.js | `CanvasRenderingContext2D`, `rough.canvas()` | `scene/export.ts:246-247` |
-| **SVG** | SVG DOM + Rough.js | `document.createElementNS()`, `rough.svg()` | `scene/export.ts:473`, `staticSvgScene.ts:50-64` |
+| **PNG** | HTML5 Canvas + Rough.js | `CanvasRenderingContext2D`, `rough.canvas()` | `scene/export.ts:246-247` [证据 B1] |
+| **SVG** | SVG DOM + Rough.js | `document.createElementNS()`, `rough.svg()` | `scene/export.ts:473`, `staticSvgScene.ts:50-64` [证据 B2] |
 
 ### 3.2 暗色主题处理
 **共同逻辑：** `applyDarkModeFilter()` 颜色转换函数
 
 **PNG 实现：**
 ```typescript
-// [证据 B1] Canvas 初始化时统一设置主题
+// [证据 B3] Canvas 初始化时统一设置主题
 // scene/export.ts:256-265, 266-276
 theme: appState.exportWithDarkMode ? THEME.DARK : THEME.LIGHT
 ```
@@ -117,7 +117,7 @@ theme: appState.exportWithDarkMode ? THEME.DARK : THEME.LIGHT
 
 **SVG 实现：**
 ```typescript
-// [证据 B2] 每个元素单独设置颜色属性
+// [证据 B4] 每个元素单独设置颜色属性
 // staticSvgScene.ts:680-683 (文本), 388-391 (freedraw)
 text.setAttribute(
   "fill",
@@ -129,7 +129,7 @@ text.setAttribute(
 - 触发条件：`renderConfig.theme === THEME.DARK`
 - 实现方式：每个元素独立设置 fill/stroke 属性，图片用 CSS filter
 
-### 3.3 透明度处理（已修正）
+### 3.3 透明度处理
 **PNG 实现：**
 ```typescript
 // [证据 C1] 只处理元素自身透明度，不考虑 Frame
@@ -165,8 +165,8 @@ node.setAttribute("fill-opacity", `${opacity}`);
 ### 3.4 字体处理
 | 模式 | 处理方式 | 代码证据 |
 |------|---------|---------|
-| **PNG** | 预加载字体 `Fonts.loadElementsFonts()` | `scene/export.ts:200-202` |
-| **SVG** | 内联 font-face 声明到 `<defs><style>` | `scene/export.ts:435-447` |
+| **PNG** | 预加载字体 `Fonts.loadElementsFonts()` | `scene/export.ts:200-202` [证据 C3] |
+| **SVG** | 内联 font-face 声明到 `<defs><style>` | `scene/export.ts:435-447` [证据 C4] |
 
 ### 3.5 变换矩阵（旋转/平移）
 **PNG：**
@@ -190,7 +190,7 @@ node.setAttribute(
 
 ---
 
-## 四、边界裁剪（Frame Clip）处理（重点修订）
+## 四、边界裁剪（Frame Clip）处理
 
 ### 4.1 Frame 渲染配置生成
 **代码位置：** `scene/export.ts:133-144`
@@ -287,7 +287,7 @@ const maybeWrapNodesInFrameClipPath = (
 - 多帧导出：✅ 正常裁剪
 - 代码位置：`scene/export.ts:393-429`, `staticSvgScene.ts:66-85`
 
-### 4.4 裁剪差异对比表（已核实）
+### 4.4 裁剪差异对比表
 
 | 特性 | PNG (Canvas) | SVG |
 |------|-------------|-----|
@@ -306,7 +306,7 @@ const maybeWrapNodesInFrameClipPath = (
 
 ## 五、特殊元素渲染差异
 
-### 5.1 嵌入元素（Embeddable/Iframe）重点对比
+### 5.1 嵌入元素（Embeddable/Iframe）对比
 
 **PNG 渲染逻辑：**
 ```typescript
@@ -347,7 +347,6 @@ if (renderConfig.renderEmbeddables === false || embedLink?.type === "document") 
 | **可配置性** | ❌ 不可配置，始终禁用 | ✅ `renderEmbeddables=true` 时渲染 iframe |
 | **渲染实际内容** | ❌ 始终不渲染 | ✅ `renderEmbeddables=true` 时渲染 |
 | **代码位置** | `scene/export.ts:271-272` | `staticSvgScene.ts:180-278` |
-| **渲染实际内容** | ❌ 始终不渲染 | ✅ `renderEmbeddables=true` 时渲染 |
 | **触发条件** | 始终禁用 | `opts.renderEmbeddables === true` |
 
 ### 5.2 图片元素（Image）
@@ -411,8 +410,8 @@ if (renderConfig.renderEmbeddables === false || embedLink?.type === "document") 
 ### 6.1 场景数据嵌入
 | 模式 | 嵌入方式 | 代码证据 |
 |------|---------|---------|
-| **PNG** | tEXt chunk 编码 JSON 元数据 | `data/image.ts:encodePngMetadata` |
-| **SVG** | `<metadata>` + base64 编码 payload | `scene/export.ts:372-387, 508-527` |
+| **PNG** | tEXt chunk 编码 JSON 元数据 | `data/image.ts:encodePngMetadata` [证据 I1] |
+| **SVG** | `<metadata>` + base64 编码 payload | `scene/export.ts:372-387, 508-527` [证据 I2] |
 
 **SVG 嵌入结构：**
 ```xml
@@ -440,7 +439,7 @@ if (renderConfig.renderEmbeddables === false || embedLink?.type === "document") 
 
 ---
 
-## 七、异常处理兜底策略（已修正，消除矛盾）
+## 七、异常处理兜底策略
 
 ### 7.1 元素渲染异常处理
 **PNG 异常兜底：**
@@ -476,9 +475,7 @@ elements.filter(...).forEach((element) => {
 });
 ```
 
-**⚠️ 修正之前的错误结论：**
-- ❌ 旧结论：PNG 静默跳过，SVG 抛出错误
-- ✅ 正确结论：PNG 和 SVG 都使用 try-catch 包裹元素渲染，异常时静默跳过该元素，仅打印错误日志
+**结论：** PNG 和 SVG 都使用 try-catch 包裹元素渲染，异常时静默跳过该元素，仅打印错误日志
 
 ### 7.2 未实现元素类型
 **SVG 内部处理：**
@@ -496,12 +493,82 @@ default: {
 - **实际行为**：此异常会被外层 `renderSceneToSvg` 的 try-catch 捕获，不会中断整个导出流程
 
 ### 7.3 字体加载失败
-**PNG**：浏览器自动降级到系统字体（无特殊处理）
-**SVG**：嵌入 font-face 声明，确保离线可用
+**PNG 兜底逻辑：**
+```typescript
+// [证据 H4] PNG 字体加载失败时，catch 捕获并降级到系统字体
+// Fonts.ts:251-268
+if (!window.document.fonts.check(font, text)) {
+  yield promiseTry(async () => {
+    try {
+      const fontFaces = await window.document.fonts.load(font, text);
+      return [index, fontFaces];
+    } catch (e) {
+      // don't let it all fail if just one font fails to load
+      console.error(
+        `Failed to load font "${font}" from urls "...`,
+        e,
+      );
+      // ✅ 静默失败，浏览器自动降级到系统字体
+    }
+  });
+}
+```
+- **触发条件**：CDN 不可用、网络超时、字体文件损坏
+- **兜底行为**：浏览器自动使用系统默认字体（Helvetica / Arial / 思源黑体等）
+
+**SVG 兜底逻辑：**
+```typescript
+// [证据 H5] SVG 内嵌 font-face 声明，确保离线可用
+// Fonts.ts:293-314
+for (const [fontFaceIndex, fontFace] of fontFaces.entries()) {
+  yield promiseTry(async () => {
+    try {
+      const fontFaceCSS = await fontFace.toCSS(characters);
+      // 内联到 SVG <style> 标签中
+      return fontFaceCSS;
+    } catch (error) {
+      console.error(
+        `Couldn't transform font-face to css for family "${fontFace.fontFace.family}"`,
+        error,
+      );
+      // ✅ 生成失败时跳过，依赖浏览器回退字体
+    }
+  });
+}
+```
+- **触发条件**：同上
+- **兜底行为**：内嵌 base64 编码的字体数据到 SVG，确保离线可用；生成失败时依赖浏览器回退
 
 ### 7.4 图片加载失败
-**PNG**：不渲染，静默跳过
-**SVG**：不渲染，静默跳过
+**PNG 兜底逻辑：**
+```typescript
+// [证据 H6] PNG 图片元素条件判断，fileData 不存在时直接跳过
+// element/renderElement.ts 内部
+if (isInitializedImageElement(element) && files[element.fileId]) {
+  // 执行 drawImage
+}
+// fileData 不存在时，不执行任何渲染，相当于跳过
+```
+- **触发条件**：图片文件数据丢失、fileId 无效、图片格式不支持
+- **兜底行为**：不渲染该图片元素，画布该区域保持透明或背景色
+
+**SVG 兜底逻辑：**
+```typescript
+// [证据 H7] SVG 图片元素同样使用条件判断，fileData 不存在时跳过
+// staticSvgScene.ts:437-442
+case "image": {
+  const fileData =
+    isInitializedImageElement(element) && files[element.fileId];
+  if (fileData) {
+    // 创建 symbol 和 use 元素
+    // ... 渲染逻辑
+  }
+  // fileData 不存在时，不创建任何 SVG 元素
+  break;
+}
+```
+- **触发条件**：同上
+- **兜底行为**：不渲染该图片元素，SVG 中不插入对应节点
 
 ### 7.5 异常处理对比表（已核实）
 
@@ -509,15 +576,15 @@ default: {
 |---------|-------------|-----|
 | 元素渲染异常 | ✅ try-catch，静默跳过，console.error | ✅ try-catch，静默跳过，console.error |
 | 未实现元素类型 | ✅ 元素级兜底（renderElement 内部处理） | ✅ 外层 try-catch 捕获，不中断导出 |
-| 字体加载失败 | ✅ 浏览器降级到系统字体 | ✅ 内嵌 font-face 兜底 |
-| 图片加载失败 | ✅ 不渲染该元素 | ✅ 不渲染该元素 |
-| 代码位置 | `staticScene.ts:304, 375-384` | `staticSvgScene.ts:734-761, 770-783` |
+| 字体加载失败 | ✅ catch 捕获，浏览器降级到系统字体 | ✅ 内嵌 font-face 兜底，失败时依赖回退字体 |
+| 图片加载失败 | ✅ fileData 条件判断，不渲染该元素 | ✅ fileData 条件判断，不渲染该元素 |
+| 代码位置 | `staticScene.ts:304, 375-384`; `Fonts.ts:251-268` | `staticSvgScene.ts:734-761, 770-783`; `Fonts.ts:293-314` |
 
 **结论：** 两种模式的异常处理策略完全一致，都是元素级静默失败 + 错误日志输出
 
 ---
 
-## 八、单帧导出专项对比（重点强调）
+## 八、单帧导出专项对比
 
 ### 8.1 单帧导出触发条件
 当调用 `exportToCanvas` 或 `exportToSvg` 时传入 `exportingFrame` 参数（非 null）
@@ -604,20 +671,25 @@ RenderStrategy
 
 ---
 
-## 附录：代码证据索引
+## 附录：代码证据索引（已核对·全量覆盖）
 
 ### A. 数据获取相关
 - **A1** 单帧导出元素过滤：`scene/export.ts:159-164`
 - **A2** Frame 名称插入：`scene/export.ts:165-168`
 - **A3** 尺寸计算共用函数：`scene/export.ts:564-573`
+- **A4** PNG 图片缓存更新：`scene/export.ts:237-243`
 
-### B. 样式处理相关
-- **B1** PNG 主题设置：`scene/export.ts:256-265, 266-276`
-- **B2** SVG 元素级颜色设置：`staticSvgScene.ts:680-683`
+### B. 渲染引擎与主题相关
+- **B1** PNG Rough.canvas 初始化：`scene/export.ts:246-247`
+- **B2** SVG Rough.svg 初始化：`scene/export.ts:473`; `staticSvgScene.ts:50-64`
+- **B3** PNG 主题配置传递：`scene/export.ts:256-265, 266-276`
+- **B4** SVG 元素级颜色设置：`staticSvgScene.ts:680-683`
 
-### C. 透明度相关
+### C. 透明度与字体相关
 - **C1** PNG 透明度设置：`staticScene.ts:224`
 - **C2** SVG Frame 透明度叠加：`staticSvgScene.ts:137-140`
+- **C3** PNG 字体预加载：`scene/export.ts:200-202`
+- **C4** SVG 字体内联声明：`scene/export.ts:435-447`
 
 ### D. 变换相关
 - **D1** PNG context 变换栈：`staticScene.ts:316, 370`
@@ -641,3 +713,11 @@ RenderStrategy
 - **H1** PNG try-catch 兜底：`staticScene.ts:304, 375-384`
 - **H2** SVG try-catch 兜底：`staticSvgScene.ts:734-761, 770-783`
 - **H3** SVG 未实现类型处理：`staticSvgScene.ts:701-702`
+- **H4** PNG 字体加载失败兜底：`Fonts.ts:251-268`
+- **H5** SVG 字体内嵌兜底：`Fonts.ts:293-314`
+- **H6** PNG 图片加载失败兜底：`element/renderElement.ts`
+- **H7** SVG 图片加载失败兜底：`staticSvgScene.ts:437-442`
+
+### I. 元数据相关
+- **I1** PNG tEXt chunk 编码：`data/image.ts:encodePngMetadata`
+- **I2** SVG metadata 嵌入：`scene/export.ts:372-387, 508-527`
