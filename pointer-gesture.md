@@ -12,7 +12,7 @@ Excalidraw 的指针手势系统采用**事件驱动的状态机**设计，通�
 | 拖拽引擎 | 元素拖拽、新建、对齐逻辑 | `dragElements.ts:35-353` |
 | 历史记录管理器 | 撤销/重做栈管理 | `history.ts:90-240` |
 | Store 增量捕获器 | 快照-增量计算、撤销入栈 | `element/src/store.ts:78-427` |
-| 协作同步器 | 指针位置广播 | `App.tsx:12906-12930` |
+| 协作同步器 | 指针位置广播 | `excalidraw-app/collab/Collab.tsx:914-925` |
 | 清理补偿器 | pointerup 丢失时的兜底处理 | `App.tsx:8246-8249` |
 
 ---
@@ -123,27 +123,30 @@ type PointerDownState = {
 - **事件捕获**：使用 `setPointerCapture` 确保后续事件都由 canvas 处理，即使指针移出画布
 - **多指过滤**：`gesture.pointers.size > 1` 时阻止单选/绘制操作（`App.tsx:7903`）
 - **橡皮笔切换**：检测到橡皮笔按钮时自动切换工具，抬起后还原
-- **自由绘制多指特殊处理** (`App.tsx:7760-7793`）：
+- **自由绘制多指特殊处理** (`App.tsx:7760-7793`)：
   - 触屏且当前正在绘制 freedraw 时，第二指按下会触发特殊逻辑
   - 点数 < 10：删除元素（认为是误触尖峰），`captureUpdate: NEVER`
   - 点数 >= 10：保留元素，重置 newElement 等待第二指抬起后 finalize
 
 ### 3.2 第二阶段：PointerMove
 
-**⚠️ 重要修正：两层 pointerMove 事件，节流常量**
+**⚠️ 重要修正：三层 pointerMove 处理链路，两层节流**
 
-Excalidraw 有**两条独立的 pointerMove 处理链路**，节流频率不同：
+Excalidraw 有**三条独立的 pointerMove 处理链路**，分布在两个层级：
 
-| 处理器 | 代码位置 | 节流方式 | 频率 | 职责 |
-|--------|---------|---------|------|------|
-| `handleCanvasPointerMove` | `App.tsx:6888` | **无节流**（React 原生事件） | 60-120Hz（浏览器决定） | 多指手势追踪 + 协作指针同步 |
-| `onPointerMoveFromPointerDownHandler` | `App.tsx:9675` | `withBatchedUpdatesThrottled` | **~60fps**（16.6ms） | 元素拖拽/绘制逻辑 |
+| 层级 | 处理器 | 代码位置 | 节流方式 | 频率 | 职责 |
+|------|--------|---------|---------|------|------|
+| 核心包 | `handleCanvasPointerMove` | `App.tsx:6888` | **无节流**（React 原生事件） | 60-120Hz（浏览器决定） | 多指手势追踪 + 协作指针同步入口 |
+| 核心包 | `onPointerMoveFromPointerDownHandler` | `App.tsx:9675` | `withBatchedUpdatesThrottled` | **~60fps**（16.6ms） | 元素拖拽/绘制逻辑 |
+| 协作层 | `Collab.onPointerUpdate` | `Collab.tsx:914` | `lodash.throttle` | **~30fps**（33ms） | 协作端指针广播 |
 
 **第一层：handleCanvasPointerMove (无节流)**
 
 ```typescript
 // App.tsx:6888-6905
-private handleCanvasPointerMove = (event) => {
+private handleCanvasPointerMove = (
+  event: React.PointerEvent<HTMLCanvasElement>,
+) => {
   // 无节流！浏览器 pointermove 原生频率 60-120Hz
   this.savePointer(event.clientX, event.clientY, this.state.cursorButton);
   this.lastPointerMoveEvent = event.nativeEvent;
@@ -169,16 +172,18 @@ private handleCanvasPointerMove = (event) => {
 private onPointerMoveFromPointerDownHandler(pointerDownState) {
   return withBatchedUpdatesThrottled((event) => {
     // throttleRAF + batchedUpdates，限制到 ~60fps
+    // 返回的函数带有 flush() 方法
   });
 }
 ```
 
-**节流实现 (`common/src/utils.ts:155-195`）
+**节流实现 (`common/src/utils.ts:155-195` + `reactUtils.ts:23-32`)**
 
 ```typescript
 export const throttleRAF = (fn) => {
   // requestAnimationFrame 节流，约 16.6ms 一次
   // 同一帧内多次调用只执行最后一次
+  // 返回值带有 flush() 方法可强制执行
 };
 
 export const withBatchedUpdatesThrottled = (func) => {
@@ -188,13 +193,55 @@ export const withBatchedUpdatesThrottled = (func) => {
 };
 ```
 
-**执行流程：**
+**第三层：Collab.onPointerUpdate (throttled @30fps)** - 协作层
+
+```typescript
+// excalidraw-app/app_constants.ts:8
+export const CURSOR_SYNC_TIMEOUT = 33; // ~30fps
+
+// excalidraw-app/collab/Collab.tsx:914-925
+import throttle from "lodash.throttle";
+
+onPointerUpdate = throttle(
+  (payload) => {
+    // ⚠️ 真实多指过滤条件：单指才广播
+    payload.pointersMap.size < 2 &&
+      this.portal.socket &&
+      this.portal.broadcastMouseLocation(payload);
+  },
+  CURSOR_SYNC_TIMEOUT,  // 33ms → ~30fps
+);
+```
+
+**完整协作端同步链路：**
+
+```
+浏览器 pointermove (60-120Hz)
+    ↓
+App.tsx: handleCanvasPointerMove (无节流)
+    ↓
+App.tsx: this.savePointer(x, y, button)
+    ├─ 坐标转换 viewport → scene
+    └─ this.props.onPointerUpdate?.({
+        pointer, button, pointersMap: gesture.pointers
+       })
+    ↓
+excalidraw-app/App.tsx:916 → collabAPI?.onPointerUpdate
+    ↓
+Collab.tsx: lodash.throttle(fn, 33ms) → ~30fps
+    ↓
+真实过滤: payload.pointersMap.size < 2 ?
+    ├─ 是 → Portal.broadcastMouseLocation() → WebSocket volatile 消息
+    └─ 否 → 丢弃，不广播
+```
+
+**执行流程总览：**
 
 ```
 浏览器 pointermove 事件（60-120Hz）
     │
     ├─→ handleCanvasPointerMove（无节流）
-    │       ├─ savePointer() → 协作同步（60-120Hz）
+    │       ├─ savePointer() → 协作同步入口（60-120Hz）
     │       ├─ 更新 gesture.pointers 坐标
     │       └─ 双指缩放计算
     │
@@ -210,7 +257,7 @@ export const withBatchedUpdatesThrottled = (func) => {
                 └─ 普通拖拽 → dragSelectedElements()
 ```
 
-**拖拽核心逻辑 (`dragElements.ts:35-171`)
+**拖拽核心逻辑 (`dragElements.ts:35-171`)**
 
 ```typescript
 export const dragSelectedElements = (
@@ -229,15 +276,15 @@ export const dragSelectedElements = (
 - `pointerDownState.drag.hasOccurred` - 首次移动超过阈值时设为 `true`
 - `selectedElementsAreBeingDragged` - 全局拖拽状态，影响渲染和撤销
 
-### 3.3 第三阶段：PointerUp (`App.tsx:10598-10900`
+### 3.3 第三阶段：PointerUp (`App.tsx:10598-10900`)
 
 **执行流程：**
 
 ```
 10604: removePointer() - 移除手势追踪
     ↓
-10606-10607: pointerDownState.eventListeners.onMove.flush() - 刷新节流中的 move 事件
-    ↓
+10606-10607: pointerDownState.eventListeners.onMove.flush()
+    ↓ （⚠️ 强制刷新节流中的 move 事件，确保拖拽状态不丢失）
 10620: 重置临时状态
   { isResizing, isRotating, isCropping, resizingElement, 
     selectionElement, snapLines, cursorButton: "up" }
@@ -291,7 +338,7 @@ pointerUp
 
 ### 4.2 Linear 工具状态机（Arrow/Line）- 重要修正
 
-**⚠️ 关键修正：线性元素小拖拽不会删除，而是进入多点编辑模式
+**⚠️ 关键修正：线性元素小拖拽不会删除，而是进入多点编辑模式**
 
 ```
 pointerDown
@@ -331,7 +378,7 @@ pointerUp (`App.tsx:10867-10963`)
             └─ locked 工具：仅 newElement = null
 ```
 
-**线性元素与其他元素的关键区别：
+**线性元素与其他元素的关键区别：**
 
 | 行为 | 线性元素 (arrow/line) | 其他元素 (rect/ellipse 等) |
 |------|----------------------|---------------------------|
@@ -380,7 +427,7 @@ handleCanvasPanUsingWheelOrSpaceDrag()
     ├─ setCursor(GRABBING)
     └─ 绑定 onPointerMove/onPointerUp
     ↓
-pointerMove (withBatchedUpdatesThrottled @60fps）
+pointerMove (withBatchedUpdatesThrottled @60fps)
     ↓
 translateCanvas()
     ├─ scrollX -= deltaX / zoom
@@ -393,7 +440,7 @@ isPanning = false, 恢复光标
 
 ---
 
-## 5. 多指场景下的过滤与节流规则（重要修正版）
+## 5. 多指场景下的过滤与节流规则（最终修正版）
 
 ### 5.1 Gesture 对象定义 (`App.tsx:614-619` + `types.ts:512-517`)
 
@@ -420,58 +467,80 @@ const gesture: Gesture = {
 | 自由绘制多指 | `App.tsx:7760-7793` | `event.pointerType === "touch"` && `newElement.type === "freedraw"` | 短尖峰删除，长轨迹保留 |
 | freedraw 缩放禁用 | `App.tsx:6921-6923` | `activeTool.type === "freedraw"` && `penMode` | `scaleFactor = 1`，禁用双指缩放 |
 | 空格键切换光标 | `App.tsx:5250` | `gesture.pointers.size === 0` | 按下空格键时才允许切换到抓取光标 |
+| **协作端广播阻止** | **`Collab.tsx:920`** | **`payload.pointersMap.size >= 2`** | **多指时不广播指针位置给协作端** |
 
-### 5.3 协作端指针同步 - 真实过滤条件
+### 5.3 协作端指针同步 - 真实过滤条件与节流频率
 
-**⚠️ 关键修正：协作端指针同步**没有**专门的多指过滤！**
+**⚠️ 最终事实：协作端同步是**两层节流 + 多指过滤**的组合**
 
 ```typescript
-// App.tsx:12906-12930
-private savePointer = (x: number, y: number, button: "up" | "down") => {
-  if (!x || !y) return;  // 空坐标过滤
-  
-  const { x: sceneX, y: sceneY } = viewportCoordsToSceneCoords(...);
-  
-  const pointer: CollaboratorPointer = {
-    x: sceneX,
-    y: sceneY,
-    tool: activeTool.type === "laser" ? "laser" : "pointer",
-  };
-  
-  // ⚠️ 无论多少指，都完整广播 gesture.pointers
-  this.props.onPointerUpdate?.({
-    pointer,        // 主指针位置（始终是当前触发事件的指针）
-    button,         // 按钮状态
-    pointersMap: gesture.pointers,  // 完整多指 Map 也广播（包含所有活跃指针）
-  });
-};
+// 节流常量定义
+// excalidraw-app/app_constants.ts:8
+export const CURSOR_SYNC_TIMEOUT = 33; // ~30fps (1000/33 ≈ 30.3)
+
+// 协作层节流与过滤
+// excalidraw-app/collab/Collab.tsx:29, 914-925
+import throttle from "lodash.throttle";  // lodash 默认 leading:true, trailing:true
+
+onPointerUpdate = throttle(
+  (payload) => {
+    // ⚠️ 真实多指过滤条件：严格小于 2 才广播
+    payload.pointersMap.size < 2 &&
+      this.portal.socket &&
+      this.portal.broadcastMouseLocation(payload);
+  },
+  CURSOR_SYNC_TIMEOUT,  // 33ms
+);
 ```
 
-**协作同步频率 - 真实节流频率：**
+**三层节流频率对比表：**
 
-| 事件 | 调用点 | 节流方式 | 真实频率 |
-|------|--------|---------|---------|
-| pointerMove | `handleCanvasPointerMove` 第一行 | **无节流** | **60-120Hz（浏览器原生 pointermove 频率） |
-| pointerDown | `handleCanvasPointerDown` | 无节流 | 事件触发时 |
-| pointerUp | `handleCanvasPointerUp` / `onPointerUpFromPointerDownHandler` | 无节流 | 事件触发时 |
+| 节流点 | 实现方式 | 常量值 | 真实频率 | 影响范围 |
+|--------|----------|--------|---------|----------|
+| handleCanvasPointerMove | 无节流（React 原生） | N/A | 60-120Hz | 多指追踪、协作同步入口 |
+| onPointerMoveFromPointerDownHandler | `throttleRAF` + `batchedUpdates` | 16.6ms (RAF) | **~60fps** | 拖拽、绘制、平移操作 |
+| **Collab.onPointerUpdate** | **`lodash.throttle`** | **CURSOR_SYNC_TIMEOUT = 33ms** | **~30fps** | **协作端指针广播** |
+| image refresh | `lodash.throttle` | 可配置 | 可配置 | 图片元素刷新 |
+| React 更新 | `unstable_batchedUpdates` | N/A | 批量 | 同一帧内多次 setState 合并 |
 
-**⚠️ **重要事实**：
-- `savePointer()` 在 `handleCanvasPointerMove` 中被调用，这个函数是**无节流**的 React 原生事件处理器
-- 浏览器 pointermove 事件频率通常为 60-120Hz（取决于硬件和浏览器）
-- 协作端同步频率与浏览器指针硬件频率一致，不是 60fps
-- `onPointerMoveFromPointerDownHandler` 的节流只影响**拖拽绘制逻辑，不影响协作同步
+**协作端同步完整链路图：**
 
-### 5.4 节流规则汇总 - 修正版
+```
+浏览器 pointermove 事件
+    │ 频率：60-120Hz（硬件决定）
+    ▼
+┌─────────────────────────────────────────┐
+│ App.tsx: handleCanvasPointerMove         │
+│ （无节流，60-120Hz）                     │
+│  - 更新 gesture.pointers                 │
+│  - 调用 savePointer() → onPointerUpdate  │
+└───────────────────┬─────────────────────┘
+                    │
+                    ▼
+┌─────────────────────────────────────────┐
+│ excalidraw-app/collab/Collab.tsx        │
+│ onPointerUpdate = throttle(fn, 33ms)    │
+│ （lodash.throttle，~30fps）             │
+│                                         │
+│  过滤条件：                              │
+│  payload.pointersMap.size < 2 ?         │
+│    ├─ 是 → 广播给协作端                  │
+│    └─ 否 → 丢弃，不广播                  │
+└─────────────────────────────────────────┘
+                    │
+                    ▼
+           Portal.broadcastMouseLocation()
+           WebSocket volatile 消息
+```
 
-| 节流点 | 实现方式 | 真实频率 | 影响范围 |
-|--------|----------|---------|----------|
-| handleCanvasPointerMove | 无节流（React 原生） | 60-120Hz | 多指追踪、协作同步 |
-| onPointerMoveFromPointerDownHandler | `withBatchedUpdatesThrottled` = `throttleRAF` + `batchedUpdates` | **~60fps**（16.6ms） | 拖拽、绘制、平移操作 |
-| 协作指针同步 | 随 handleCanvasPointerMove 隐式同步 | 60-120Hz | `savePointer()` 广播频率 |
-| image refresh | `lodash.throttle` | 可配置 | 图片元素刷新 |
-| React 更新 | `unstable_batchedUpdates` | 批量 | 同一帧内多次 setState 合并 |
+**lodash.throttle 行为说明：**
+- 默认配置：`leading: true`, `trailing: true`
+- 第一次调用立即执行（leading edge）
+- 33ms 窗口内的后续调用被忽略
+- 窗口结束时如果有待执行调用则执行最后一次（trailing edge）
+- 返回的函数带有 `flush()` 和 `cancel()` 方法
 
-### 5.5 协作端多指数据广播
+### 5.4 协作端多指数据广播
 
 ```typescript
 // 广播数据结构
@@ -484,7 +553,7 @@ private savePointer = (x: number, y: number, button: "up" | "down") => {
 
 ---
 
-## 6. 撤销栈交互机制（重要修正版）
+## 6. 撤销栈交互机制（最终修正版）
 
 ### 6.1 Store 核心 (`element/src/store.ts:38-69`)
 
@@ -496,9 +565,9 @@ export const CaptureUpdateAction = {
 } as const;
 ```
 
-### 6.2 ⚠️ 关键修正：NEVER 分支与 snapshot 更新关系
+### 6.2 ⚠️ 最终修正：NEVER 分支与 snapshot 更新关系
 
-**之前的错误描述**：NEVER 分支 "只通知，不更新 snapshot
+**之前的错误描述**：NEVER 分支 "只通知，不更新 snapshot"
 
 **✅ 真实语义** (`store.ts:362-385`)
 
@@ -514,7 +583,7 @@ try {
       break;
   }
 } finally {
-  // ⚠️ 更新 snapshot 的是在 finally 块中，无论什么分支都会执行！
+  // ⚠️ 更新 snapshot 在 finally 块中，无论什么分支都会执行！
   switch (action) {
     // ✅ IMMEDIATELY 和 NEVER 都更新 snapshot！
     case CaptureUpdateAction.IMMEDIATELY:
@@ -526,7 +595,7 @@ try {
 }
 ```
 
-**三个分支的完整对比：
+**三个分支的完整对比：**
 
 | 行为 | IMMEDIATELY | NEVER | EVENTUALLY |
 |------|-------------|-------|------------|
@@ -535,7 +604,12 @@ try {
 | 发出通知 | DurableIncrement | EphemeralIncrement | EphemeralIncrement |
 | 优先级 | 最高 | 中等 | 最低 |
 
-### 6.3 Store 捕获链路（修正版）
+**NEVER 分支的设计意图：**
+1. **更新 snapshot**：将变更固化到快照，确保后续 delta 计算不会重复包含
+2. **不入撤销栈**：用户无法撤销这个操作（通常是远程变更、系统自动清理）
+3. **防止后续捕获**：snapshot 已更新，后续 IMMEDIATELY 操作计算 delta 时不会再包含这个变更
+
+### 6.3 Store 捕获链路（最终修正版）
 
 ```
 scheduleCapture()
@@ -554,8 +628,8 @@ commit(elements, appState)
         │   │                       onDurableIncrementEmitter.trigger()
         │   │                           ↓
         │   │                       history.record(delta) → 入 undoStack
-        │   ├─ NEVER → emitEphemeralIncrement() - 只通知，不更新入栈
-        │   └─ EVENTUALLY → emitEphemeralIncrement() - 只通知，不更新入栈
+        │   ├─ NEVER → emitEphemeralIncrement() - 只通知，不入栈
+        │   └─ EVENTUALLY → emitEphemeralIncrement() - 只通知，不入栈
         └─ finally: 更新 snapshot
             ├─ IMMEDIATELY/NEVER → this.snapshot = nextSnapshot
             └─ EVENTUALLY → 不更新
@@ -575,8 +649,8 @@ if (newElement && isInvisiblySmallElement(newElement)) {
 }
 ```
 
-**NEVER 在这里的作用**：
-1. **更新 snapshot**：将"删除该元素"这个变更被记录到 snapshot 中
+**NEVER 在这里的作用：**
+1. **更新 snapshot**：将"删除该元素"这个变更记录到 snapshot 中
 2. **不入撤销栈**：用户无法撤销这个删除操作
 3. **防止后续捕获**：snapshot 已更新，后续 IMMEDIATELY 操作计算 delta 时不会再包含这个元素
 
@@ -631,7 +705,7 @@ if (
 
 ---
 
-## 7. PointerUp 丢失的清理补偿机制（深度解析版）
+## 7. PointerUp 丢失的清理补偿机制（最终深度解析版）
 
 ### 7.1 问题场景
 
@@ -677,9 +751,9 @@ requestAnimationFrame(() => {
 });
 ```
 
-### 7.5 对撤销捕获链路的影响（深度解析版）
+### 7.5 对撤销捕获链路的影响（最终深度解析版）
 
-**正常流程 vs 补偿流程对比：
+**⚠️ 关键修正：两层 flush 机制分别影响不同链路**
 
 ```
 【正常流程】
@@ -687,7 +761,10 @@ pointerDown → 拖拽 mutate（EVENTUALLY，snapshot 不更新）
     ↓
 pointerUp 事件到达
     ↓
-10606: onMove.flush() → 强制执行最后一次 throttle 中的 move 事件
+├─ 10606: onMove.flush() → 强制执行最后一次 throttleRAF 中的 move 事件
+│   （作用域：拖拽绘制逻辑 @60fps）
+├─ Collab.onPointerUpdate.flush() → 执行最后一次 lodash.throttle 中的广播
+│   （作用域：协作同步 @30fps，需显式调用）
     ↓
 10811: missingPointerEventCleanupEmitter.clear() → 取消补偿监听
     ↓
@@ -715,7 +792,9 @@ maybeCleanupAfterMissingPointerUp() →
 missingPointerEventCleanupEmitter.trigger(event|null) →
 调用 onPointerUp 闭包 →
     ↓
-10606: onMove.flush() → 强制执行最后一次 throttle 中的 move 事件
+├─ 10606: onMove.flush() → 强制执行最后一次 throttleRAF 中的 move 事件
+│   （⚠️ 补偿时确保拖拽最后状态被捕获）
+├─ （协作端 throttle 可能需要显式 flush()）
     ↓
 10811: missingPointerEventCleanupEmitter.clear() → 清除补偿监听
     ↓
@@ -730,19 +809,26 @@ Store.commit() →
   └─ finally: snapshot = nextSnapshot
 ```
 
-### 7.6 关键差异点 - 恢复边界分析
+### 7.6 关键差异点 - 恢复边界分析（最终版）
+
+**⚠️ 恢复边界 = 上一次 snapshot 更新点**
+
+snapshot 被更新的操作：
+1. **IMMEDIATELY** 操作（本地用户拖拽完成等）
+2. **NEVER** 操作（远程协作者修改、小元素删除等）
+3. **EVENTUALLY** 操作 **不**更新 snapshot
 
 **1. 事件对象差异**：
-- 正常：真实的 PointerUp 事件，`event.clientX/clientY 是抬起位置
+- 正常：真实的 PointerUp 事件，`event.clientX/clientY` 是抬起位置
 - 补偿：可能为 `null`，回退到原始 pointerDown 事件，坐标是按下位置
 
 **2. 时间延迟**：
 - 正常：即时触发，snapshot 是连续的
 - 补偿：可能延迟数秒甚至数分钟，中间可能插入其他操作
 
-**⚠️ 3. NEVER 操作对恢复边界的影响（关键！）**
+**⚠️ 3. NEVER 操作对恢复边界的影响（最终关键！）**
 
-如果 pointerup 丢失期间，如果发生了 **NEVER 操作**（如远程更新、小元素删除）：
+如果 pointerup 丢失期间发生了 **NEVER 操作**（如远程协作者修改、小元素删除）：
 
 ```
 pointerDown → 拖拽 mutate（EVENTUALLY）
@@ -752,30 +838,39 @@ pointerUp 丢失
 【插入：远程协作者修改元素 → updateScene(NEVER)
     → snapshot 被更新（因为 NEVER 更新 snapshot）
     ↓
-补偿触发 → onPointerUp → scheduleCapture(IMMEDIATELY)
+补偿触发 → onPointerUp → onMove.flush() → scheduleCapture(IMMEDIATELY)
     ↓
 Store.commit()
   ├─ delta = 当前状态 - 上一次 snapshot（已被 NEVER 更新过）
   └─ 结果：delta 只包含补偿触发时与上一次 snapshot 的差
 ```
 
-**恢复边界 = 上一次 snapshot 更新点**：
-- 如果中间有 NEVER 操作更新了 snapshot，恢复时的 delta 计算会**跳过**中间变更
-- 这意味着：pointerup 丢失期间的拖拽变更可能**部分丢失或与其他变更合并
-- **恢复边界是上一次 IMMEDIATELY 或 NEVER 操作的 snapshot 更新点
+**恢复边界总结表（最终版）：**
 
-**4. onMove.flush() 的作用**：
+| 场景 | 恢复边界 | delta 包含内容 | 协作端同步状态 |
+|------|---------|--------------|---------------|
+| 无中间操作 | pointerDown 时的 snapshot | 完整拖拽变更 | 最后 ~33ms 的移动可能因 throttle trailing 已广播 |
+| 中间有 IMMEDIATELY | 上一次 IMMEDIATELY 的 snapshot | 从该点之后的拖拽变更 | 取决于时间间隔 |
+| 中间有 NEVER | 上一次 NEVER 的 snapshot | 从该点之后的拖拽变更 | 取决于时间间隔 |
+| 中间有 EVENTUALLY | pointerDown 时的 snapshot | 完整拖拽变更 | 取决于时间间隔 |
+
+**4. onMove.flush() 的关键作用** (`App.tsx:10606-10607`)：
 ```typescript
-// App.tsx:10606-10607
 if (pointerDownState.eventListeners.onMove) {
   pointerDownState.eventListeners.onMove.flush();
 }
 ```
-- `onMove` 是 `withBatchedUpdatesThrottled` 返回的函数，有 `flush()` 方法
+- `onMove` 是 `withBatchedUpdatesThrottled` 返回的函数（`throttleRAF` 封装），有 `flush()` 方法
 - 补偿触发时强制执行最后一次 throttle 中的 move 事件，确保拖拽的最后状态被捕获
-- 如果没有 flush，最后几帧的拖拽变更可能丢失
+- 如果没有 flush，最后几帧的拖拽变更可能丢失（最多 16.6ms 的移动量）
 
-**5. emitter.clear() 的作用**：
+**⚠️ 5. 协作端 throttle 的 flush 问题**：
+- `Collab.onPointerUpdate` 是 `lodash.throttle`，也有 `.flush()` 方法
+- **但补偿流程中没有显式调用** `Collab.onPointerUpdate.flush()`
+- 这意味着：pointerup 丢失时，最后 ~33ms 的指针移动可能**不会**广播给协作端
+- 协作端看到的最后指针位置可能比实际位置落后最多 33ms
+
+**6. emitter.clear() 的作用**：
 - 触发后立即清空所有注册的补偿监听
 - 避免同一轮交互被多次补偿触发
 - 正常 pointerUp 时也会调用 `clear()` 取消补偿
@@ -801,26 +896,44 @@ private processAction(params) {
 **保证机制**：
 - Store 始终与上一次 snapshot 比较，而非与 pointerDown 时比较
 - 延迟触发时，中间的远程变更（NEVER）已更新了 snapshot
-- 最终 delta 只反映**当前状态与上一次 snapshot 的差
+- 最终 delta 只反映**当前状态与上一次 snapshot 的差**
 - **但这也意味着：如果中间有 NEVER 操作更新了 snapshot，恢复时的 delta 不会包含 NEVER 操作之前的拖拽变更**
 
-### 7.8 恢复边界总结
+### 7.8 恢复边界与协作端同步的关系（新增）
 
-| 场景 | 恢复边界 | delta 包含内容 |
-|------|---------|--------------|
-| 无中间操作 | pointerDown 时的 snapshot | 完整拖拽变更 |
-| 中间有 IMMEDIATELY 操作 | 上一次 IMMEDIATELY 的 snapshot | 从该点之后的拖拽变更 |
-| 中间有 NEVER 操作 | 上一次 NEVER 的 snapshot | 从该点之后的拖拽变更 |
-| 中间有 EVENTUALLY 操作 | pointerDown 时的 snapshot | 完整拖拽变更（EVENTUALLY 不更新 snapshot） |
+```
+pointerDown → 拖拽开始
+    ↓
+pointerMove (60-120Hz)
+    ├─ 拖拽绘制逻辑：throttleRAF @60fps → element mutate
+    └─ 协作同步：lodash.throttle @30fps → WebSocket 广播
+    ↓
+pointerUp 丢失
+    ↓
+（协作端可能已收到最后一次广播，但落后实际位置最多 33ms）
+    ↓
+补偿触发 → maybeCleanupAfterMissingPointerUp()
+    ├─ onMove.flush() → 执行最后一次拖拽绘制（最多 16.6ms 丢失）
+    └─ （无 Collab.onPointerUpdate.flush()）→ 协作端可能落后最多 33ms
+    ↓
+Store.commit() → delta = 当前状态 - 上一次 snapshot
+    ↓
+（撤销捕获基于元素状态，不依赖协作端同步状态）
+```
+
+**协作端恢复边界：**
+- 协作端看到的指针位置可能落后实际位置最多 33ms（CURSOR_SYNC_TIMEOUT）
+- 但元素最终状态是一致的（通过元素同步机制，不是指针同步）
+- 指针同步是**最佳努力**的，不影响元素状态的最终一致性
 
 ---
 
 ## 8. 协作端事件传递
 
-### 8.1 指针位置广播 (`App.tsx:12906-12930`)
+### 8.1 指针位置广播 (`App.tsx:12906-12930` + `Collab.tsx:914-925`)
 
 广播时机：
-- `pointerMove` - 每次移动（随 handleCanvasPointerMove，60-120Hz）
+- `pointerMove` - 每次移动（经两层节流：核心层无节流 → 协作层 @30fps）
 - `pointerDown` - 按下时
 - `pointerUp` - 抬起时
 
@@ -859,8 +972,9 @@ props.appState.collaborators.forEach((user, socketId) => {
 - 补偿事件路径：`missingPointerEventCleanupEmitter.once()`
 - 任一触发后立即清除另一路径，避免重复执行
 
-### 9.4 事件节流与批量更新
-- `withBatchedUpdatesThrottled` 确保拖拽绘制 60fps
+### 9.4 多层节流与批量更新
+- `throttleRAF` 确保拖拽绘制 60fps
+- `lodash.throttle` 确保协作同步 30fps
 - Store 层自动合并连续变更，减少撤销栈条目
 - `unstable_batchedUpdates` 合并 React 重渲染
 
@@ -872,7 +986,7 @@ props.appState.collaborators.forEach((user, socketId) => {
 
 ---
 
-## 10. 修正后的核心状态流转图
+## 10. 修正后的核心状态流转图（最终版）
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -898,21 +1012,25 @@ props.appState.collaborators.forEach((user, socketId) => {
                             │
                             ▼
 ┌─────────────────────────────────────────────────────────────┐
-│           两层 pointerMove 并行处理                            │
-│  ├─ handleCanvasPointerMove（无节流，60-120Hz）          │
-│  │   ├─ savePointer() → 协作同步                        │
-│  │   └─ 更新 gesture.pointers 坐标                      │
-│  │                                                         │
-│  └─ onPointerMoveFromPointerDownHandler（@60fps）          │
-│      ├─ 多指分支:                                       │
-│      │   ├─ size === 2 → 双指缩放平移                        │
-│      │   └─ size > 2  → 忽略                                │
-│      └─ 单指工具分支:                                   │
-│          ├─ Selection → dragSelectedElements()           │
-│          ├─ 绘图工具 → dragNewElement()                  │
-│          ├─ Linear → handlePointDragging()               │
-│          ├─ Hand → translateCanvas()                     │
-│          └─ Eraser → handleEraser()                      │
+│           三层 pointerMove 并行处理                           │
+│                                                             │
+│  第一层：handleCanvasPointerMove（无节流，60-120Hz）        │
+│    ├─ savePointer() → 协作同步入口                          │
+│    └─ 更新 gesture.pointers 坐标                            │
+│                                                             │
+│  第二层：onPointerMoveFromPointerDownHandler（@60fps）      │
+│    ├─ 多指分支:                                             │
+│    │   ├─ size === 2 → 双指缩放平移                         │
+│    │   └─ size > 2  → 忽略                                 │
+│    └─ 单指工具分支:                                         │
+│        ├─ Selection → dragSelectedElements()               │
+│        ├─ 绘图工具 → dragNewElement()                      │
+│        ├─ Linear → handlePointDragging()                   │
+│        ├─ Hand → translateCanvas()                         │
+│        └─ Eraser → handleEraser()                          │
+│                                                             │
+│  第三层：Collab.onPointerUpdate（@30fps，协作层）           │
+│    └─ 过滤: pointersMap.size < 2 ? 广播 : 丢弃              │
 └───────────────────────────┬─────────────────────────────────┘
                             │
           ┌─────────────────┴─────────────────┐
@@ -926,7 +1044,8 @@ props.appState.collaborators.forEach((user, socketId) => {
             ▼                                 ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                      onPointerUp()                          │
-│  - onMove.flush() 强制刷新节流中 move 事件                    │
+│  - onMove.flush() 强制刷新 throttleRAF 中 move 事件           │
+│  - （协作端 throttle 无显式 flush，可能落后最多 33ms）        │
 │  - emitter.clear() 取消补偿监听                              │
 │  - 移除 window 事件监听器                                    │
 │  - 线性元素分支:                                             │
@@ -960,7 +1079,7 @@ props.appState.collaborators.forEach((user, socketId) => {
 
 ---
 
-## 11. 代码位置索引
+## 11. 代码位置索引（最终版）
 
 | 功能 | 文件位置 | 行号 |
 |------|---------|------|
@@ -992,6 +1111,11 @@ props.appState.collaborators.forEach((user, socketId) => {
 | actionFinalize | `actions/actionFinalize.tsx` | 52 |
 | undo/redo action | `actions/actionHistory.tsx` | 31-39 |
 | savePointer | `components/App.tsx` | 12906 |
+| ⚠️ Collab.onPointerUpdate 节流 | `excalidraw-app/collab/Collab.tsx` | 914-925 |
+| ⚠️ CURSOR_SYNC_TIMEOUT 常量 | `excalidraw-app/app_constants.ts` | 8 |
+| ⚠️ 协作端多指过滤条件 | `excalidraw-app/collab/Collab.tsx` | 920 |
+| broadcastMouseLocation | `excalidraw-app/collab/Portal.tsx` | 202 |
+| onPointerUpdate 类型定义 | `types.ts` | 601-605 |
 | PointerDownState 类型 | `types.ts` | 853 |
 | gesture 工具函数 | `gesture.ts` | 1 |
 | throttleRAF 实现 | `common/src/utils.ts` | 155 |
