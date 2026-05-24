@@ -119,22 +119,36 @@ const data = await parseClipboard(dataTransferList, isPlainPaste);
 ```
 
 **📌 代码事实**：`parseDataTransferEvent` 同步提取剪贴板数据
-**源码摘录**（`clipboard.ts:466-490`）：
+
+**源码摘录**（`clipboard.ts:466-475`）：
 ```typescript
 export const parseDataTransferEvent = async (
   event: ClipboardEvent | DragEvent | React.DragEvent<HTMLDivElement>,
 ): Promise<ParsedDataTranferList> => {
-  // ... 遍历 DataTransferItemList
-  Array.from(items || []).map(async (item) => {
-    if (item.kind === "file") {
-      let file = item.getAsFile();
-      if (file) {
-        file = await normalizeFile(file);
-        return { type: file.type, kind: "file", file, ... };
-      }
+  let items: DataTransferItemList | undefined = undefined;
+
+  if (isClipboardEvent(event)) {
+    items = event.clipboardData?.items;
+  } else {
+    items = event.dataTransfer?.items;
+  }
+```
+
+**逻辑示意**（非真实代码，核心处理流程）：
+```typescript
+// 遍历 DataTransferItemList
+Array.from(items || []).map(async (item) => {
+  if (item.kind === "file") {
+    let file = item.getAsFile();
+    if (file) {
+      file = await normalizeFile(file);
+      return { type: file.type, kind: "file", file, fileHandle };
     }
-    // ... 处理 string 类型
-  })
+  } else if (item.kind === "string") {
+    // 处理 string 类型（text/plain, text/html 等）
+    return { type: item.type, kind: "string", value: await item.getAsString() };
+  }
+})
 ```
 
 #### onPaste 拦截点（📌 代码事实）
@@ -181,27 +195,39 @@ const parseClipboardEventTextData = async (
 ): Promise<ParsedClipboardEventTextData> => {
   try {
     const htmlItem = dataList.findByType(MIME_TYPES.html);
+
     const mixedContent =
       !isPlainPaste && htmlItem && maybeParseHTMLDataItem(htmlItem);
 
     if (mixedContent) {
       if (mixedContent.value.every((item) => item.type === "text")) {
-        // 全部都是 text 类型 → 降级为 text
         return {
           type: "text",
-          value: dataList.getData(MIME_TYPES.text) ??
-                 mixedContent.value.map(i => i.value).join("\n").trim(),
+          value:
+            dataList.getData(MIME_TYPES.text) ??
+            mixedContent.value
+              .map((item) => item.value)
+              .join("\n")
+              .trim(),
         };
       }
-      return mixedContent;  // 包含 imageUrl → 返回 mixedContent
+
+      return mixedContent;
     }
 
-    return { type: "text", value: (dataList.getData(MIME_TYPES.text) || "").trim() };
+    return {
+      type: "text",
+      value: (dataList.getData(MIME_TYPES.text) || "").trim(),
+    };
   } catch {
     return { type: "text", value: "" };
   }
 };
 ```
+
+**📌 代码事实**：
+- 全部都是 text 类型 → 降级为 text 类型
+- 包含 imageUrl → 返回 mixedContent 类型
 
 **逻辑示意**（非真实代码）：
 ```
@@ -221,8 +247,9 @@ const parseClipboardEventTextData = async (
 **源码摘录**（`clipboard.ts:531-553`）：
 ```typescript
 if (parsedEventData.type === "mixedContent") {
-  return { mixedContent: parsedEventData.value };
-  // ⚠️ 只返回 mixedContent，不返回 text！
+  return {
+    mixedContent: parsedEventData.value,
+  };
 }
 
 try {
@@ -233,7 +260,9 @@ try {
     return {
       elements: systemClipboardData.elements,
       files: systemClipboardData.files,
-      text: isPlainPaste ? JSON.stringify(...) : undefined,
+      text: isPlainPaste
+        ? JSON.stringify(systemClipboardData.elements, null, 2)
+        : undefined,
       programmaticAPI,
     };
   }
@@ -241,6 +270,8 @@ try {
 
 return { text: parsedEventData.value };
 ```
+
+**📌 代码事实**：返回 mixedContent 时不返回 text，`text` 字段为 `undefined`
 
 #### 2.3 Excalidraw 内部格式识别（📌 代码事实）
 
@@ -339,7 +370,11 @@ if (!isPlainPaste && data.text) {
   const result = tryParseSpreadsheet(data.text);
   if (result.ok) {
     this.setState({
-      openDialog: { name: "charts", data: result.data },
+      openDialog: {
+        name: "charts",
+        data: result.data,
+        rawText: data.text,
+      },
     });
     return;
   }
@@ -355,17 +390,24 @@ if (!isPlainPaste && data.text) {
 
 **源码摘录**（`App.tsx:3743-3762`）：
 ```typescript
+// ------------------- Images or SVG code -------------------
 const imageFiles = dataTransferFiles.map((data) => data.file);
 
 if (imageFiles.length === 0 && data.text && !isPlainPaste) {
   const trimmedText = data.text.trim();
   if (trimmedText.startsWith("<svg") && trimmedText.endsWith("</svg>")) {
+    // ignore SVG validation/normalization which will be done during image
+    // initialization
     imageFiles.push(SVGStringToFile(trimmedText));
   }
 }
 
 if (imageFiles.length > 0) {
-  await this.insertImages(imageFiles, sceneX, sceneY);
+  if (this.isToolSupported("image")) {
+    await this.insertImages(imageFiles, sceneX, sceneY);
+  } else {
+    this.setState({ errorMessage: t("errors.imageToolNotSupported") });
+  }
   return;
 }
 ```
@@ -376,15 +418,23 @@ if (imageFiles.length > 0) {
 
 **源码摘录**（`App.tsx:3764-3783`）：
 ```typescript
+// ------------------- Elements -------------------
 if (data.elements) {
-  const elements = data.programmaticAPI
-    ? convertToExcalidrawElements(data.elements)
-    : data.elements;
-
+  const elements = (
+    data.programmaticAPI
+      ? convertToExcalidrawElements(
+          data.elements as ExcalidrawElementSkeleton[],
+        )
+      : data.elements
+  ) as readonly ExcalidrawElement[];
+  // TODO: remove formatting from elements if isPlainPaste
   this.addElementsFromPasteOrLibrary({
     elements,
     files: data.files || null,
-    position: this.editorInterface.formFactor === "desktop" ? "cursor" : "center",
+    position:
+      this.editorInterface.formFactor === "desktop" ? "cursor" : "center",
+    retainSeed: isPlainPaste,
+    preserveFrameChildrenOrder: true,
   });
   return;
 }
@@ -468,11 +518,41 @@ const nonEmptyLines = normalizeEOL(data.text)
   .filter(Boolean);
 const embbeddableUrls = nonEmptyLines
   .map((str) => maybeParseEmbedSrc(str))
-  .filter((string) => typeof string === "string" && isValidURL(string));
+  .filter(
+    (string) =>
+      embeddableURLValidator(string, this.props.validateEmbeddable) &&
+      (/^(http|https):\/\/[^\s/$.?#].[^\s]*$/.test(string) ||
+        getEmbedLink(string)?.type === "video"),
+  );
 
-if (!isPlainPaste && embbeddableUrls.length === nonEmptyLines.length && nonEmptyLines.length > 0) {
-  // ... 创建 embeddable 元素
-  this.addElementsFromPasteOrLibrary({ elements, files: null, position: "cursor" });
+if (
+  !isPlainPaste &&
+  embbeddableUrls.length > 0 &&
+  embbeddableUrls.length === nonEmptyLines.length
+) {
+  const embeddables: NonDeleted<ExcalidrawEmbeddableElement>[] = [];
+  for (const url of embbeddableUrls) {
+    const prevEmbeddable: ExcalidrawEmbeddableElement | undefined =
+      embeddables[embeddables.length - 1];
+    const embeddable = this.insertEmbeddableElement({
+      sceneX: prevEmbeddable
+        ? prevEmbeddable.x + prevEmbeddable.width + 20
+        : sceneX,
+      sceneY,
+      link: normalizeLink(url),
+    });
+    if (embeddable) {
+      embeddables.push(embeddable);
+    }
+  }
+  if (embeddables.length) {
+    this.store.scheduleCapture();
+    this.setState({
+      selectedElementIds: Object.fromEntries(
+        embeddables.map((embeddable) => [embeddable.id, true]),
+      ),
+    });
+  }
   return;
 }
 ```
@@ -504,7 +584,6 @@ if (
   mixedContent.some((node) => node.type === "imageUrl") &&
   this.isToolSupported("image")
 ) {
-  // ── 分支 A：有 imageUrl 且图片工具可用 ──
   const imageURLs = mixedContent
     .filter((node) => node.type === "imageUrl")
     .map((node) => node.value);
@@ -513,7 +592,13 @@ if (
       try {
         return { file: await ImageURLToFile(url) };
       } catch (error: any) {
-        return { errorMessage: error.message };
+        let errorMessage = error.message;
+        if (error.cause === "FETCH_ERROR") {
+          errorMessage = t("errors.failedToFetchImage");
+        } else if (error.cause === "UNSUPPORTED") {
+          errorMessage = t("errors.unsupportedFileType");
+        }
+        return { errorMessage };
       }
     }),
   );
@@ -522,9 +607,11 @@ if (
     .filter((response): response is { file: File } => !!response.file)
     .map((response) => response.file);
   await this.insertImages(imageFiles, sceneX, sceneY);
-  // ⚠️ 文本节点被完全丢弃！
+  const error = responses.find((response) => !!response.errorMessage);
+  if (error && error.errorMessage) {
+    this.setState({ errorMessage: error.errorMessage });
+  }
 } else {
-  // ── 分支 B：没有 imageUrl，或图片工具不可用 ──
   const textNodes = mixedContent.filter((node) => node.type === "text");
   if (textNodes.length) {
     this.addTextFromPaste(
@@ -532,9 +619,12 @@ if (
       isPlainPaste,
     );
   }
-  // 如果没有 text 节点 → 什么都不插入
 }
 ```
+
+**📌 代码事实**：
+- **分支 A**（有 imageUrl 且图片工具可用）：只下载插入图片，**文本节点被完全丢弃**
+- **分支 B**（其他情况）：只提取 text 节点，**imageUrl 被丢弃**
 
 **📌 代码事实**：进入分支 B 的三种情况：
 1. `isPlainPaste = true`（纯文本粘贴）
@@ -571,9 +661,10 @@ private addTextFromPaste(text: string, isPlainPaste = false) {
 ```typescript
 const elements = restoreElements(opts.elements, null, {
   deleteInvisibleElements: true,
-  // ⚠️ 注意：没有传 repairBindings 参数！
 });
 ```
+
+**📌 代码事实**：调用时没有传 `repairBindings` 参数，使用默认值 `undefined`
 
 **📌 代码事实**：`restoreElements` 函数签名（`restore.ts:764-774`）：
 ```typescript
@@ -593,13 +684,14 @@ export const restoreElements = <T extends ExcalidrawElement>(
 **📌 代码事实**：绑定修复分支（`restore.ts:830-835`）：
 ```typescript
 if (!opts?.repairBindings) {
-  // ⚠️ 粘贴时 repairBindings 是 undefined，直接返回！
   return restoredElements as CombineBrandsIfNeeded<
     T,
     OrderedExcalidrawElement
   >;
 }
 ```
+
+**📌 代码事实**：粘贴时 `repairBindings` 是 `undefined`，条件成立，直接返回，跳过后续绑定关系修复逻辑
 
 **📌 代码事实**：粘贴时实际执行的流程：
 
@@ -638,29 +730,34 @@ if (!opts?.repairBindings) {
 ```typescript
 const [minX, minY, maxX, maxY] = getCommonBounds(elements);
 
-// distance(x, y) = Math.abs(x - y)  [utils.ts:370]
-const elementsCenterX = distance(minX, maxX) / 2;  // = (maxX - minX) / 2 = 半宽
-const elementsCenterY = distance(minY, maxY) / 2;  // = 半高
+const elementsCenterX = distance(minX, maxX) / 2;
+const elementsCenterY = distance(minY, maxY) / 2;
 
-// 目标位置
 const clientX =
   typeof opts.position === "object"
     ? opts.position.clientX
     : opts.position === "cursor"
     ? this.lastViewportPosition.x
     : this.state.width / 2 + this.state.offsetLeft;
+const clientY =
+  typeof opts.position === "object"
+    ? opts.position.clientY
+    : opts.position === "cursor"
+    ? this.lastViewportPosition.y
+    : this.state.height / 2 + this.state.offsetTop;
 
-const { x, y } = viewportCoordsToSceneCoords({ clientX, clientY }, this.state);
+const { x, y } = viewportCoordsToSceneCoords(
+  { clientX, clientY },
+  this.state,
+);
 
-// 计算偏移
 const dx = x - elementsCenterX;
 const dy = y - elementsCenterY;
 
-// 对齐到网格：Math.round(val / gridSize) * gridSize  [points.ts:68-79]
 const [gridX, gridY] = getGridPoint(dx, dy, this.getEffectiveGridSize());
 
-// 最终坐标
 const { duplicatedElements } = duplicateElements({
+  type: "everything",
   elements: elements.map((element) => {
     return newElementWith(element, {
       x: element.x + gridX - minX,
@@ -668,8 +765,21 @@ const { duplicatedElements } = duplicateElements({
     });
   }),
   randomizeSeed: !opts.retainSeed,
+  preserveFrameChildrenOrder: opts.preserveFrameChildrenOrder,
 });
 ```
+
+**📌 代码事实**：
+- `distance(x, y) = Math.abs(x - y)`（`utils.ts:370`）
+- `elementsCenterX = (maxX - minX) / 2` = 半宽
+- `getGridPoint(x, y, gridSize)` = `Math.round(val / gridSize) * gridSize`（`points.ts:68-79`）
+
+**💡 行为推导**：
+虽然 `elementsCenterX` 计算的是半宽，但结合：
+- `dx = x - 半宽`
+- `新坐标 = element.x + dx - minX`
+
+最终效果等价于将元素**中心点**对齐到目标点 `(x, y)`。
 
 **📌 代码事实**：`distance` 函数定义（`utils.ts:370`）：
 ```typescript
@@ -909,14 +1019,17 @@ catch (err: any) {
 - `boundElementIds` → `boundElements`：`restore.ts:247-259`
 - `font` 字符串 → `fontSize` + `fontFamily`：`restore.ts:441-446`
 
-### 5. 绑定修复的选择性执行（📌 代码事实）
-粘贴时跳过复杂绑定修复（`restore.ts:830-835`），权衡了性能与数据完整性：
-- 只做单元素级别的属性修复
-- 不做跨元素的绑定关系校验
+### 5. 绑定修复的选择性执行
+**📌 代码事实**：粘贴时跳过复杂绑定修复（`restore.ts:830-835`）
+**💡 行为推导**：这是权衡了性能与数据完整性的设计决策：
+- 只做单元素级别的属性修复（有直接代码）
+- 不做跨元素的绑定关系校验（有直接代码）
 
 ---
 
-## 附录：事实 vs 推导汇总
+---
+
+## 附录 A：事实 vs 推导汇总
 
 | 结论 | 类型 | 源码证据 |
 |------|------|----------|
@@ -933,3 +1046,41 @@ catch (err: any) {
 | 最终效果等价于中心点对齐 | 💡 行为推导 | 基于坐标转换公式推断 |
 | 按结构化程度从高到低匹配 | 💡 行为推导 | 基于分支顺序推断 |
 | 粘贴带绑定元素可能不一致 | 💡 行为推导 | 基于跳过绑定修复推断 |
+
+---
+
+## 附录 B：终局核查修正记录
+
+本次终局核查共修正 **12 处** 源码摘录与实际代码不一致的问题，以及 **1 处** 标签混用问题：
+
+### B.1 源码摘录字段不完整修正
+
+| # | 位置 | 修正前 | 修正后 | 代码行号 |
+|---|------|--------|--------|----------|
+| 1 | parseDataTransferEvent | 用 `// ...` 省略核心逻辑，未区分源码与示意 | 拆分：函数签名为源码摘录，处理流程为逻辑示意 | `clipboard.ts:466-475` |
+| 2 | parseClipboardEventTextData | 添加了代码中不存在的内联注释（`// 全部都是 text 类型 → 降级为 text`） | 移除内联注释，将分析移到代码块外 | `clipboard.ts:330-363` |
+| 3 | parseClipboard 返回逻辑 | `JSON.stringify(...)` 省略参数，添加了不存在的注释 | 补充完整参数 `JSON.stringify(systemClipboardData.elements, null, 2)`，移除内联注释 | `clipboard.ts:531-553` |
+| 4 | 表格分支 openDialog | 缺少 `rawText: data.text` | 补充完整字段 | `App.tsx:3732-3737` |
+| 5 | 图片分支 isToolSupported | 缺少 `isToolSupported("image")` 判断和 else 分支 | 补充完整工具支持检查逻辑 | `App.tsx:3755-3761` |
+| 6 | 元素分支类型转换 | 简化的三元表达式，缺少类型断言和参数 | 补充 `as ExcalidrawElementSkeleton[]`、`retainSeed: isPlainPaste`、`preserveFrameChildrenOrder: true` | `App.tsx:3766-3780` |
+| 7 | URL 分支验证逻辑 | 简化为 `isValidURL` | 补充完整验证逻辑：`embeddableURLValidator` + 正则 + `getEmbedLink` | `App.tsx:3823-3827` |
+| 8 | URL 分支元素创建 | 简化为 `addElementsFromPasteOrLibrary` | 补充完整的横向排列逻辑和选中状态设置 | `App.tsx:3835-3856` |
+| 9 | 混合内容处理 | 添加了代码中不存在的分支标记注释（`// ── 分支 A：...`） | 移除内联注释，将分支分析移到代码块外 | `App.tsx:4080-4121` |
+| 10 | restoreElements 调用参数 | 添加了不存在的注释（`// ⚠️ 注意：没有传 repairBindings 参数！`） | 移除内联注释，将分析移到代码块外 | `App.tsx:3926-3928` |
+| 11 | restoreElements 绑定修复分支 | 添加了不存在的注释（`// ⚠️ 粘贴时 repairBindings 是 undefined，直接返回！`） | 移除内联注释，将分析移到代码块外 | `restore.ts:830-835` |
+| 12 | 坐标转换 duplicateElements | 添加了不存在的分析注释，缺少 `clientY` 完整逻辑、`type: "everything"` 和 `preserveFrameChildrenOrder` 参数 | 移除内联注释，补充完整代码，将分析移到代码块外 | `App.tsx:3929-3963` |
+
+### B.2 标签混用修正
+
+| # | 位置 | 修正前 | 修正后 |
+|---|------|--------|--------|
+| 1 | 关键设计决策 #5 | 「绑定修复的选择性执行（📌 代码事实）」整体标记为事实 | 拆分：<br>📌 代码事实：粘贴时跳过复杂绑定修复<br>💡 行为推导：这是权衡了性能与数据完整性的设计决策 |
+
+### B.3 其他格式修正
+
+- 统一所有源码摘录的格式：`**源码摘录**（文件:行号范围）：`
+- 统一所有逻辑示意的格式：`**逻辑示意**（非真实代码）：`
+- 严格区分源码摘录与逻辑示意：源码摘录中不添加任何分析注释
+- 确保所有源码摘录中的注释与实际代码完全一致
+- 修正所有流程注释与代码中的实际注释一致（如 `// ------------------- Error -------------------`）
+- 所有分析说明必须放在代码块外部，使用明确的 📌/💡 标签标记
