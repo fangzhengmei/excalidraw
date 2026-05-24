@@ -423,29 +423,39 @@ export const restoreAppState = (
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│  优先级从高到低                                          │
+│  通用字段优先级从高到低（theme 字段除外，见第八节）       │
 ├──────────────────────────────────────────────────────────┤
 │                                                          │
 │  1. imported appState (文件/链接/协作数据)               │
 │     └─ 例外：cursorButton 强制从 localStorage 读取        │
 │                                                          │
 │  2. localAppState (localStorage 中的用户偏好)             │
-│     └─ 例如：theme、activeTool、画笔颜色、字体等           │
+│     └─ 例如：activeTool、画笔颜色、字体、gridSize 等      │
 │                                                          │
 │  3. getDefaultAppState() (代码内定默认值)                 │
 │                                                          │
 └──────────────────────────────────────────────────────────┘
+
+⚠️  注意：theme 字段有特殊的双重存储机制，优先级完全不同。
+        详见第八节"主题偏好的双重存储与冲突"。
 ```
 
 ---
 
-## 八、本地偏好的特殊处理
+## 八、本地偏好的特殊处理 - 主题偏好的双重存储与冲突
 
-### 8.1 主题偏好 - 独立存储
+### 8.1 两套主题存储机制
+
+主题是**唯一同时存储在两个 localStorage key** 中的字段，这是混乱的根源：
+
+| 存储位置 | 存储内容 | 数据类型 | 管理方 |
+|---------|---------|---------|-------|
+| `localStorage["excalidraw-theme"]` | 独立 key | `"light" \| "dark" \| "system"` | `useHandleAppTheme()` hook |
+| `localStorage["excalidraw-state"].theme` | AppState 字段 | `"light" \| "dark"` | AppState 持久化链路 |
+
+#### 存储 A：独立 key（excalidraw-theme）
 
 **位置**：`excalidraw-app/useHandleAppTheme.ts`
-
-主题采用**独立存储 + 系统偏好检测**的策略，不经过 AppState 持久化链路：
 
 ```typescript
 const useHandleAppTheme = () => {
@@ -478,7 +488,264 @@ const useHandleAppTheme = () => {
 
 **存储 key**：`STORAGE_KEYS.LOCAL_STORAGE_THEME = "excalidraw-theme"`
 
-### 8.2 协作场景的主题覆盖
+**特点**：
+- 支持 `"system"` 模式（跟随系统主题）
+- 在 HTML 加载阶段就被内联脚本读取，避免主题闪烁
+- `editorTheme` 作为 `props.theme` 传递给 `<Excalidraw>` 组件
+
+#### 存储 B：AppState 字段（excalidraw-state.theme）
+
+**位置**：`packages/excalidraw/appState.ts:151`
+
+```typescript
+theme: { browser: true, export: false, server: false },
+```
+
+`theme` 标记为 `browser: true`，所以会通过 `clearAppStateForLocalStorage()` 过滤后持久化到 `excalidraw-state`。
+
+**写入时机**：`onChange` 回调 → `LocalData.save()` → `saveDataStateToLocalStorage()`
+
+---
+
+### 8.2 主题优先级核心规则
+
+`props.theme`（来自独立 key）在 **Excalidraw 组件内部**有三处会覆盖 AppState 中的 theme：
+
+#### 规则 1：初始化时覆盖
+**位置**：`packages/excalidraw/components/App.tsx:2916-2918, 2964-2966`
+
+```typescript
+// 初始化一开始就设置
+if (this.props.theme) {
+  this.setState({ theme: this.props.theme });
+}
+
+// restoreAppState 之后再次强制覆盖
+restoredAppState = {
+  ...restoredAppState,
+  theme: this.props.theme || restoredAppState.theme,  // ← 关键：props.theme 优先
+};
+```
+
+#### 规则 2：每次状态更新时覆盖
+**位置**：`packages/excalidraw/components/App.tsx:2797-2798`
+
+```typescript
+const theme =
+  actionResult?.appState?.theme || this.props.theme || THEME.LIGHT;
+```
+
+每次调用 `syncActionResult()` 时，theme 的取值顺序：
+1. `actionResult.appState.theme`（来自 action，如快捷键切换）
+2. `this.props.theme`（来自独立 key）
+3. `THEME.LIGHT`（兜底）
+
+#### 规则 3：props 变化时直接覆盖
+**位置**：`packages/excalidraw/components/App.tsx:3519-3521`
+
+```typescript
+if (prevProps.theme !== this.props.theme && this.props.theme) {
+  this.setState({ theme: this.props.theme });
+}
+```
+
+---
+
+### 8.3 各场景下的主题取值与冲突处理
+
+#### 场景 1：冷启动（新用户）
+**存储状态**：两个 key 都不存在
+
+1. HTML 内联脚本读取 `excalidraw-theme` → 不存在，返回 `"light"`
+2. `useHandleAppTheme()` 初始化 → `editorTheme = "light"`
+3. `importFromLocalStorage()` → `appState` 为 `null`
+4. `restoreAppState(null, null)` → `theme = THEME.LIGHT`
+5. `initialize()` 中：`restoredAppState.theme = "light" || "light" = "light"`
+6. **最终取值**：`"light"`
+7. **冲突**：无
+
+#### 场景 2：热启动（老用户，两个存储一致）
+**存储状态**：
+- `excalidraw-theme = "dark"`
+- `excalidraw-state.theme = "dark"`
+
+1. HTML 内联脚本 → `"dark"`，设置 `html.dark`
+2. `useHandleAppTheme()` → `editorTheme = "dark"`
+3. `importFromLocalStorage()` → `appState.theme = "dark"`
+4. `restoreAppState(localDataState.appState, null)` → `theme = "dark"`
+5. `initialize()` 中：`restoredAppState.theme = "dark" || "dark" = "dark"`
+6. **最终取值**：`"dark"`
+7. **冲突**：无，两个存储一致
+
+#### 场景 3：热启动（两个存储冲突）
+**存储状态**：
+- `excalidraw-theme = "dark"`（独立 key）
+- `excalidraw-state.theme = "light"`（AppState 字段）
+
+1. HTML 内联脚本 → `"dark"`
+2. `useHandleAppTheme()` → `editorTheme = "dark"`
+3. `importFromLocalStorage()` → `appState.theme = "light"`
+4. `restoreAppState(localDataState.appState, null)` → `theme = "light"`
+5. `initialize()` 中：
+   ```typescript
+   restoredAppState.theme = this.props.theme || restoredAppState.theme
+   // "dark" || "light" = "dark"
+   ```
+6. **最终取值**：**`"dark"`**
+7. **冲突解决**：`props.theme`（独立 key）优先级更高，覆盖了 restoredAppState.theme
+
+#### 场景 4：打开分享链接（链接指定 theme = "dark"，本地独立 key = "light"）
+**存储状态**：
+- `excalidraw-theme = "light"`（独立 key）
+- 链接导入的 `imported.appState.theme = "dark"`
+
+1. `useHandleAppTheme()` → `editorTheme = "light"`
+2. `restoreAppState(imported.appState, localDataState.appState)`：
+   - 三级合并：`suppliedValue = "dark"`（导入）> `localValue`（本地 AppState）> `default`
+   - 结果：`restoredAppState.theme = "dark"`
+3. **但**，`initialize()` 中：
+   ```typescript
+   restoredAppState.theme = this.props.theme || restoredAppState.theme
+   // "light" || "dark" = "light"
+   ```
+4. **最终取值**：**`"light"`**
+5. **关键点**：即使导入数据指定了 theme，`props.theme`（独立 key）仍然会覆盖它！
+6. **结论**：导入的 `appState.theme` 对 excalidraw-app 来说**完全不生效**，因为 `props.theme` 总是有值。
+
+#### 场景 5：协作场景
+**位置**：`excalidraw-app/App.tsx:339-347`
+
+```typescript
+appState: {
+  ...restoreAppState(
+    {
+      ...scene?.appState,
+      theme: localDataState?.appState?.theme || scene?.appState?.theme,
+    },
+    excalidrawAPI.getAppState(),
+  ),
+  isLoading: false,
+},
+```
+
+这里的逻辑：
+1. 先用 `localDataState?.appState?.theme`（AppState 存储）覆盖服务器返回的 theme
+2. 调用 `restoreAppState` 恢复
+3. **但最终**，还是会被 `props.theme`（独立 key）覆盖！
+
+**最终结果**：协作场景下，主题始终使用本地独立 key 的值，不随其他用户的主题变化。
+
+#### 场景 6：用户通过菜单切换主题（推荐路径）
+1. 用户点击菜单选择 "dark" → `setAppTheme("dark")`
+2. `setAppTheme()` 写入 `localStorage["excalidraw-theme"] = "dark"`
+3. `editorTheme` 更新为 `"dark"`，作为 `props.theme` 传入 `<Excalidraw>`
+4. `componentDidUpdate` 检测到变化 → `setState({ theme: "dark" })`
+5. `onChange` 回调触发 → `LocalData.save()`
+6. 写入 `localStorage["excalidraw-state"].theme = "dark"`
+7. **最终状态**：两个存储都更新为 `"dark"`，保持一致
+8. **无冲突**：推荐的切换方式
+
+#### 场景 7：用户通过快捷键切换主题（Alt+Shift+D）- 潜在 Bug
+1. 快捷键触发 `actionToggleTheme.perform()`
+2. 返回 `{ appState: { theme: "dark" } }`
+3. `syncActionResult` 处理：
+   ```typescript
+   const theme = actionResult?.appState?.theme || this.props.theme || THEME.LIGHT
+   // "dark" || "light" = "dark"  ← 这次生效了
+   ```
+4. `setState({ theme: "dark" })`
+5. `onChange` 回调 → 写入 `localStorage["excalidraw-state"].theme = "dark"`
+6. **但**：`localStorage["excalidraw-theme"]` **没有更新！**
+7. **当前状态**：AppState 是 "dark"，独立 key 还是 "light"
+8. **刷新后**：`props.theme` 是 "light"，会覆盖 AppState 的 "dark"，主题又变回 "light"！
+9. **这是一个 Bug**：快捷键切换主题不会更新独立 key，刷新后恢复。
+
+#### 场景 8：用户选择 "system" 主题
+1. 用户选择 "system" → `setAppTheme("system")`
+2. 写入 `localStorage["excalidraw-theme"] = "system"`
+3. 假设系统是 dark 模式，`editorTheme = "dark"`，作为 `props.theme` 传入
+4. `componentDidUpdate` → `setState({ theme: "dark" })`
+5. `onChange` 回调 → 写入 `localStorage["excalidraw-state"].theme = "dark"`
+6. **存储状态**：
+   - `excalidraw-theme = "system"`
+   - `excalidraw-state.theme = "dark"`
+7. **下次刷新时**：
+   - 独立 key 是 "system"，解析为实际主题（如 "dark"）
+   - AppState 是 "dark"
+   - 两者一致，无冲突
+8. **系统主题变化时**：如果系统从 dark 变 light，刷新后：
+   - `editorTheme = "light"`（重新解析 "system"）
+   - `props.theme = "light"` 覆盖 AppState 的 "dark"
+   - 主题变为 light
+
+---
+
+### 8.4 主题优先级总览
+
+```
+┌───────────────────────────────────────────────────────────────────────┐
+│  主题优先级从高到低                                                   │
+├───────────────────────────────────────────────────────────────────────┤
+│                                                                       │
+│  1. props.theme（来自 excalidraw-theme 独立 key）                     │
+│     ├─ 初始化时：this.props.theme || restoredAppState.theme           │
+│     ├─ 每次更新时：actionResult.theme || this.props.theme || LIGHT    │
+│     └─ props 变化时：直接 setState({ theme: this.props.theme })       │
+│                                                                       │
+│  2. actionResult.appState.theme（来自 actionToggleTheme 等）          │
+│     └─ 仅在没有 props.theme 时生效（excalidraw-app 中不生效）          │
+│                                                                       │
+│  3. imported.appState.theme（文件/链接/协作导入）                     │
+│     └─ 在 restoreAppState 中生效，但随后被 props.theme 覆盖            │
+│                                                                       │
+│  4. localAppState.theme（来自 excalidraw-state）                      │
+│     └─ 在 restoreAppState 中作为偏好源，但随后被 props.theme 覆盖      │
+│                                                                       │
+│  5. getDefaultAppState().theme（代码默认值）                          │
+│                                                                       │
+└───────────────────────────────────────────────────────────────────────┘
+
+┌───────────────────────────────────────────────────────────────────────┐
+│  主题切换的两条路径                                                   │
+├───────────────────────────────────────────────────────────────────────┤
+│  路径 A（推荐，用于 excalidraw-app）：                                │
+│    用户菜单 → setAppTheme() → 更新 excalidraw-theme →                 │
+│    props.theme 变化 → Excalidraw setState → onChange →                │
+│    更新 excalidraw-state.theme  → 两个存储一致                        │
+│                                                                       │
+│  路径 B（仅库内部，excalidraw-app 有副作用）：                         │
+│    快捷键 → actionToggleTheme → 更新 AppState →                       │
+│    onChange → 更新 excalidraw-state.theme →                           │
+│    excalidraw-theme 未更新 → 刷新后恢复                               │
+│                                                                       │
+└───────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 8.5 为什么主题要设计成双重存储？
+
+1. **避免主题闪烁**：HTML 加载阶段就需要读取主题，此时 React 还未初始化，必须用独立 key 的内联脚本读取
+2. **支持 system 模式**：AppState.theme 只支持 `"light"/"dark"`，不支持 `"system"` 模式
+3. **应用级 vs 画布级**：主题是应用级偏好，不是画布级状态，不应该随画布导入导出而变化
+4. **协作隔离**：协作时本地主题不应被其他用户覆盖
+5. **库的灵活性**：Excalidraw 作为库，可以通过 `props.theme` 让宿主应用完全控制主题
+
+---
+
+### 8.6 设计缺陷与潜在问题
+
+1. **快捷键切换主题的 Bug**：Alt+Shift+D 不会更新独立 key，刷新后恢复。修复需要在 `actionToggleTheme` 中触发外部回调，或者 excalidraw-app 监听 AppState.theme 变化同步更新独立 key。
+
+2. **数据冗余**：同一个信息存储在两个地方，增加了不一致的风险。
+
+3. **导入数据的 theme 无效**：对于 excalidraw-app，导入的 `.excalidraw` 文件中即使包含 `appState.theme`，也会被 `props.theme` 覆盖，用户感知不到。
+
+4. **restoreAppState 中的 theme 处理名存实亡**：虽然 `restoreAppState` 会按照三级合并逻辑处理 theme，但对于 excalidraw-app 来说，结果总是会被 `props.theme` 覆盖。
+
+---
+
+### 8.7 协作场景的主题覆盖（补充）
 
 **位置**：`excalidraw-app/App.tsx:339-347`
 
@@ -487,7 +754,7 @@ appState: {
   ...restoreAppState(
     {
       ...scene?.appState,
-      // 协作时：本地主题优先于服务器传回的主题
+      // 先用本地 AppState 的 theme 覆盖服务器数据
       theme: localDataState?.appState?.theme || scene?.appState?.theme,
     },
     excalidrawAPI.getAppState(),
@@ -495,6 +762,11 @@ appState: {
   isLoading: false,
 },
 ```
+
+这层保护是为了防止协作时服务器返回的主题覆盖本地，但实际上：
+1. 这里已经用本地 AppState.theme 覆盖了服务器 theme
+2. 最后还会被 `props.theme`（独立 key）再覆盖一次
+3. 所以即使删除这段代码，最终结果也一样（只是多了一层防御）
 
 ---
 
@@ -654,12 +926,78 @@ localStorage.getItem("excalidraw-state")
   restoreAppState(importedData.appState, localAppState)
        ├─ 三级合并：
        │    importedData  → 用于画布数据（元素、gridSize等）
-       │    localAppState → 用于用户偏好（theme、画笔颜色等）
+       │    localAppState → 用于用户偏好（画笔颜色、字体等）
        │    defaults      → 兜底
-       └─ 特殊：theme 强制用 local
+       └─ ⚠️  theme 字段在 restoreAppState 中按正常逻辑合并
+       │
+       ▼
+  Excalidraw.initialize() 中强制覆盖
+       │
+       ▼
+  restoredAppState.theme = props.theme || restoredAppState.theme
+       │
+       ▼
+  ⚠️  importedData.appState.theme 被 props.theme（独立 key）完全覆盖！
        │
        ▼
   用户操作写入 localStorage（协作场景除外）
+```
+
+### 11.4 主题切换（菜单路径 - 推荐）
+
+```
+用户点击菜单选择主题 → setAppTheme(theme)
+       │
+       ▼
+  写入 localStorage["excalidraw-theme"] = theme
+       │
+       ▼
+  editorTheme 更新 → 作为 props.theme 传入
+       │
+       ▼
+  componentDidUpdate 检测到 props.theme 变化
+       │
+       ▼
+  setState({ theme: props.theme })
+       │
+       ▼
+  onChange 回调触发 → LocalData.save()
+       │
+       ▼
+  写入 localStorage["excalidraw-state"].theme = theme
+       │
+       ▼
+  ✅  两个存储保持一致
+```
+
+### 11.5 主题切换（快捷键路径 - 有 Bug）
+
+```
+用户按 Alt+Shift+D → actionToggleTheme.perform()
+       │
+       ▼
+  返回 { appState: { theme: newTheme } }
+       │
+       ▼
+  syncActionResult() 处理
+       │
+       ▼
+  const theme = actionResult.theme || props.theme || LIGHT
+       │
+       ▼
+  setState({ theme: newTheme })  ←  这次生效了
+       │
+       ▼
+  onChange 回调 → 写入 excalidraw-state.theme = newTheme
+       │
+       ▼
+  ⚠️  localStorage["excalidraw-theme"] 未更新！
+       │
+       ▼
+  刷新页面 → props.theme 读取独立 key 的旧值
+       │
+       ▼
+  ❌  主题恢复到切换前的状态
 ```
 
 ---
@@ -689,13 +1027,44 @@ restoreAppState(
 
 当 `localAppState = null` 时，实际上只使用 `appState` + `defaults` 两层合并。
 
-### 12.4 为什么主题要独立存储？
+### 12.4 主题的双重存储与优先级（最容易混淆的点）
+
+这是之前分析最容易出错的地方：
+
+| 误区 | 事实 |
+|------|------|
+| theme 不经过 AppState 持久化链路 | ❌ theme 标记为 `browser: true`，会被写入 `excalidraw-state` |
+| theme 完全由独立 key 控制 | ✅ 但 AppState 中也有一份，两者可能不一致 |
+| 导入数据的 theme 会生效 | ❌ 对于 excalidraw-app，`props.theme` 会覆盖它 |
+| 协作时本地 theme 优先 | ✅ 但实际上有两层保护（AppState 层 + props 层） |
+| 快捷键切换主题是可靠的 | ❌ 不会更新独立 key，刷新后恢复 |
+
+**核心记忆点**：
+- `props.theme` 是**最终裁决者**，在三处覆盖 AppState.theme
+- 独立 key `excalidraw-theme` 决定 `props.theme`
+- AppState 中的 theme 只是"影子"，刷新后以独立 key 为准
+- 只有通过 `setAppTheme()`（菜单切换）才能同时更新两个存储
+
+### 12.5 为什么主题要设计成双重存储？
 
 主题在 AppState 中有字段，但应用层选择独立管理，原因：
-1. 主题是**应用级**偏好，不是**画布级**状态
-2. 需要支持 `system` 模式（跟随系统），这在 AppState 中未建模
-3. 协作时本地主题不应被其他用户覆盖
-4. 需要在 Excalidraw 组件初始化前就确定主题（避免闪烁）
+1. **避免主题闪烁**：HTML 加载阶段就需要读取主题，此时 React 还未初始化
+2. **支持 system 模式**：AppState.theme 只支持 `"light"/"dark"`，不支持 `"system"`
+3. **应用级 vs 画布级**：主题是应用级偏好，不是画布级状态
+4. **协作隔离**：协作时本地主题不应被其他用户覆盖
+5. **库的灵活性**：Excalidraw 作为库，可以通过 `props.theme` 让宿主完全控制主题
+
+### 12.6 主题相关的潜在 Bug
+
+**快捷键切换主题不会更新独立 key**：
+- 按 Alt+Shift+D 只会调用 `actionToggleTheme`，更新 AppState.theme
+- 独立 key `excalidraw-theme` 不会更新
+- 刷新后 `props.theme` 读取独立 key 的旧值，覆盖 AppState.theme
+- 主题恢复到切换前的状态
+
+**修复方案**：
+1. 在 excalidraw-app 中监听 `appState.theme` 变化，同步更新独立 key
+2. 或者禁用默认的 `actionToggleTheme`，完全由外部控制
 
 ---
 
@@ -712,5 +1081,11 @@ restoreAppState(
 | onChange 回调 | `excalidraw-app/App.tsx` | 678-717 |
 | 启动初始化 | `excalidraw-app/App.tsx` | 216-372 |
 | 跨标签页同步 | `excalidraw-app/App.tsx` | 560-617 |
-| 主题独立存储 | `excalidraw-app/useHandleAppTheme.ts` | 12-70 |
+| 主题独立存储 hook | `excalidraw-app/useHandleAppTheme.ts` | 12-70 |
+| **主题优先级规则 1：初始化覆盖** | `packages/excalidraw/components/App.tsx` | 2916-2918, 2964-2966 |
+| **主题优先级规则 2：状态更新覆盖** | `packages/excalidraw/components/App.tsx` | 2797-2798 |
+| **主题优先级规则 3：props 变化覆盖** | `packages/excalidraw/components/App.tsx` | 3519-3521 |
+| **HTML 内联脚本预加载主题** | `excalidraw-app/index.html` | 59-87 |
+| **切换主题 action（快捷键用）** | `packages/excalidraw/actions/actionCanvas.tsx` | 468-494 |
+| **菜单 ToggleTheme 组件** | `packages/excalidraw/components/main-menu/DefaultItems.tsx` | 231-309 |
 | Tab 版本同步 | `excalidraw-app/data/tabSync.ts` | 1-39 |
