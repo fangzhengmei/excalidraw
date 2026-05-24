@@ -296,26 +296,40 @@ addTextFromPaste(data.text, isPlainPaste)
 
 #### 4.1 混合内容处理 (`App.tsx:4072`) → `addElementsFromMixedContentPaste()`
 
-**⚠️ **真实分支**：
+**⚠️ 真实分支**（`App.tsx:4080-4121`）：
 ```typescript
 if (
   !isPlainPaste &&
-  mixedContent.some(node.type === "imageUrl") &&
+  mixedContent.some((node) => node.type === "imageUrl") &&
   this.isToolSupported("image")
 ) {
-  // ── 有图片 URL 的分支 ──
+  // ── 分支 A：有 imageUrl 且图片工具可用 ──
   // 1. 提取所有 imageUrl
+  const imageURLs = mixedContent.filter(n => n.type === "imageUrl").map(n => n.value);
   // 2. Promise.all 并发下载图片
+  const responses = await Promise.all(imageURLs.map(url => ImageURLToFile(url)));
   // 3. 成功的作为图片插入
+  const imageFiles = responses.filter(r => !!r.file).map(r => r.file);
+  await this.insertImages(imageFiles, sceneX, sceneY);
   // 4. 失败的显示错误消息
-  // ⚠️ 文本节点被丢弃！（TODO: "rewrite this to paste both text & images"
+  // ⚠️ 文本节点被完全丢弃！
 } else {
-  // ── 没有图片 URL 的分支 ──
-  // 1. 提取所有 text 节点
-  // 2. 用 "\n\n" 拼接成一个字符串
-  // 3. 调用 addTextFromPaste()
+  // ── 分支 B：没有 imageUrl，或图片工具不可用 ──
+  // 1. 只提取 text 节点（imageUrl 被过滤丢弃）
+  const textNodes = mixedContent.filter((node) => node.type === "text");
+  if (textNodes.length) {
+    // 2. 用 "\n\n" 拼接成一个字符串
+    // 3. 调用 addTextFromPaste()
+    this.addTextFromPaste(textNodes.map(n => n.value).join("\n\n"), isPlainPaste);
+  }
+  // 如果没有 text 节点 → 什么都不插入
 }
 ```
+
+> **进入分支 B 的三种情况**：
+> 1. `isPlainPaste = true`（纯文本粘贴）
+> 2. `mixedContent` 中没有 `imageUrl` 类型节点
+> 3. `isToolSupported("image")` 返回 `false`（图片工具被禁用）
 
 > **已知缺陷**：代码顶部注释 `// TODO rewrite this to paste both text & images at the same time if pasted data contains both`
 
@@ -469,18 +483,37 @@ if (!opts?.repairBindings) {
 **函数**：`App.tsx:3918` → `addElementsFromPasteOrLibrary()`
 
 #### 6.1 坐标转换
+**⚠️ 真实代码** (`App.tsx:3929-3955`)：
 ```typescript
-// 计算元素中心点
 const [minX, minY, maxX, maxY] = getCommonBounds(elements);
-const elementsCenterX = (minX + maxX) / 2;
-const elementsCenterY = (minY + maxY) / 2;
+
+// 计算元素半宽/半高（distance = Math.abs(max - min)）
+const elementsCenterX = distance(minX, maxX) / 2;  // = (maxX - minX) / 2 = 半宽
+const elementsCenterY = distance(minY, maxY) / 2;  // = 半高
+
+// 目标位置（cursor/center/指定坐标）
+const clientX = opts.position === "cursor" ? this.lastViewportPosition.x : this.state.width / 2 + this.state.offsetLeft;
+const clientY = opts.position === "cursor" ? this.lastViewportPosition.y : this.state.height / 2 + this.state.offsetTop;
 
 // 转换为场景坐标
 const { x, y } = viewportCoordsToSceneCoords({ clientX, clientY }, this.state);
 
-// 对齐到网格
+// 计算偏移（目标点 - 半宽/半高）
+const dx = x - elementsCenterX;
+const dy = y - elementsCenterY;
+
+// 对齐到网格（gridSize 存在时四舍五入到最近网格点）
 const [gridX, gridY] = getGridPoint(dx, dy, this.getEffectiveGridSize());
+
+// 最终坐标：元素原始坐标 + 网格对齐偏移 - 原始 minX
+x: element.x + gridX - minX,
+y: element.y + gridY - minY,
 ```
+
+> **坐标转换原理**：
+> - 虽然计算的是「半宽/半高」，但结合 `dx = x - 半宽` 和 `新坐标 = element.x + dx - minX`
+> - 最终效果等价于将元素**中心点**对齐到目标点 `(x, y)`
+> - `getGridPoint`（`points.ts:68`）：当 `gridSize` 存在时，`Math.round(val / gridSize) * gridSize`
 
 #### 6.2 元素复制
 **函数**：`duplicateElements()`
@@ -517,15 +550,15 @@ if (dataTransferFiles.length === 0 && !isPlainPaste && data.mixedContent)
 
 **真实场景分析**：
 
-| 场景 | dataTransferFiles | data.mixedContent | 执行分支 |
-|-----|-------------------|--------------------|----------|
-| 复制网页中的图片+文字 | 1（图片文件） | 有 | ✅ 跳过混合内容 → 进入图片分支 |
-| 复制网页中的图片+文字 | 0（只有 HTML) | 有 | ✅ 进入混合内容分支 |
-| 复制 Excel 表格 | 0 | 无（全是文本降级） | ✅ 进入表格分支 |
-| 截图粘贴 | 1（图片文件） | 无 | ✅ 进入图片分支 |
-| 复制 Excalidraw 元素 | 0 | 无 | ✅ 进入元素分支 |
+| 场景 | dataTransferFiles | data.mixedContent | 执行分支 | 文本处理 | 图片处理 |
+|-----|-------------------|--------------------|----------|----------|----------|
+| 复制网页中的图片+文字（浏览器转文件） | 1（图片文件） | 有 | ✅ 跳过混合内容 → 进入图片分支 | ❌ 完全丢失 | ✅ 插入图片 |
+| 复制网页中的图片+文字（只有 HTML) | 0 | 有 | ✅ 进入混合内容分支 | ❌ 文本丢弃（分支 A）或 ✅ 文本插入（分支 B） | ✅ 下载插入（分支 A）或 ❌ 丢弃（分支 B） |
+| 复制 Excel 表格 | 0 | 无（全是文本降级） | ✅ 进入表格分支 | —— | —— |
+| 截图粘贴 | 1（图片文件） | 无 | ✅ 进入图片分支 | —— | ✅ 插入图片 |
+| 复制 Excalidraw 元素 | 0 | 无 | ✅ 进入元素分支 | —— | —— |
 
-> **反直觉行为**：从网页复制带图片的富文本时，如果浏览器会自动把图片转成文件，导致 `dataTransferFiles.length > 0`，此时混合内容分支被跳过，直接进入图片分支，**文本丢失**！
+> **反直觉行为**：从网页复制带图片的富文本时，如果浏览器自动把图片转成文件，导致 `dataTransferFiles.length > 0`，此时混合内容分支被跳过，直接进入图片分支，**文本丢失**！
 
 ---
 
@@ -618,8 +651,16 @@ paste 事件触发 → pasteFromClipboard()
 
 ## 七、常见问题解惑（真实行为版）
 
-### Q: 为什么从网页复制的带图片富文本，粘贴后只有图片丢失了？
-A: 浏览器自动将图片转为文件，`dataTransferFiles.length > 0`，导致混合内容分支条件不满足，直接进入图片分支，文本被丢弃。这是已知问题，代码中有 TODO 注释待修复。
+### Q: 为什么从网页复制的带图片富文本，粘贴后文本丢失了？
+A: 分两种情况：
+
+**情况 1**（`dataTransferFiles.length > 0`）：
+浏览器自动将图片转为文件，`dataTransferFiles.length > 0`，导致混合内容分支条件不满足，直接进入图片分支，**文本被丢弃**。
+
+**情况 2**（`dataTransferFiles.length === 0`，进入混合内容分支）：
+如果检测到 `imageUrl` 且图片工具可用，会进入分支 A，**只下载插入图片，文本节点被完全丢弃**。
+
+这是已知问题，代码中有 TODO 注释：`// TODO rewrite this to paste both text & images at the same time if pasted data contains both`。
 
 ### Q: 为什么粘贴的文字有时候变成多个文本框？
 A: 正常粘贴模式下，换行符会被分割为独立的文本元素。使用 `Shift+Ctrl+V` 纯文本粘贴可保留为单个元素。
