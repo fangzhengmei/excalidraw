@@ -509,9 +509,11 @@ theme: { browser: true, export: false, server: false },
 
 ### 8.2 主题优先级核心规则
 
-`props.theme`（来自独立 key）在 **Excalidraw 组件内部**有三处会覆盖 AppState 中的 theme：
+⚠️ **关键修正**：主题在**不同阶段有不同的优先级规则**，初始化阶段和运行时更新阶段的优先级正好相反！
 
-#### 规则 1：初始化时覆盖
+这是因为 `||` 运算符取第一个真值，而两处代码的操作数顺序不同。
+
+#### 规则 1：初始化阶段 - `props.theme` 优先级最高
 **位置**：`packages/excalidraw/components/App.tsx:2916-2918, 2964-2966`
 
 ```typescript
@@ -523,11 +525,19 @@ if (this.props.theme) {
 // restoreAppState 之后再次强制覆盖
 restoredAppState = {
   ...restoredAppState,
-  theme: this.props.theme || restoredAppState.theme,  // ← 关键：props.theme 优先
+  theme: this.props.theme || restoredAppState.theme,  // ← props.theme 在前
 };
 ```
 
-#### 规则 2：每次状态更新时覆盖
+**优先级（初始化）**：
+1. `this.props.theme`（来自独立 key）
+2. `restoredAppState.theme`（来自 restoreAppState 的合并结果）
+
+**关键**：`this.props.theme || restoredAppState.theme`
+- 只要 `props.theme` 存在（`"light"` 或 `"dark"` 都是真值），就会优先使用
+- 完全忽略 `restoredAppState.theme` 中可能存在的导入数据或本地数据
+
+#### 规则 2：运行时更新阶段 - `actionResult.theme` 优先级最高
 **位置**：`packages/excalidraw/components/App.tsx:2797-2798`
 
 ```typescript
@@ -535,12 +545,19 @@ const theme =
   actionResult?.appState?.theme || this.props.theme || THEME.LIGHT;
 ```
 
-每次调用 `syncActionResult()` 时，theme 的取值顺序：
-1. `actionResult.appState.theme`（来自 action，如快捷键切换）
+**优先级（运行时）**：
+1. `actionResult.appState.theme`（如果 action 明确返回）
 2. `this.props.theme`（来自独立 key）
 3. `THEME.LIGHT`（兜底）
 
-#### 规则 3：props 变化时直接覆盖
+**关键**：`actionResult?.appState?.theme || this.props.theme || THEME.LIGHT`
+- `||` 取第一个真值，`"light"` 和 `"dark"` 都是真值
+- 只要 action 返回了 `theme`（无论是 `"light"` 还是 `"dark"`），它就会覆盖 `props.theme`！
+- 只有当 action 不返回 theme 时，才会使用 `props.theme`
+
+**这与初始化阶段的优先级正好相反！**
+
+#### 规则 3：props 变化时 - `props.theme` 直接覆盖
 **位置**：`packages/excalidraw/components/App.tsx:3519-3521`
 
 ```typescript
@@ -548,6 +565,9 @@ if (prevProps.theme !== this.props.theme && this.props.theme) {
   this.setState({ theme: this.props.theme });
 }
 ```
+
+**优先级（props 变化）**：
+- `props.theme` 直接覆盖 state.theme，无条件
 
 ---
 
@@ -651,14 +671,20 @@ appState: {
 3. `syncActionResult` 处理：
    ```typescript
    const theme = actionResult?.appState?.theme || this.props.theme || THEME.LIGHT
-   // "dark" || "light" = "dark"  ← 这次生效了
+   // "dark" || "light" = "dark"  ← ⚠️ actionResult.theme 覆盖了 props.theme！
    ```
-4. `setState({ theme: "dark" })`
+4. `setState({ theme: "dark" })`  ← 临时生效
 5. `onChange` 回调 → 写入 `localStorage["excalidraw-state"].theme = "dark"`
 6. **但**：`localStorage["excalidraw-theme"]` **没有更新！**
 7. **当前状态**：AppState 是 "dark"，独立 key 还是 "light"
-8. **刷新后**：`props.theme` 是 "light"，会覆盖 AppState 的 "dark"，主题又变回 "light"！
-9. **这是一个 Bug**：快捷键切换主题不会更新独立 key，刷新后恢复。
+8. **刷新后**：进入初始化阶段
+   ```typescript
+   theme: this.props.theme || restoredAppState.theme
+   // "light" || "dark" = "light"  ← ⚠️ 优先级反转，props.theme 覆盖回来
+   ```
+9. **主题又变回 "light"！**
+10. **这是一个 Bug**：快捷键切换主题不会更新独立 key，刷新后恢复。
+11. **根本原因**：运行时优先级与初始化优先级正好相反，且两条路径不同步。
 
 #### 场景 8：用户选择 "system" 主题
 1. 用户选择 "system" → `setAppTheme("system")`
@@ -682,27 +708,42 @@ appState: {
 
 ### 8.4 主题优先级总览
 
+⚠️ **关键修正**：不存在单一的全局优先级，不同阶段优先级不同！
+
 ```
 ┌───────────────────────────────────────────────────────────────────────┐
-│  主题优先级从高到低                                                   │
+│  阶段 1：初始化阶段优先级（initialize()）                              │
+│  代码：this.props.theme || restoredAppState.theme                     │
 ├───────────────────────────────────────────────────────────────────────┤
-│                                                                       │
 │  1. props.theme（来自 excalidraw-theme 独立 key）                     │
-│     ├─ 初始化时：this.props.theme || restoredAppState.theme           │
-│     ├─ 每次更新时：actionResult.theme || this.props.theme || LIGHT    │
-│     └─ props 变化时：直接 setState({ theme: this.props.theme })       │
+│  2. restoredAppState.theme（来自 restoreAppState 三级合并）           │
+│     └─ imported > localAppState > defaults                           │
 │                                                                       │
-│  2. actionResult.appState.theme（来自 actionToggleTheme 等）          │
-│     └─ 仅在没有 props.theme 时生效（excalidraw-app 中不生效）          │
+│  结果：props.theme 无条件覆盖 restoredAppState.theme                   │
+│        导入的 theme、本地 AppState 的 theme 全部无效！                  │
+└───────────────────────────────────────────────────────────────────────┘
+
+┌───────────────────────────────────────────────────────────────────────┐
+│  阶段 2：运行时更新优先级（syncActionResult()）                        │
+│  代码：actionResult.theme || this.props.theme || THEME.LIGHT          │
+├───────────────────────────────────────────────────────────────────────┤
+│  1. actionResult.appState.theme（如果 action 明确返回）                │
+│     └─ 例如：快捷键 Alt+Shift+D 触发 actionToggleTheme                 │
+│     └─ 例如：调用 excalidrawAPI.updateScene({ appState: { theme } }) │
+│  2. props.theme（来自独立 key）                                       │
+│  3. THEME.LIGHT（兜底）                                               │
 │                                                                       │
-│  3. imported.appState.theme（文件/链接/协作导入）                     │
-│     └─ 在 restoreAppState 中生效，但随后被 props.theme 覆盖            │
+│  结果：actionResult.theme 可以覆盖 props.theme！                        │
+│        这与初始化阶段正好相反！                                        │
+└───────────────────────────────────────────────────────────────────────┘
+
+┌───────────────────────────────────────────────────────────────────────┐
+│  阶段 3：props 变化优先级（componentDidUpdate）                        │
+│  代码：this.setState({ theme: this.props.theme })                     │
+├───────────────────────────────────────────────────────────────────────┤
+│  1. props.theme（直接覆盖）                                           │
 │                                                                       │
-│  4. localAppState.theme（来自 excalidraw-state）                      │
-│     └─ 在 restoreAppState 中作为偏好源，但随后被 props.theme 覆盖      │
-│                                                                       │
-│  5. getDefaultAppState().theme（代码默认值）                          │
-│                                                                       │
+│  结果：props.theme 无条件覆盖 state.theme                              │
 └───────────────────────────────────────────────────────────────────────┘
 
 ┌───────────────────────────────────────────────────────────────────────┐
@@ -710,13 +751,16 @@ appState: {
 ├───────────────────────────────────────────────────────────────────────┤
 │  路径 A（推荐，用于 excalidraw-app）：                                │
 │    用户菜单 → setAppTheme() → 更新 excalidraw-theme →                 │
-│    props.theme 变化 → Excalidraw setState → onChange →                │
-│    更新 excalidraw-state.theme  → 两个存储一致                        │
+│    editorTheme 更新 → props.theme 变化 →                              │
+│    componentDidUpdate → setState({ theme: props.theme }) →           │
+│    onChange → 更新 excalidraw-state.theme → 两个存储一致 ✅            │
 │                                                                       │
-│  路径 B（仅库内部，excalidraw-app 有副作用）：                         │
-│    快捷键 → actionToggleTheme → 更新 AppState →                       │
-│    onChange → 更新 excalidraw-state.theme →                           │
-│    excalidraw-theme 未更新 → 刷新后恢复                               │
+│  路径 B（有 Bug，excalidraw-app 中不完整）：                           │
+│    快捷键 → actionToggleTheme → 返回 { appState: { theme } } →        │
+│    syncActionResult → actionResult.theme 覆盖 props.theme →          │
+│    setState({ theme: newTheme }) → onChange →                        │
+│    更新 excalidraw-state.theme → ❌ excalidraw-theme 未更新 →         │
+│    刷新后 → 初始化阶段 props.theme 覆盖 → 主题恢复 ⚠️                 │
 │                                                                       │
 └───────────────────────────────────────────────────────────────────────┘
 ```
@@ -985,7 +1029,10 @@ localStorage.getItem("excalidraw-state")
   const theme = actionResult.theme || props.theme || LIGHT
        │
        ▼
-  setState({ theme: newTheme })  ←  这次生效了
+  ⚠️  运行时优先级：actionResult.theme > props.theme
+       │
+       ▼
+  setState({ theme: newTheme })  ←  临时生效
        │
        ▼
   onChange 回调 → 写入 excalidraw-state.theme = newTheme
@@ -994,10 +1041,41 @@ localStorage.getItem("excalidraw-state")
   ⚠️  localStorage["excalidraw-theme"] 未更新！
        │
        ▼
-  刷新页面 → props.theme 读取独立 key 的旧值
+  刷新页面 → 进入初始化阶段
+       │
+       ▼
+  ⚠️  初始化优先级：props.theme > restoredAppState.theme
+       │
+       ▼
+  theme = props.theme || restoredAppState.theme
        │
        ▼
   ❌  主题恢复到切换前的状态
+```
+
+### 11.6 主题优先级反转全景图
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                       优先级反转示意图                                 │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  运行时（syncActionResult）：                                         │
+│    actionResult.theme  →  props.theme  →  THEME.LIGHT                │
+│         ▲                  ▲                                         │
+│         │                  │                                         │
+│  初始化（initialize）：                                               │
+│    被完全忽略        props.theme  →  restoredAppState.theme          │
+│                                                                      │
+│  当用户通过快捷键切换主题：                                           │
+│    1. 运行时：actionResult.theme = "dark"  获胜，主题变为 dark        │
+│    2. 刷新后：初始化阶段 props.theme = "light" 获胜，主题恢复为 light  │
+│                                                                      │
+│  原因：两处代码的 || 操作数顺序不同！                                 │
+│    运行时：   actionResult.theme || props.theme || LIGHT              │
+│    初始化：   props.theme || restoredAppState.theme                  │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -1029,21 +1107,33 @@ restoreAppState(
 
 ### 12.4 主题的双重存储与优先级（最容易混淆的点）
 
-这是之前分析最容易出错的地方：
+⚠️ **这是之前分析最容易出错的地方，也是代码行为最反直觉的地方**：
 
 | 误区 | 事实 |
 |------|------|
 | theme 不经过 AppState 持久化链路 | ❌ theme 标记为 `browser: true`，会被写入 `excalidraw-state` |
 | theme 完全由独立 key 控制 | ✅ 但 AppState 中也有一份，两者可能不一致 |
-| 导入数据的 theme 会生效 | ❌ 对于 excalidraw-app，`props.theme` 会覆盖它 |
+| 导入数据的 theme 会生效 | ❌ 初始化阶段 `props.theme` 会无条件覆盖它 |
 | 协作时本地 theme 优先 | ✅ 但实际上有两层保护（AppState 层 + props 层） |
 | 快捷键切换主题是可靠的 | ❌ 不会更新独立 key，刷新后恢复 |
+| props.theme 总是最高优先级 | ❌ 运行时 actionResult.theme 可以覆盖它！ |
+| 主题有统一的全局优先级规则 | ❌ 不同阶段优先级正好相反！ |
 
 **核心记忆点**：
-- `props.theme` 是**最终裁决者**，在三处覆盖 AppState.theme
-- 独立 key `excalidraw-theme` 决定 `props.theme`
-- AppState 中的 theme 只是"影子"，刷新后以独立 key 为准
-- 只有通过 `setAppTheme()`（菜单切换）才能同时更新两个存储
+
+1. **初始化阶段**：`props.theme` > `restoredAppState.theme`
+   - 代码：`this.props.theme || restoredAppState.theme`
+   - 导入的 theme、本地 AppState 的 theme 全部无效
+
+2. **运行时更新阶段**：`actionResult.theme` > `props.theme` > `LIGHT`
+   - 代码：`actionResult.theme || this.props.theme || THEME.LIGHT`
+   - 只要 action 返回了 theme，就能覆盖 props.theme
+
+3. **props 变化阶段**：`props.theme` 直接覆盖
+   - 代码：`setState({ theme: this.props.theme })`
+
+4. **只有通过 `setAppTheme()`（菜单切换）才能同时更新两个存储**
+   - 其他方式（快捷键、`updateScene`）只会更新 AppState，不会更新独立 key
 
 ### 12.5 为什么主题要设计成双重存储？
 
@@ -1056,15 +1146,38 @@ restoreAppState(
 
 ### 12.6 主题相关的潜在 Bug
 
-**快捷键切换主题不会更新独立 key**：
-- 按 Alt+Shift+D 只会调用 `actionToggleTheme`，更新 AppState.theme
-- 独立 key `excalidraw-theme` 不会更新
-- 刷新后 `props.theme` 读取独立 key 的旧值，覆盖 AppState.theme
+**Bug 1：快捷键切换主题不会更新独立 key，刷新后恢复**
+- 按 Alt+Shift+D 触发 `actionToggleTheme`，返回 `{ appState: { theme: "dark" } }`
+- 运行时：`actionResult.theme` 覆盖 `props.theme`，临时生效
+- 但独立 key `excalidraw-theme` 不会更新
+- 刷新后：初始化阶段优先级反转，`props.theme` 覆盖回来
 - 主题恢复到切换前的状态
+
+**Bug 2：`excalidrawAPI.updateScene({ appState: { theme } })` 同样有问题**
+- 调用后临时生效，但不会更新独立 key
+- 刷新后恢复
 
 **修复方案**：
 1. 在 excalidraw-app 中监听 `appState.theme` 变化，同步更新独立 key
 2. 或者禁用默认的 `actionToggleTheme`，完全由外部控制
+3. 或者在 `actionToggleTheme` 中增加回调机制
+
+### 12.7 `||` vs `??` 运算符的影响
+
+为什么代码用 `||` 而不是 `??`？
+
+- `||` 取第一个**真值**，`"light"` 和 `"dark"` 都是真值
+- `??` 取第一个**非 null/undefined** 的值
+- 如果用 `??`，运行时优先级会变成：
+  - `actionResult.theme ?? this.props.theme ?? LIGHT`
+  - 只要 `actionResult.theme` 不是 `null/undefined`，就优先使用
+  - 这和 `||` 的行为**在这个场景下是一样的**（因为 theme 不会是空字符串）
+
+**真正的问题**不是运算符，而是两处代码的操作数顺序相反：
+- 初始化：`props.theme || restoredAppState.theme`
+- 运行时：`actionResult.theme || props.theme || LIGHT`
+
+这是故意设计的，还是历史遗留？需要看设计意图。
 
 ---
 
