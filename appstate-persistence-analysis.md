@@ -665,13 +665,51 @@ appState: {
 7. **最终状态**：两个存储都更新为 `"dark"`，保持一致
 8. **无冲突**：推荐的切换方式
 
-#### 场景 7：用户通过快捷键切换主题（Alt+Shift+D）- 潜在 Bug
+#### 场景 7：用户通过快捷键切换主题（Alt+Shift+D）
+⚠️ **关键修正**：在 excalidraw-app 中，Alt+Shift+D **在捕获阶段就被宿主拦截了**，根本不会到达 Excalidraw 内核！
+
+**位置**：`excalidraw-app/useHandleAppTheme.ts:34-47`
+
+```typescript
+const handleKeydown = (event: KeyboardEvent) => {
+  if (
+    !event[KEYS.CTRL_OR_CMD] &&
+    event.altKey &&
+    event.shiftKey &&
+    event.code === CODES.D
+  ) {
+    event.preventDefault();
+    event.stopImmediatePropagation();  // ← 阻止事件继续传播
+    setAppTheme(editorTheme === THEME.DARK ? THEME.LIGHT : THEME.DARK);
+  }
+};
+
+// 捕获阶段监听，比冒泡阶段更早
+document.addEventListener(EVENT.KEYDOWN, handleKeydown, { capture: true });
+```
+
+**完整链路**：
+1. 用户按 `Alt+Shift+D` → keydown 事件触发
+2. **捕获阶段**：`useHandleAppTheme` 的监听器触发
+3. `event.stopImmediatePropagation()` → 事件**不会继续传播**
+4. 直接调用 `setAppTheme(...)` → 更新独立 key `excalidraw-theme`
+5. `editorTheme` 更新 → `props.theme` 变化
+6. `componentDidUpdate` → `setState({ theme: props.theme })`
+7. `onChange` 回调 → 更新 `excalidraw-state.theme`
+8. **最终状态**：两个存储都更新，保持一致 ✅
+9. **无 Bug**：在 excalidraw-app 中，快捷键切换主题是正确的！
+
+---
+
+#### 场景 7b：Excalidraw 作为独立库使用（无宿主拦截）- 潜在 Bug
+⚠️ **只有当 Excalidraw 作为独立库使用、没有宿主拦截时**，才会触发 `actionToggleTheme`：
+
 1. 快捷键触发 `actionToggleTheme.perform()`
 2. 返回 `{ appState: { theme: "dark" } }`
 3. `syncActionResult` 处理：
    ```typescript
    const theme = actionResult?.appState?.theme || this.props.theme || THEME.LIGHT
-   // "dark" || "light" = "dark"  ← ⚠️ actionResult.theme 覆盖了 props.theme！
+   // "dark" || "light" = "dark"  ← actionResult.theme 覆盖了 props.theme
    ```
 4. `setState({ theme: "dark" })`  ← 临时生效
 5. `onChange` 回调 → 写入 `localStorage["excalidraw-state"].theme = "dark"`
@@ -680,11 +718,10 @@ appState: {
 8. **刷新后**：进入初始化阶段
    ```typescript
    theme: this.props.theme || restoredAppState.theme
-   // "light" || "dark" = "light"  ← ⚠️ 优先级反转，props.theme 覆盖回来
+   // "light" || "dark" = "light"  ← 优先级反转，props.theme 覆盖回来
    ```
 9. **主题又变回 "light"！**
-10. **这是一个 Bug**：快捷键切换主题不会更新独立 key，刷新后恢复。
-11. **根本原因**：运行时优先级与初始化优先级正好相反，且两条路径不同步。
+10. **这是一个 Bug**：只有在没有宿主拦截的场景下才会出现。
 
 #### 场景 8：用户选择 "system" 主题
 1. 用户选择 "system" → `setAppTheme("system")`
@@ -728,8 +765,9 @@ appState: {
 │  代码：actionResult.theme || this.props.theme || THEME.LIGHT          │
 ├───────────────────────────────────────────────────────────────────────┤
 │  1. actionResult.appState.theme（如果 action 明确返回）                │
-│     └─ 例如：快捷键 Alt+Shift+D 触发 actionToggleTheme                 │
 │     └─ 例如：调用 excalidrawAPI.updateScene({ appState: { theme } }) │
+│     └─ 例如：作为独立库使用时，快捷键触发 actionToggleTheme            │
+│     └─ ⚠️  在 excalidraw-app 中，快捷键已被宿主拦截，不会走这里        │
 │  2. props.theme（来自独立 key）                                       │
 │  3. THEME.LIGHT（兜底）                                               │
 │                                                                       │
@@ -747,16 +785,39 @@ appState: {
 └───────────────────────────────────────────────────────────────────────┘
 
 ┌───────────────────────────────────────────────────────────────────────┐
-│  主题切换的两条路径                                                   │
+│  excalidraw-app 中的三条入口（全部被宿主拦截）                         │
 ├───────────────────────────────────────────────────────────────────────┤
-│  路径 A（推荐，用于 excalidraw-app）：                                │
-│    用户菜单 → setAppTheme() → 更新 excalidraw-theme →                 │
+│  入口 1：快捷键 Alt+Shift+D                                           │
+│    位置：useHandleAppTheme.ts:34-47                                   │
+│    方式：捕获阶段拦截 + stopImmediatePropagation                      │
+│    调用：setAppTheme()                                                │
+│    结果：✅ 两个存储都更新                                            │
+│                                                                       │
+│  入口 2：菜单 ToggleTheme                                             │
+│    位置：AppMainMenu.tsx:81-85                                        │
+│    方式：传入 onSelect={props.setTheme} 覆盖默认行为                  │
+│    调用：setAppTheme()                                                │
+│    结果：✅ 两个存储都更新                                            │
+│                                                                       │
+│  入口 3：命令面板 ToggleTheme                                         │
+│    位置：App.tsx:1233-1238                                            │
+│    方式：覆盖 perform 函数                                            │
+│    调用：setAppTheme()                                                │
+│    结果：✅ 两个存储都更新                                            │
+│                                                                       │
+└───────────────────────────────────────────────────────────────────────┘
+
+┌───────────────────────────────────────────────────────────────────────┐
+│  主题切换的两条路径（是否被宿主拦截）                                 │
+├───────────────────────────────────────────────────────────────────────┤
+│  路径 A（excalidraw-app 中所有入口）：                                │
+│    被宿主拦截 → setAppTheme() → 更新 excalidraw-theme →              │
 │    editorTheme 更新 → props.theme 变化 →                              │
 │    componentDidUpdate → setState({ theme: props.theme }) →           │
 │    onChange → 更新 excalidraw-state.theme → 两个存储一致 ✅            │
 │                                                                       │
-│  路径 B（有 Bug，excalidraw-app 中不完整）：                           │
-│    快捷键 → actionToggleTheme → 返回 { appState: { theme } } →        │
+│  路径 B（独立库使用、无宿主拦截）：                                   │
+│    快捷键/命令面板 → actionToggleTheme → 返回 { appState: { theme } }│
 │    syncActionResult → actionResult.theme 覆盖 props.theme →          │
 │    setState({ theme: newTheme }) → onChange →                        │
 │    更新 excalidraw-state.theme → ❌ excalidraw-theme 未更新 →         │
@@ -1014,10 +1075,46 @@ localStorage.getItem("excalidraw-state")
   ✅  两个存储保持一致
 ```
 
-### 11.5 主题切换（快捷键路径 - 有 Bug）
+### 11.5 主题切换（快捷键路径 - excalidraw-app 中被拦截）
 
 ```
-用户按 Alt+Shift+D → actionToggleTheme.perform()
+用户按 Alt+Shift+D → keydown 事件触发
+       │
+       ▼
+  ⚠️  捕获阶段：useHandleAppTheme 监听器触发
+       │
+       ▼
+  event.stopImmediatePropagation() → 事件停止传播
+       │
+       ▼
+  直接调用 setAppTheme(newTheme)
+       │
+       ▼
+  ✅  更新 localStorage["excalidraw-theme"] = newTheme
+       │
+       ▼
+  editorTheme 更新 → props.theme 变化
+       │
+       ▼
+  componentDidUpdate → setState({ theme: props.theme })
+       │
+       ▼
+  onChange 回调 → 写入 excalidraw-state.theme = newTheme
+       │
+       ▼
+  ✅  两个存储保持一致
+```
+
+### 11.6 主题切换（快捷键路径 - 独立库场景，有 Bug）
+
+```
+用户按 Alt+Shift+D → keydown 事件
+       │
+       ▼
+  ⚠️  无宿主拦截 → 事件到达 Excalidraw 内核
+       │
+       ▼
+  actionToggleTheme.perform()
        │
        ▼
   返回 { appState: { theme: newTheme } }
@@ -1038,7 +1135,7 @@ localStorage.getItem("excalidraw-state")
   onChange 回调 → 写入 excalidraw-state.theme = newTheme
        │
        ▼
-  ⚠️  localStorage["excalidraw-theme"] 未更新！
+  ❌  localStorage["excalidraw-theme"] 未更新！
        │
        ▼
   刷新页面 → 进入初始化阶段
@@ -1053,7 +1150,7 @@ localStorage.getItem("excalidraw-state")
   ❌  主题恢复到切换前的状态
 ```
 
-### 11.6 主题优先级反转全景图
+### 11.7 主题优先级反转全景图
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
@@ -1115,7 +1212,9 @@ restoreAppState(
 | theme 完全由独立 key 控制 | ✅ 但 AppState 中也有一份，两者可能不一致 |
 | 导入数据的 theme 会生效 | ❌ 初始化阶段 `props.theme` 会无条件覆盖它 |
 | 协作时本地 theme 优先 | ✅ 但实际上有两层保护（AppState 层 + props 层） |
-| 快捷键切换主题是可靠的 | ❌ 不会更新独立 key，刷新后恢复 |
+| 快捷键切换主题不会更新独立 key | ❌ 在 excalidraw-app 中，快捷键被宿主拦截，会更新 |
+| Alt+Shift+D 会触发 actionToggleTheme | ❌ 在 excalidraw-app 中，事件在捕获阶段就被拦截了 |
+| `actionToggleTheme` 在 excalidraw-app 中被调用 | ❌ 所有三条入口都被宿主拦截，实际上永远不会调用 |
 | props.theme 总是最高优先级 | ❌ 运行时 actionResult.theme 可以覆盖它！ |
 | 主题有统一的全局优先级规则 | ❌ 不同阶段优先级正好相反！ |
 
@@ -1146,7 +1245,9 @@ restoreAppState(
 
 ### 12.6 主题相关的潜在 Bug
 
-**Bug 1：快捷键切换主题不会更新独立 key，刷新后恢复**
+**Bug 1（仅独立库场景）：快捷键切换主题不会更新独立 key，刷新后恢复**
+- ⚠️ **在 excalidraw-app 中不存在**，因为快捷键被宿主拦截了
+- 只有当 Excalidraw 作为独立库使用、没有宿主拦截时才会出现
 - 按 Alt+Shift+D 触发 `actionToggleTheme`，返回 `{ appState: { theme: "dark" } }`
 - 运行时：`actionResult.theme` 覆盖 `props.theme`，临时生效
 - 但独立 key `excalidraw-theme` 不会更新
@@ -1154,15 +1255,31 @@ restoreAppState(
 - 主题恢复到切换前的状态
 
 **Bug 2：`excalidrawAPI.updateScene({ appState: { theme } })` 同样有问题**
-- 调用后临时生效，但不会更新独立 key
+- 直接调用 API 更新 theme，走的是运行时更新路径
+- `actionResult.theme` 覆盖 `props.theme`，临时生效
+- 但独立 key `excalidraw-theme` 不会更新
 - 刷新后恢复
+- ✅ **在 excalidraw-app 中也存在**，因为这是 API 直接调用
 
 **修复方案**：
 1. 在 excalidraw-app 中监听 `appState.theme` 变化，同步更新独立 key
 2. 或者禁用默认的 `actionToggleTheme`，完全由外部控制
 3. 或者在 `actionToggleTheme` 中增加回调机制
 
-### 12.7 `||` vs `??` 运算符的影响
+### 12.7 三条入口的拦截机制对比
+
+| 入口 | 拦截位置 | 拦截方式 | 调用函数 | excalidraw-app | 独立库 |
+|------|---------|---------|---------|---------------|--------|
+| **Alt+Shift+D** | `useHandleAppTheme.ts:34-47` | `capture: true` + `stopImmediatePropagation` | `setAppTheme()` | ✅ 被拦截 | ❌ 不拦截 |
+| **菜单 ToggleTheme** | `AppMainMenu.tsx:81-85` | 传入 `onSelect={props.setTheme}` | `setAppTheme()` | ✅ 被拦截 | ❌ 不拦截（走 `actionToggleTheme`） |
+| **命令面板 ToggleTheme** | `App.tsx:1233-1238` | 覆盖 `perform` 函数 | `setAppTheme()` | ✅ 被拦截 | ❌ 不拦截（走 `actionToggleTheme`） |
+
+**关键点**：
+- 在 excalidraw-app 中，**所有三条入口都被宿主拦截**，都走 `setAppTheme()` 路径
+- `actionToggleTheme` 在 excalidraw-app 中**实际上永远不会被调用**
+- 只有当 Excalidraw 作为独立库使用时，才会走 `actionToggleTheme` 路径
+
+### 12.8 `||` vs `??` 运算符的影响
 
 为什么代码用 `||` 而不是 `??`？
 
@@ -1199,6 +1316,9 @@ restoreAppState(
 | **主题优先级规则 2：状态更新覆盖** | `packages/excalidraw/components/App.tsx` | 2797-2798 |
 | **主题优先级规则 3：props 变化覆盖** | `packages/excalidraw/components/App.tsx` | 3519-3521 |
 | **HTML 内联脚本预加载主题** | `excalidraw-app/index.html` | 59-87 |
-| **切换主题 action（快捷键用）** | `packages/excalidraw/actions/actionCanvas.tsx` | 468-494 |
+| **切换主题 action（独立库用）** | `packages/excalidraw/actions/actionCanvas.tsx` | 468-494 |
 | **菜单 ToggleTheme 组件** | `packages/excalidraw/components/main-menu/DefaultItems.tsx` | 231-309 |
+| **快捷键拦截（捕获阶段）** | `excalidraw-app/useHandleAppTheme.ts` | 34-47 |
+| **命令面板主题项覆盖** | `excalidraw-app/App.tsx` | 1233-1238 |
+| **菜单主题项覆盖** | `excalidraw-app/components/AppMainMenu.tsx` | 81-85 |
 | Tab 版本同步 | `excalidraw-app/data/tabSync.ts` | 1-39 |
