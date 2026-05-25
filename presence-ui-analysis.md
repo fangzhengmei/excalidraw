@@ -762,7 +762,7 @@ onUserActivity = () => {
 
 ### 8.2 过滤机制
 
-- `user.pointer.renderCursor === false` 时跳过光标渲染（只渲染激光轨迹）
+- `user.pointer.renderCursor === false` 时跳过 Canvas 光标渲染（⚠️ 默认为 `undefined`，实际从不跳过，详见第十五章）
 - 超出画布边界时 `isOutOfBounds = true`，用户名标签不显示
 - 多指触控时 `pointersMap.size >= 2`，不上报指针位置
 
@@ -791,14 +791,16 @@ isSpeaking (说话中) > button === "down" (按下中) > isInactive (不活跃)
 | 状态层 | `App.tsx` | `appState.collaborators` 作为唯一数据源 | IDLE_THRESHOLD = 60s |
 | UI 层 | `UserList.tsx` | 显示在线用户头像，点击发起跟随 | ACTIVE_THRESHOLD = 3s |
 | 转换层 | `InteractiveCanvas.tsx` | **关键**：拆分为 5 个渲染专用 Map + 坐标转换 | useEffect 无依赖 |
-| 动画层 | `AnimationController` | 驱动渲染循环 | requestAnimationFrame (~60fps) |
+| 动画层 | `AnimationController` | 驱动渲染循环 | rAF (~60fps) / setTimeout (尽可能快) |
 | 渲染层 | `renderRemoteCursors()` | Canvas 2D 绘制光标、用户名、状态指示 | 4 种状态叠加 |
 | 工具层 | `getClientColor()` | 生成用户专属颜色 | 37 种色相值 |
+| 开关层 | `EXCALIDRAW_THROTTLE_RENDER` | 控制 rAF vs setTimeout 分支 | 默认 true (React 18+) |
 
-> **最容易看漏的三点**:
+> **最容易看漏的四点**:
 > 1. `InteractiveCanvas.tsx` 中的 `useEffect` 转换层（无依赖数组）
 > 2. `CURSOR_SYNC_TIMEOUT` 实际是 33ms（~30fps），不是 50ms
-> 3. 渲染由 `AnimationController` 驱动，帧率取决于 React 版本和浏览器刷新率
+> 3. 渲染由 `AnimationController` 驱动，帧率取决于 `EXCALIDRAW_THROTTLE_RENDER` 开关和 React 版本
+> 4. `renderCursor` 在内部代码中从未被设置，默认为 `undefined`，因此 laser 模式下 Canvas 光标 + SVG 轨迹**并存**
 
 ---
 
@@ -1192,7 +1194,7 @@ if (!user.pointer || user.pointer.renderCursor === false) {
 }
 ```
 
-> **分离渲染的关键**: 当 `tool === "laser"` 时，`renderCursor` 被设为 `false`，因此 Canvas 光标不会渲染，只有 SVG LaserTrails 会渲染轨迹。
+> **⚠️ 重要修正**: 之前的结论"当 tool === laser 时 renderCursor 被设为 false，因此 Canvas 光标不会渲染"是**错误的**。实际上 `renderCursor` 在 Excalidraw 内部代码中**从未被设置过**，默认为 `undefined`（即 `true`）。因此 **laser 模式下 Canvas 光标和 SVG 轨迹是并存的**！详见第十五章核实。
 
 ### 12.6 双管线架构对比
 
@@ -1202,9 +1204,9 @@ if (!user.pointer || user.pointer.renderCursor === false) {
 | **驱动方式** | `AnimationController` + `requestAnimationFrame` | `AnimationFrameHandler`（不同的动画控制器！） |
 | **坐标系统** | 视口坐标（已转换） | 场景坐标（直接使用） |
 | **渲染频率** | 60fps（由 AnimationController 控制） | 60fps（由 AnimationFrameHandler 控制） |
-| **可见性** | 始终可见（除非 IDLE/AWAY） | 按下时才绘制，松开后 1 秒内渐隐 |
+| **可见性** | 始终可见（除非 IDLE/AWAY） | **始终可见**（与 pointer 模式相同）+ 按下时绘制轨迹 |
 | **颜色来源** | `getClientColor()` 哈希 | `collaborator.pointer.laserColor` 或 `getClientColor()` |
-| **过滤条件** | `renderCursor !== false` | `pointer.tool === "laser"` |
+| **过滤条件** | `renderCursor === false`（默认为 `undefined` → 不跳过） | `pointer.tool === "laser"` |
 
 > **容易混淆**: 两者使用**不同的动画控制器**！Cursor 走 `AnimationController`（`animation.ts`），Laser 走 `AnimationFrameHandler`（`animation-frame-handler.ts`）。
 
@@ -1218,6 +1220,7 @@ appState.collaborators (Map<SocketId, Collaborator>)
 InteractiveCanvas.useEffect()              LaserTrails.onFrame()
   ├─ 遍历 collaborators                      ├─ 遍历 collaborators
   ├─ 过滤: renderCursor === false?           ├─ 过滤: pointer.tool === "laser"?
+  │  (默认为 undefined → 不跳过)              │  (只在 laser 模式下添加点)
   ├─ 提取到 5 个渲染 Map                      ├─ button === "down" → 添加路径点
   └─ 组装 renderConfig                        └─ button === "up" → 结束路径
       ↓                                             ↓
@@ -1228,6 +1231,10 @@ Canvas 2D 绘制                            SVG 元素渲染
   ├─ 箭头光标（3层叠加）
   ├─ 用户名标签
   └─ 状态指示（按下环/说话框）
+
+⚠️ 注意：当 tool === "laser" 时，
+   Canvas 光标 + SVG 轨迹是**同时渲染**的！
+   因为 renderCursor 默认为 undefined（≠ false）
 ```
 
 ---
@@ -1406,5 +1413,246 @@ App.setState() → React 重渲染
 | IDLE → 光标透明 | `IDLE_STATUS` volatile 消息 | `context.globalAlpha = 0.3` | `userState` → `isInactive` |
 | 指针位置同步 | `MOUSE_LOCATION` volatile 消息 | Canvas 光标位置 | 33ms 节流，~30fps 有效更新 |
 | 激光轨迹渲染 | `MOUSE_LOCATION` (tool=laser) | SVG 渐隐轨迹 | `LaserTrails` + `AnimatedTrail` |
-| 光标不渲染 laser | `renderCursor = false` | Canvas 跳过该用户 | InteractiveCanvas useEffect 过滤 |
+| Canvas 光标跳过渲染 | `renderCursor = false` | Canvas 跳过该用户 | InteractiveCanvas useEffect 过滤（默认不跳过） |
+| laser 模式 Canvas+SVG 并存 | `renderCursor` 默认为 `undefined` | 两者同时渲染 | `undefined !== false` → Canvas 光标不被跳过 |
 | Volatile 丢包 | 网络层丢弃 | 光标/状态短暂不一致 | 下一帧或心跳自动修复 |
+| 渲染节流开关 | `window.EXCALIDRAW_THROTTLE_RENDER` | rAF vs setTimeout 分支 | React 18+ 才启用 rAF |
+
+---
+
+## 十五、关键不确定点核实（证据链）
+
+### 15.1 renderCursor 的真实来源与设置路径
+
+**类型定义**（`packages/excalidraw/types.ts:92-109`）:
+
+```typescript
+export type CollaboratorPointer = {
+  x: number;
+  y: number;
+  tool: "pointer" | "laser";
+  /**
+   * Whether to render cursor + username. Useful when you only want to render
+   * laser trail.
+   *
+   * @default true
+   */
+  renderCursor?: boolean;  // ⬅️ 可选，默认为 undefined
+  /**
+   * Explicit laser color.
+   *
+   * @default string collaborator's cursor color
+   */
+  laserColor?: string;
+};
+```
+
+**全局搜索 `renderCursor` 的结果**：
+
+| 位置 | 用途 | 是否设置值 |
+|------|------|-----------|
+| `types.ts:102` | 类型定义 | ❌ 仅定义类型 |
+| `InteractiveCanvas.tsx:116` | `if (!user.pointer \|\| user.pointer.renderCursor === false)` | ❌ 仅读取检查 |
+| `presence-ui-analysis.md` | 文档引用 | ❌ 文档内容 |
+
+> **核心结论**: 在 Excalidraw **内部代码**中，`renderCursor` **从未被设置过任何值**。它始终保持为 `undefined`。检查条件 `user.pointer.renderCursor === false` 中，`undefined === false` 的结果是 `false`，因此 Canvas 光标**永远不会被跳过**。
+
+**设置路径**：
+- `renderCursor` 是为 **Excalidraw API 的外部调用者**设计的
+- 调用者可以通过 `excalidrawAPI.updateScene({ collaborators })` 传入自定义 `Collaborator` 对象
+- 在自定义对象中设置 `pointer.renderCursor = false` 来控制是否渲染光标
+- **在 Excalidraw 内部协作流程中**（`Collab.tsx` → `updateCollaborator`），`pointer` 对象只包含 `{ x, y, tool }`，不包含 `renderCursor`
+
+### 15.2 laser 模式下 Canvas 光标和 SVG 轨迹是否并存
+
+**Canvas 光标渲染条件**（`InteractiveCanvas.tsx:116`）:
+
+```typescript
+if (!user.pointer || user.pointer.renderCursor === false) {
+  return;  // 跳过 Canvas 光标渲染
+}
+```
+
+- `user.pointer` 在协作流程中始终存在（由 `updateCollaborator` 设置）
+- `user.pointer.renderCursor` 始终为 `undefined`
+- `undefined === false` → `false` → **不跳过** → Canvas 光标**始终渲染**
+
+**SVG LaserTrails 渲染条件**（`laser-trails.ts:102`）:
+
+```typescript
+if (collaborator.pointer && collaborator.pointer.tool === "laser") {
+  // 按下时添加轨迹点，松开时结束轨迹
+}
+```
+
+- `collaborator.pointer.tool === "laser"` → 为 `true` 时渲染 SVG 轨迹
+
+**结论**：当 `tool === "laser"` 时：
+1. Canvas 光标：✅ **渲染**（因为 `renderCursor` 是 `undefined`，不跳过）
+2. SVG 激光轨迹：✅ **渲染**（因为 `tool === "laser"`）
+3. **两者并存**，用户可以看到箭头光标 + 激光轨迹同时存在
+
+> **⚠️ 之前文档中的错误结论已修正**：原文档认为 laser 模式下 Canvas 光标不渲染，这是不正确的。实际上两者并存，除非外部调用者显式设置 `renderCursor = false`。
+
+### 15.3 EXCALIDRAW_THROTTLE_RENDER 开关对渲染节奏分支的影响
+
+**全局设置**（`excalidraw-app/App.tsx:155`）:
+
+```typescript
+window.EXCALIDRAW_THROTTLE_RENDER = true;
+```
+
+**类型声明**（`packages/excalidraw/global.d.ts:5`）:
+
+```typescript
+interface Window {
+  EXCALIDRAW_THROTTLE_RENDER: boolean | undefined;
+}
+```
+
+**开关实现**（`packages/excalidraw/reactUtils.ts:34-62`）:
+
+```typescript
+export const isRenderThrottlingEnabled = (() => {
+  // 判断 React 版本
+  let IS_REACT_18_AND_UP: boolean;
+  try {
+    const version = ReactVersion.split(".");
+    IS_REACT_18_AND_UP = Number(version[0]) > 17;
+  } catch {
+    IS_REACT_18_AND_UP = false;
+  }
+
+  let hasWarned = false;
+
+  return () => {
+    if (window.EXCALIDRAW_THROTTLE_RENDER === true) {
+      if (!IS_REACT_18_AND_UP) {
+        if (!hasWarned) {
+          hasWarned = true;
+          console.warn(
+            "Excalidraw: render throttling is disabled on React versions < 18.",
+          );
+        }
+        return false;  // ⬅️ React < 18 时强制返回 false
+      }
+      return true;   // ⬅️ React 18+ 且开关为 true
+    }
+    return false;    // ⬅️ 开关为 false 或 undefined
+  };
+})();
+```
+
+**在 AnimationController 中的使用**（`packages/excalidraw/renderer/animation.ts:35-39, 69-73`）:
+
+```typescript
+// 启动时
+if (isRenderThrottlingEnabled()) {
+  requestAnimationFrame(AnimationController.tick);  // ~60fps
+} else {
+  setTimeout(AnimationController.tick, 0);  // 尽可能快，可能 > 60fps
+}
+
+// 每帧递归时
+if (isRenderThrottlingEnabled()) {
+  requestAnimationFrame(AnimationController.tick);
+} else {
+  setTimeout(AnimationController.tick, 0);
+}
+```
+
+**完整分支逻辑**：
+
+| EXCALIDRAW_THROTTLE_RENDER | React 版本 | 渲染方式 | 帧率 |
+|---------------------------|-----------|----------|------|
+| `true` | >= 18 | `requestAnimationFrame` | ~60fps（与显示器同步） |
+| `true` | < 18 | `setTimeout(..., 0)` | 尽可能快（可能 > 60fps） + 控制台警告 |
+| `false` / `undefined` | 任意 | `setTimeout(..., 0)` | 尽可能快（可能 > 60fps） |
+
+> **注意**: `setTimeout(..., 0)` 实际上会被浏览器限制为至少 4ms（HTML spec 规范），所以实际帧率约为 250fps，但这会消耗大量 CPU/GPU 资源。
+
+**excalidraw-app 的默认配置**：
+- `window.EXCALIDRAW_THROTTLE_RENDER = true`（`excalidraw-app/App.tsx:155`）
+- 使用 React 18+
+- 因此默认渲染方式是 `requestAnimationFrame`（~60fps）
+
+**对协作光标的影响**：
+- `EXCALIDRAW_THROTTLE_RENDER = true` + React 18+ → 光标以 ~60fps 渲染，但位置数据每 33ms 才更新一次（~30fps 有效更新）
+- `EXCALIDRAW_THROTTLE_RENDER = false` → 光标以尽可能快的速度渲染，但位置数据仍然每 33ms 才更新一次，多余的渲染帧不会带来额外效果，只会浪费资源
+
+### 15.4 核实后的渲染节奏完整图解
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  EXCALIDRAW_THROTTLE_RENDER 开关决定渲染循环的底层机制         │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  EXCALIDRAW_THROTTLE_RENDER = true  + React >= 18:              │
+│    requestAnimationFrame (每帧约 16.67ms)                        │
+│                                                                 │
+│  EXCALIDRAW_THROTTLE_RENDER = false 或 React < 18:              │
+│    setTimeout(..., 0) (每帧约 4ms+，实际被浏览器限制)           │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│  网络数据到达频率                                               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  MOUSE_LOCATION: 每 33ms (~30fps) 一帧                         │
+│  IDLE_STATUS: 每 60s (IDLE) / 3s (ACTIVE 心跳)                 │
+│  USER_VISIBLE_SCENE_BOUNDS: throttleRAF 节流                    │
+│                                                                 │
+│  ⚠️ 所有 presence 消息都是 volatile，可能丢包！                 │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│  collaborators Map 更新 → React setState                        │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  App.setState({ collaborators })                                │
+│    → React 重渲染                                               │
+│    → React.memo 比较 collaborators (浅比较)                     │
+│    → InteractiveCanvas 重渲染                                   │
+│    → useEffect 提取到 5 个渲染专用 Map                          │
+│    → rendererParams.current 更新                                │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│  Canvas 渲染循环 (由 AnimationController 驱动)                 │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  帧1: 读取 rendererParams.current.renderConfig                  │
+│       → renderRemoteCursors() 绘制光标 + 用户名                 │
+│       → cursor 位置 = collaborators[socketId].pointer           │
+│       (基于上一次 MOUSE_LOCATION 的数据)                        │
+│                                                                 │
+│  帧2: 同上，但 pointer 数据可能未更新                           │
+│       → 光标在同一位置停留                                      │
+│                                                                 │
+│  帧3: 新 MOUSE_LOCATION 到达                                    │
+│       → pointer 更新 → 光标移动到新位置                         │
+│                                                                 │
+│  ⚠️ 实际光标帧率 = min(渲染帧率, 网络更新频率) ≈ 30fps          │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│  SVG LaserTrails 渲染循环 (由 AnimationFrameHandler 驱动)      │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  独立于 Canvas 渲染循环！                                       │
+│  每帧检查 collaborators 中 tool === "laser" 的用户              │
+│  按下时添加路径点，松开时结束路径                                │
+│  轨迹在 1 秒内渐隐消失                                          │
+│                                                                 │
+│  ⚠️ 当 tool === "laser" 时，Canvas 光标 + SVG 轨迹并存！       │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
