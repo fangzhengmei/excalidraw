@@ -24,7 +24,19 @@ export type Collaborator = Readonly<{
 }>;
 ```
 
-### 1.2 AppState 中的存储位置
+### 1.2 UserIdleState 枚举
+
+**文件**: `packages/common/src/constants.ts:496-500`
+
+```typescript
+export enum UserIdleState {
+  ACTIVE = "active",   // 活跃状态
+  AWAY = "away",       // 离开状态
+  IDLE = "idle",       // 空闲状态
+}
+```
+
+### 1.3 AppState 中的存储位置
 
 **文件**: `packages/excalidraw/appState.ts:29`
 
@@ -61,6 +73,8 @@ UserList 组件                     InteractiveCanvas 组件
       ↓                                   ↓
 显示用户头像 + 状态            转换为 renderConfig 并驱动 Canvas 渲染
                                   ↓
+                            AnimationController.start()
+                                  ↓  (requestAnimationFrame)
                             renderInteractiveScene()
                                   ↓
                             renderRemoteCursors()  [clients.ts:57-261]
@@ -70,9 +84,201 @@ UserList 组件                     InteractiveCanvas 组件
 
 ---
 
-## 三、远端 Presence 数据接入本地提示组件（UserList）
+## 三、关键时间常量与同步频率
 
-### 3.1 数据接收与更新
+### 3.1 指针同步频率（重点核准）
+
+**文件**: `excalidraw-app/app_constants.ts:8`
+
+```typescript
+export const CURSOR_SYNC_TIMEOUT = 33;  // 33ms = ~30fps
+```
+
+> ⚠️ **重要修正**: 之前文档误写为 50ms，实际代码是 **33ms（约 30fps）**！
+
+### 3.2 空闲状态检测阈值
+
+**文件**: `packages/common/src/constants.ts:307-310`
+
+```typescript
+// Report a user inactive after IDLE_THRESHOLD milliseconds
+export const IDLE_THRESHOLD = 60_000;   // 60秒无操作 → IDLE
+// Report a user active each ACTIVE_THRESHOLD milliseconds
+export const ACTIVE_THRESHOLD = 3_000;   // 每 3秒上报一次活跃状态
+```
+
+### 3.3 全量场景同步间隔
+
+**文件**: `excalidraw-app/app_constants.ts:6`
+
+```typescript
+export const SYNC_FULL_SCENE_INTERVAL_MS = 20000;  // 20秒同步一次完整场景
+```
+
+### 3.4 时间常量汇总表
+
+| 常量名 | 数值 | 含义 | 影响 |
+|--------|------|------|------|
+| `CURSOR_SYNC_TIMEOUT` | 33ms | 指针位置节流上报间隔 | 决定远端光标更新的**最大频率**（~30fps） |
+| `IDLE_THRESHOLD` | 60,000ms | 空闲检测阈值 | 60秒无操作后用户标记为 `IDLE`，光标变半透明 |
+| `ACTIVE_THRESHOLD` | 3,000ms | 活跃状态上报间隔 | 每3秒心跳式上报，防止误判为空闲 |
+| `SYNC_FULL_SCENE_INTERVAL_MS` | 20,000ms | 全量场景同步间隔 | 兜底机制，防止增量同步丢失 |
+
+---
+
+## 四、渲染节奏控制机制
+
+### 4.1 AnimationController 驱动
+
+**文件**: `packages/excalidraw/renderer/animation.ts:8-84`
+
+```typescript
+export class AnimationController {
+  private static animations = new Map<string, { animation, lastTime, state }>();
+
+  static start<R extends object>(key: string, animation: Animation<R>) {
+    // ...
+    if (!AnimationController.isRunning) {
+      AnimationController.isRunning = true;
+      // React 18+ 使用 requestAnimationFrame（与浏览器刷新率同步）
+      // React < 18 使用 setTimeout(..., 0)（不限制帧率）
+      if (isRenderThrottlingEnabled()) {
+        requestAnimationFrame(AnimationController.tick);
+      } else {
+        setTimeout(AnimationController.tick, 0);
+      }
+    }
+  }
+
+  private static tick() {
+    if (AnimationController.animations.size > 0) {
+      for (const [key, animation] of AnimationController.animations) {
+        const now = performance.now();
+        const deltaTime = animation.lastTime === 0 ? 0 : now - animation.lastTime;
+        // 执行渲染回调
+        const state = animation.animation({ deltaTime, state: animation.state });
+        // ...
+      }
+      // 继续下一帧
+      if (isRenderThrottlingEnabled()) {
+        requestAnimationFrame(AnimationController.tick);
+      } else {
+        setTimeout(AnimationController.tick, 0);
+      }
+    }
+  }
+}
+```
+
+**关键点**:
+- **React 18+**: 使用 `requestAnimationFrame`，与浏览器刷新率同步（通常 60fps）
+- **React < 18**: 使用 `setTimeout(..., 0)`，尽可能快地渲染（可能 > 60fps）
+- 动画一旦启动就会持续运行，直到 `state` 返回 `undefined/ null`
+
+### 4.2 InteractiveCanvas 触发渲染
+
+**文件**: `packages/excalidraw/components/canvases/InteractiveCanvas.tsx:173-198`
+
+```typescript
+useEffect(() => {
+  // ... 数据转换 ...
+  
+  rendererParams.current = {
+    app: props.app,
+    canvas: props.canvas,
+    // ...
+    renderConfig: { /* 5 个 Map */ },
+    // ...
+  };
+
+  // 只有动画未在运行时才启动
+  if (!AnimationController.running(INTERACTIVE_SCENE_ANIMATION_KEY)) {
+    AnimationController.start<InteractiveSceneRenderAnimationState>(
+      INTERACTIVE_SCENE_ANIMATION_KEY,
+      ({ deltaTime, state }) => {
+        const nextAnimationState = renderInteractiveScene({
+          ...rendererParams.current!,
+          deltaTime,
+          animationState: state,
+        }).animationState;
+        // 返回 state 则继续下一帧
+        // 返回 undefined 则动画停止
+        return nextAnimationState;
+      },
+    );
+  }
+});  // 无依赖数组 → 每次组件渲染都会执行！
+```
+
+> **容易看错**: 这个 `useEffect` **没有依赖数组**，每次 `InteractiveCanvas` 重新渲染都会执行。
+
+### 4.3 React.memo 比较逻辑
+
+**文件**: `packages/excalidraw/components/canvases/InteractiveCanvas.tsx:275-302`
+
+```typescript
+const areEqual = (prevProps, nextProps) => {
+  // 快速比较：这些变化一定需要重渲染
+  if (
+    prevProps.selectionNonce !== nextProps.selectionNonce ||
+    prevProps.canvasNonce !== nextProps.canvasNonce ||
+    prevProps.scale !== nextProps.scale ||
+    prevProps.elementsMap !== nextProps.elementsMap ||
+    prevProps.visibleElements !== nextProps.visibleElements ||
+    prevProps.selectedElements !== nextProps.selectedElements ||
+    prevProps.renderScrollbars !== nextProps.renderScrollbars
+  ) {
+    return false;  // 不相等 → 重渲染
+  }
+
+  // 深度比较：只比较 InteractiveCanvas 关心的 AppState 字段
+  // 包含 collaborators！
+  return isShallowEqual(
+    getRelevantAppStateProps(prevProps.appState as AppState),
+    getRelevantAppStateProps(nextProps.appState as AppState),
+  );
+};
+
+export default React.memo(InteractiveCanvas, areEqual);
+```
+
+**`getRelevantAppStateProps` 包含的关键字段**（`InteractiveCanvas.tsx:232-273`）：
+```typescript
+const getRelevantAppStateProps = (appState: AppState): InteractiveCanvasAppState => ({
+  // ...
+  collaborators: appState.collaborators,  // ⭐ Necessary for collab. sessions
+  // ...
+});
+```
+
+### 4.4 渲染节奏总结
+
+```
+网络接收频率:  ~30fps (CURSOR_SYNC_TIMEOUT = 33ms)
+       ↓
+React setState: 触发 App 重渲染
+       ↓
+React.memo 比较: collaborators 变化 → InteractiveCanvas 重渲染
+       ↓
+useEffect 执行: 更新 rendererParams.current
+       ↓
+AnimationController: 若未运行则启动（requestAnimationFrame → ~60fps）
+       ↓
+Canvas 渲染: 每帧调用 renderInteractiveScene()
+       ↓
+动画停止条件: animationState 无未完成动画时返回 undefined
+```
+
+**关键理解**:
+1. **网络频率 ≠ 渲染频率**: 网络 30fps 上报，但 Canvas 以 60fps 渲染（如果有动画）
+2. **动画常驻**: 只要有协作指针，`rendererParams.current` 就会更新，但动画是否持续运行取决于 `animationState`
+3. **无动画时**: 如果 `bindingHighlight` 等动画完成，动画会停止，直到下一次状态更新
+
+---
+
+## 五、远端 Presence 数据接入本地提示组件（UserList）
+
+### 5.1 数据接收与更新
 
 **文件**: `excalidraw-app/collab/Collab.tsx:610-626`
 
@@ -91,7 +297,7 @@ case WS_SUBTYPES.MOUSE_LOCATION: {
 }
 ```
 
-### 3.2 updateCollaborator 核心逻辑
+### 5.2 updateCollaborator 核心逻辑
 
 **文件**: `excalidraw-app/collab/Collab.tsx:884-900`
 
@@ -111,7 +317,7 @@ updateCollaborator = (socketId: SocketId, updates: Partial<Collaborator>) => {
 };
 ```
 
-### 3.3 App.updateScene 接收
+### 5.3 App.updateScene 接收
 
 **文件**: `packages/excalidraw/components/App.tsx:4573-4621`
 
@@ -131,7 +337,7 @@ public updateScene = withBatchedUpdates(
 );
 ```
 
-### 3.4 UserList 组件接入
+### 5.4 UserList 组件接入
 
 **文件**: `packages/excalidraw/components/LayerUI.tsx:404-408`
 
@@ -162,9 +368,9 @@ UserList 组件关键处理：
 
 ---
 
-## 四、光标渲染机制
+## 六、光标渲染机制
 
-### 4.1 InteractiveCanvas 数据转换层
+### 6.1 InteractiveCanvas 数据转换层
 
 **文件**: `packages/excalidraw/components/canvases/InteractiveCanvas.tsx:96-136`
 
@@ -172,7 +378,7 @@ UserList 组件关键处理：
 
 ```typescript
 useEffect(() => {
-  // 初始化 4 个 Map
+  // 初始化 5 个 Map
   const remotePointerButton = new Map();
   const remotePointerViewportCoords = new Map();
   const remoteSelectedElementIds = new Map();
@@ -234,9 +440,9 @@ useEffect(() => {
 
 > **关键点**:
 > - `sceneCoordsToViewportCoords` 进行坐标转换，考虑 `scrollX/scrollY/zoom`
-> - 这 5 个 Map 是 `InteractiveCanvasRenderConfig` 的一部分，定义在 `scene/types.ts:61-74`
+> - 这 5 个 Map 是 `InteractiveCanvasRenderConfig` 的一部分
 
-### 4.2 渲染配置类型定义
+### 6.2 渲染配置类型定义
 
 **文件**: `packages/excalidraw/scene/types.ts:61-74`
 
@@ -253,7 +459,7 @@ export type InteractiveCanvasRenderConfig = {
 };
 ```
 
-### 4.3 renderRemoteCursors 核心渲染
+### 6.3 renderRemoteCursors 核心渲染（状态判断详解）
 
 **文件**: `packages/excalidraw/clients.ts:57-261`
 
@@ -272,50 +478,94 @@ export const renderRemoteCursors = ({
     x -= appState.offsetLeft;
     y -= appState.offsetTop;
     
-    // 3. 边界检测与裁剪
-    const isOutOfBounds = x < 0 || x > normalizedWidth - width || 
-                          y < 0 || y > normalizedHeight - height;
+    const width = 11;
+    const height = 14;
+    
+    // ═══════════════════════════════════════════════════════
+    // 状态判断 1: 边界检测
+    // ═══════════════════════════════════════════════════════
+    const isOutOfBounds =
+      x < 0 ||
+      x > normalizedWidth - width ||
+      y < 0 ||
+      y > normalizedHeight - height;
+    
+    // 边界裁剪：确保光标至少部分可见
     x = Math.max(x, 0);
     x = Math.min(x, normalizedWidth - width);
-    // ...
+    y = Math.max(y, 0);
+    y = Math.min(y, normalizedHeight - height);
     
-    // 4. 计算用户颜色（基于 socketId 哈希）
+    // 3. 计算用户颜色（基于 socketId 哈希）
     const background = getClientColor(socketId, collaborator);
     
-    // 5. 状态判断：是否不活跃（超出边界/IDLE/AWAY）
+    context.save();
+    context.strokeStyle = background;
+    context.fillStyle = background;
+    
+    // ═══════════════════════════════════════════════════════
+    // 状态判断 2: 不活跃状态（IDLE / AWAY / 超出边界）
+    // ═══════════════════════════════════════════════════════
     const userState = renderConfig.remotePointerUserStates.get(socketId);
-    const isInactive = isOutOfBounds ||
-                       userState === UserIdleState.IDLE ||
-                       userState === UserIdleState.AWAY;
+    const isInactive =
+      isOutOfBounds ||
+      userState === UserIdleState.IDLE ||
+      userState === UserIdleState.AWAY;
+    
     if (isInactive) {
       context.globalAlpha = 0.3;  // 半透明显示
     }
     
-    // 6. 按下状态：绘制环形指示
+    // ═══════════════════════════════════════════════════════
+    // 状态判断 3: 鼠标按下状态（拖拽/绘制中）
+    // ═══════════════════════════════════════════════════════
     if (renderConfig.remotePointerButton.get(socketId) === "down") {
+      // 绘制双层环形指示
       context.beginPath();
       context.arc(x, y, 15, 0, 2 * Math.PI, false);
       context.lineWidth = 3;
-      context.strokeStyle = "#ffffff88";
+      context.strokeStyle = "#ffffff88";  // 外层白色半透明
       context.stroke();
-      // ...
+      context.closePath();
+      
+      context.beginPath();
+      context.arc(x, y, 15, 0, 2 * Math.PI, false);
+      context.lineWidth = 1;
+      context.strokeStyle = background;  // 内层用户颜色
+      context.stroke();
+      context.closePath();
     }
     
-    // 7. 说话状态：特殊绿色边框 + 声波图标
+    // 说话状态颜色
+    const IS_SPEAKING_COLOR =
+      appState.theme === THEME.DARK ? "#2f6330" : COLOR_VOICE_CALL;
+    
+    // ═══════════════════════════════════════════════════════
+    // 状态判断 4: 说话中（语音通话）
+    // ═══════════════════════════════════════════════════════
     const isSpeaking = collaborator?.isSpeaking;
+    
     if (isSpeaking) {
+      // 光标绿色外框（10px 粗）
       context.fillStyle = IS_SPEAKING_COLOR;
-      // 绘制光标外框
-      // 绘制三个竖条表示说话中
-      context.fillRect(boxX + boxWidth + margin, ..., 2, barheight);
-      context.fillRect(boxX + boxWidth + margin + gap, ..., 2, barheight * 2);
-      context.fillRect(boxX + boxWidth + margin + gap * 2, ..., 2, barheight);
+      context.strokeStyle = IS_SPEAKING_COLOR;
+      context.lineWidth = 10;
+      context.lineJoin = "round";
+      context.beginPath();
+      context.moveTo(x, y);
+      context.lineTo(x + 0, y + 14);
+      context.lineTo(x + 4, y + 9);
+      context.lineTo(x + 11, y + 8);
+      context.closePath();
+      context.stroke();
+      context.fill();
     }
     
-    // 8. 绘制箭头光标（三层：说话外框 → 白色描边 → 彩色填充）
-    // 白色描边层
+    // 白色描边层（6px 粗）- 确保光标在任何背景上可见
     context.fillStyle = COLOR_WHITE;
+    context.strokeStyle = COLOR_WHITE;
     context.lineWidth = 6;
+    context.lineJoin = "round";
     context.beginPath();
     context.moveTo(x, y);
     context.lineTo(x + 0, y + 14);
@@ -325,25 +575,115 @@ export const renderRemoteCursors = ({
     context.stroke();
     context.fill();
     
-    // 彩色填充层
+    // 用户颜色填充层（2px 描边）
     context.fillStyle = background;
+    context.strokeStyle = background;
     context.lineWidth = 2;
-    // ...
+    context.lineJoin = "round";
+    context.beginPath();
+    if (isInactive) {
+      // 不活跃时光标稍微偏移
+      context.moveTo(x - 1, y - 1);
+      context.lineTo(x - 1, y + 15);
+      context.lineTo(x + 5, y + 10);
+      context.lineTo(x + 12, y + 9);
+      context.closePath();
+      context.fill();
+    } else {
+      context.moveTo(x, y);
+      context.lineTo(x + 0, y + 14);
+      context.lineTo(x + 4, y + 9);
+      context.lineTo(x + 11, y + 8);
+      context.closePath();
+      context.fill();
+      context.stroke();
+    }
     
-    // 9. 绘制用户名标签
+    // ═══════════════════════════════════════════════════════
+    // 用户名标签渲染
+    // ═══════════════════════════════════════════════════════
     const username = renderConfig.remotePointerUsernames.get(socketId) || "";
+    
+    // 只有在边界内且有用户名时才显示标签
     if (!isOutOfBounds && username) {
       context.font = "600 12px sans-serif";
-      // 绘制圆角背景框
-      roundRect(context, boxX, boxY, boxWidth, boxHeight, 8, COLOR_WHITE);
+      
+      // 说话中时标签位置稍微偏移
+      const offsetX = (isSpeaking ? x + 0 : x) + width / 2;
+      const offsetY = (isSpeaking ? y + 0 : y) + height + 2;
+      const paddingHorizontal = 5;
+      const paddingVertical = 3;
+      
+      const measure = context.measureText(username);
+      const measureHeight =
+        measure.actualBoundingBoxDescent + measure.actualBoundingBoxAscent;
+      const finalHeight = Math.max(measureHeight, 12);
+      
+      const boxX = offsetX - 1;
+      const boxY = offsetY - 1;
+      const boxWidth = measure.width + 2 + paddingHorizontal * 2 + 2;
+      const boxHeight = finalHeight + 2 + paddingVertical * 2 + 2;
+      
+      // 绘制标签背景框
+      if (context.roundRect) {
+        context.beginPath();
+        context.roundRect(boxX, boxY, boxWidth, boxHeight, 8);
+        context.fillStyle = background;
+        context.fill();
+        context.strokeStyle = COLOR_WHITE;
+        context.stroke();
+        
+        // 说话中：额外绿色边框
+        if (isSpeaking) {
+          context.beginPath();
+          context.roundRect(boxX - 2, boxY - 2, boxWidth + 4, boxHeight + 4, 8);
+          context.strokeStyle = IS_SPEAKING_COLOR;
+          context.stroke();
+        }
+      }
+      
       context.fillStyle = COLOR_CHARCOAL_BLACK;
-      context.fillText(username, offsetX + paddingHorizontal + 1, ...);
+      context.fillText(
+        username,
+        offsetX + paddingHorizontal + 1,
+        offsetY + paddingVertical + measure.actualBoundingBoxAscent + ...,
+      );
+      
+      // ═══════════════════════════════════════════════════════
+      // 说话中：绘制声波图标（三个竖条）
+      // ═══════════════════════════════════════════════════════
+      if (isSpeaking) {
+        context.fillStyle = IS_SPEAKING_COLOR;
+        const barheight = 8;
+        const margin = 8;
+        const gap = 5;
+        // 左条（短）
+        context.fillRect(boxX + boxWidth + margin, boxY + (boxHeight / 2 - barheight / 2), 2, barheight);
+        // 中条（长）- 表示音量最大
+        context.fillRect(boxX + boxWidth + margin + gap, boxY + (boxHeight / 2 - barheight), 2, barheight * 2);
+        // 右条（短）
+        context.fillRect(boxX + boxWidth + margin + gap * 2, boxY + (boxHeight / 2 - barheight / 2), 2, barheight);
+      }
     }
+    
+    context.restore();
+    context.closePath();
   }
 };
 ```
 
-### 4.4 颜色生成算法
+### 6.4 状态判断汇总与视觉效果
+
+| 状态 | 判断条件 | 视觉效果 |
+|------|----------|----------|
+| **正常活跃** | `!isInactive && !isSpeaking && button !== "down"` | 标准箭头光标 + 用户名标签 |
+| **不活跃** | `isOutOfBounds` 或 `userState === IDLE/AWAY` | `globalAlpha = 0.3` 半透明，光标微偏移 |
+| **按下中** | `button === "down"` | 光标周围绘制双层环形（白色+用户色） |
+| **说话中** | `isSpeaking === true` | 1. 光标 10px 绿色外框<br>2. 用户名标签绿色外框<br>3. 标签右侧声波图标（三竖条） |
+
+> **状态叠加**: 多种状态可以同时生效（例如说话中 + 按下中 + 不活跃），视觉效果是叠加的。
+
+### 6.5 颜色生成算法
 
 **文件**: `packages/excalidraw/clients.ts:30-44`
 
@@ -361,39 +701,9 @@ export const getClientColor = (socketId: SocketId, collaborator: Collaborator | 
 
 ---
 
-## 五、容易看漏的关键点
+## 七、本地上报流程（发送方）
 
-### 5.1 数据转换层
-
-`InteractiveCanvas.tsx` 的 `useEffect` 是最容易被忽略的关键层：
-- 它不是直接使用 `appState.collaborators`
-- 而是将其拆分为 5 个独立的 Map，结构更适合渲染
-- 这里完成了 `场景坐标 → 视口坐标` 的转换
-
-### 5.2 过滤机制
-
-- `user.pointer.renderCursor === false` 时跳过光标渲染（只渲染激光轨迹）
-- 超出画布边界时 `isOutOfBounds = true`，用户名标签不显示
-
-### 5.3 渲染时机
-
-- `InteractiveCanvas` 是 `React.memo` 组件，通过 `areEqual` 函数比较
-- 关键比较项包含 `collaborators`（在 `getRelevantAppStateProps` 中）
-- 动画由 `AnimationController` 驱动，每帧调用 `renderInteractiveScene`
-
-### 5.4 状态优先级
-
-```
-isSpeaking (说话中) > button === "down" (按下中) > isInactive (不活跃)
-```
-
-不同状态会叠加不同的视觉效果。
-
----
-
-## 六、本地上报流程（发送方）
-
-### 6.1 指针移动节流上报
+### 7.1 指针移动节流上报
 
 **文件**: `excalidraw-app/collab/Collab.tsx:914-925`
 
@@ -404,33 +714,88 @@ onPointerUpdate = throttle(
     button: "up" | "down";
     pointersMap: Gesture["pointers"];
   }) => {
+    // 单指操作时才上报（避免手势操作产生大量消息）
     payload.pointersMap.size < 2 &&
       this.portal.socket &&
       this.portal.broadcastMouseLocation(payload);
   },
-  CURSOR_SYNC_TIMEOUT,  // 默认 50ms
+  CURSOR_SYNC_TIMEOUT,  // 33ms = ~30fps
 );
 ```
 
-### 6.2 节流时间常量
+### 7.2 空闲状态检测流程
 
-**文件**: `excalidraw-app/app_constants.ts`
+**文件**: `excalidraw-app/collab/Collab.tsx:810-850`
 
 ```typescript
-export const CURSOR_SYNC_TIMEOUT = 50;  // 50ms = 20fps
+onUserActivity = () => {
+  // 清除空闲计时器
+  if (this.idleTimeoutId) {
+    window.clearTimeout(this.idleTimeoutId);
+    this.idleTimeoutId = null;
+  }
+
+  // 60秒后进入 IDLE 状态
+  this.idleTimeoutId = window.setTimeout(this.reportIdle, IDLE_THRESHOLD);
+
+  // 如果活跃定时器没启动，则启动（每3秒上报一次活跃）
+  if (!this.activeIntervalId) {
+    this.activeIntervalId = window.setInterval(
+      this.reportActive,
+      ACTIVE_THRESHOLD,
+    );
+  }
+};
 ```
 
 ---
 
-## 七、总结
+## 八、容易看漏的关键点
 
-| 层级 | 模块 | 职责 |
-|------|------|------|
-| 网络层 | `Collab.tsx` | 接收 WebSocket 消息，维护 `collaborators` Map |
-| 状态层 | `App.tsx` | `appState.collaborators` 作为唯一数据源 |
-| UI 层 | `UserList.tsx` | 显示在线用户头像，点击发起跟随 |
-| 转换层 | `InteractiveCanvas.tsx` | **关键**：拆分为 5 个渲染专用 Map + 坐标转换 |
-| 渲染层 | `renderRemoteCursors()` | Canvas 2D 绘制光标、用户名、状态指示 |
-| 工具层 | `getClientColor()` | 生成用户专属颜色 |
+### 8.1 数据转换层
 
-> **最容易看漏**: `InteractiveCanvas.tsx` 中的 `useEffect` 转换层，它是连接 `appState.collaborators` 和 Canvas 渲染的桥梁。
+`InteractiveCanvas.tsx` 的 `useEffect` 是最容易被忽略的关键层：
+- 它不是直接使用 `appState.collaborators`
+- 而是将其拆分为 5 个独立的 Map，结构更适合渲染
+- 这里完成了 `场景坐标 → 视口坐标` 的转换
+- **这个 useEffect 没有依赖数组**，每次组件渲染都会执行
+
+### 8.2 过滤机制
+
+- `user.pointer.renderCursor === false` 时跳过光标渲染（只渲染激光轨迹）
+- 超出画布边界时 `isOutOfBounds = true`，用户名标签不显示
+- 多指触控时 `pointersMap.size >= 2`，不上报指针位置
+
+### 8.3 渲染节奏
+
+- **网络上报**: 33ms 节流（~30fps）
+- **Canvas 渲染**: requestAnimationFrame 驱动（~60fps，React 18+）
+- **动画启停**: 取决于 `animationState` 是否有未完成动画
+- **React.memo**: `collaborators` 是比较字段之一，变化就会重渲染
+
+### 8.4 状态优先级
+
+```
+isSpeaking (说话中) > button === "down" (按下中) > isInactive (不活跃)
+```
+
+不同状态会叠加不同的视觉效果。
+
+---
+
+## 九、总结
+
+| 层级 | 模块 | 职责 | 关键数值 |
+|------|------|------|----------|
+| 网络层 | `Collab.tsx` | 接收 WebSocket 消息，维护 `collaborators` Map | CURSOR_SYNC_TIMEOUT = 33ms |
+| 状态层 | `App.tsx` | `appState.collaborators` 作为唯一数据源 | IDLE_THRESHOLD = 60s |
+| UI 层 | `UserList.tsx` | 显示在线用户头像，点击发起跟随 | ACTIVE_THRESHOLD = 3s |
+| 转换层 | `InteractiveCanvas.tsx` | **关键**：拆分为 5 个渲染专用 Map + 坐标转换 | useEffect 无依赖 |
+| 动画层 | `AnimationController` | 驱动渲染循环 | requestAnimationFrame (~60fps) |
+| 渲染层 | `renderRemoteCursors()` | Canvas 2D 绘制光标、用户名、状态指示 | 4 种状态叠加 |
+| 工具层 | `getClientColor()` | 生成用户专属颜色 | 37 种色相值 |
+
+> **最容易看漏的三点**:
+> 1. `InteractiveCanvas.tsx` 中的 `useEffect` 转换层（无依赖数组）
+> 2. `CURSOR_SYNC_TIMEOUT` 实际是 33ms（~30fps），不是 50ms
+> 3. 渲染由 `AnimationController` 驱动，帧率取决于 React 版本和浏览器刷新率
