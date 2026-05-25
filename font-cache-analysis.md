@@ -248,7 +248,7 @@ const testLineWidth = isSingleCharacter(token)
 
 **⚠️ emoji 缓存路径再次校正**：
 
-**emoji 分两类走不同路径**，取决于码位是否在 BMP（基本多语言平面，码位 < 0x10000）内：
+**emoji 走缓存与否不由 BMP 维度决定，而是取决于 token 是否为单码元字符（不含任何变体选择符或序列修饰符）**
 
 **`isSingleCharacter` 实现**（`textWrapping.ts:724-729`）：
 ```typescript
@@ -260,58 +260,91 @@ const isSingleCharacter = (maybeSingleCharacter: string) => {
 };
 ```
 
-**关键判定**：`codePointAt(1) === undefined` 即字符串是否只有一个 UTF-16 码元
+**关键判定**：`codePointAt(1) === undefined` — 即 token 是否只有一个 UTF-16 码元
 
 ---
 
-#### BMP emoji（码位 < 0x10000）→ 走缓存路径
+#### 走缓存的准确边界条件
 
-BMP emoji 的码位在 0x0000-0xFFFF 范围内，UTF-16 用单个码元表示：
+**必要且充分条件**：
+1. token 只有一个 UTF-16 码元（`length === 1`）
+2. 该码元是一个完整的 Unicode 字符（不是代理对的高代理项）
 
-| 字符 | 码位 | UTF-16 码元 | `codePointAt(0)` | `codePointAt(1)` | `isSingleCharacter` |
-|------|------|------------|-----------------|-----------------|--------------------|
-| '©' | U+00A9 | 1 个码元 | 0xA9 | undefined | true |
-| '®' | U+00AE | 1 个码元 | 0xAE | undefined | true |
-| '™' | U+2122 | 1 个码元 | 0x2122 | undefined | true |
-| '☺' | U+263A | 1 个码元 | 0x263A | undefined | true |
-| '☀' | U+2600 | 1 个码元 | 0x2600 | undefined | true |
-| '⚡' | U+26A1 | 1 个码元 | 0x26A1 | undefined | true |
-| '⛪' | U+26EA | 1 个码元 | 0x26EA | undefined | true |
-
-**BMP emoji 范围**：
-- U+00A9, U+00AE（版权/商标符号）
-- U+203C, U+2049（标点符号）
-- U+2122, U+2139（商标/信息）
-- U+23CF（弹出符号）
-- U+2600-U+26FF（杂项符号，约 120+ 个 emoji）
-- U+2700-U+27BF（装饰符号）
-- U+2B00-U+2BFF（箭头符号）
-- U+2934, U+2935（箭头）
-- U+3030, U+303D（CJK 符号）
-- U+3297, U+3299（日文符号）
-
-**实际验证结果**：测试 123 个 BMP emoji，**全部返回 `true`，全部走缓存路径**
+```
+isSingleCharacter(token) == true
+    ↓
+codePointAt(0) !== undefined && codePointAt(1) === undefined
+    ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 走缓存（单码元字符）                                         │
+├─────────────────────────────────────────────────────────────┤
+│ • 单码元 ASCII：A, 1, 空格                                   │
+│ • BMP CJK：中、日、韩                                        │
+│ • 单码元 BMP emoji（不含 VS16）：©, ®, ☺, ⚡, ⛪, ☕, ✌       │
+│ • BMP 符号：€, £, ¥                                          │
+│ • 单码元空白符：\t, \n                                        │
+└─────────────────────────────────────────────────────────────┘
+```
 
 ---
 
-#### 非 BMP emoji（码位 ≥ 0x10000）→ 不走缓存路径
+#### 不走缓存的准确边界条件
 
-非 BMP emoji 的码位超出 BMP 范围，UTF-16 用代理对（两个码元）表示：
+**任一满足即不走缓存**：
 
-| 字符 | 码位 | UTF-16 码元 | `codePointAt(0)` | `codePointAt(1)` | `isSingleCharacter` |
-|------|------|------------|-----------------|-----------------|--------------------|
-| '😀' | U+1F600 | 代理对（2码元） | 0x1F600 | 0xDE00（低代理项） | false |
-| '🌍' | U+1F30D | 代理对（2码元） | 0x1F30D | 0xDF0D（低代理项） | false |
-| '👍' | U+1F44D | 代理对（2码元） | 0x1F44D | 0xDC4D（低代理项） | false |
-| '👨‍👩‍👧‍👦' | ZWJ 序列 | 11 码元 | 0x1F468 | 0xDC68（低代理项） | false |
-| '👩🏽‍🦰' | 修饰符序列 | 7 码元 | 0x1F469 | 0xDC69（低代理项） | false |
-| '🇨🇳' | 国旗序列 | 4 码元 | 0x1F1E8 | 0xDDE8（低代理项） | false |
+```
+isSingleCharacter(token) == false
+    ↓
+codePointAt(1) !== undefined
+    ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 不走缓存（多码元 token）                                     │
+├─────────────────────────────────────────────────────────────┤
+│ 1. 含 VS16（U+FE0F）变体选择符的序列：                        │
+│    ☺️ (U+263A U+FE0F), ⚡️ (U+26A1 U+FE0F), ❤️ (U+2764 U+FE0F)│
+│    → 即使基础字符是 BMP，加 VS16 后变成 2 码元序列            │
+│                                                             │
+│ 2. 非 BMP emoji（码位 ≥ 0x10000，代理对）：                   │
+│    😀 (U+1F600), 🌍 (U+1F30D), 👍 (U+1F44D)                  │
+│    → UTF-16 代理对，2 码元                                   │
+│                                                             │
+│ 3. ZWJ 序列（U+200D 连接）：                                  │
+│    👨‍👩‍👧‍👦 (U+1F468 U+200D U+1F469 U+200D U+1F467 U+200D U+1F466)│
+│    → 11 码元                                                │
+│                                                             │
+│ 4. Skin Tone 修饰符序列（U+1F3FB-U+1F3FF）：                  │
+│    👋🏻 (U+1F44B U+1F3FB), 👋🏽 (U+1F44B U+1F3FD)              │
+│    → 4 码元                                                 │
+│                                                             │
+│ 5. Keycap 序列（U+FE0F + U+20E3）：                           │
+│    1️⃣ (U+0031 U+FE0F U+20E3), #️⃣ (U+0023 U+FE0F U+20E3)    │
+│    → 3 码元                                                 │
+│                                                             │
+│ 6. Tag 序列（U+E0000-U+E007F）：                              │
+│    🏴 (U+1F3F4 U+E0067 U+E0062 U+E0065 U+E006E U+E0074 U+E007F)│
+│    → 14 码元                                                │
+│                                                             │
+│ 7. 多字符 token："Hello", "World"                             │
+└─────────────────────────────────────────────────────────────┘
+```
 
-**非 BMP emoji 范围**：
-- U+1F000-U+1FFFF（大部分常见 emoji）
-- 所有 ZWJ 序列、肤色修饰符序列、国旗序列
+---
 
-**实际验证结果**：测试 6 个非 BMP emoji，**全部返回 `false`，全部不走缓存路径**
+#### BMP emoji 的双重身份
+
+**BMP emoji 不是统一走缓存的，取决于是否携带 VS16**：
+
+| 字符 | 组成 | `length` | `codePointAt(1)` | `isSingleCharacter` | 缓存路径 |
+|------|------|----------|-----------------|--------------------|----------|
+| '☺' | U+263A | 1 | undefined | true | 走缓存 ✓ |
+| '☺️' | U+263A + U+FE0F | 2 | 0xFE0F | false | 不走缓存 ✗ |
+| '⚡' | U+26A1 | 1 | undefined | true | 走缓存 ✓ |
+| '⚡️' | U+26A1 + U+FE0F | 2 | 0xFE0F | false | 不走缓存 ✗ |
+| '☕' | U+2615 | 1 | undefined | true | 走缓存 ✓ |
+| '☕️' | U+2615 + U+FE0F | 2 | 0xFE0F | false | 不走缓存 ✗ |
+| '❤️' | U+2764 + U+FE0F | 2 | 0xFE0F | false | 不走缓存 ✗ |
+
+**关键**：同一个 BMP emoji，用户输入时是否包含 VS16 变体选择符，决定了它走不走缓存路径。
 
 ---
 
@@ -322,19 +355,20 @@ token 类型判断
     ↓
 isSingleCharacter(token) = codePointAt(0) !== undefined && codePointAt(1) === undefined
     ↓
-┌─────────────────────────────┬──────────────────────────────────┐
-│ 返回 true（走缓存）          │ 返回 false（走直接测量）          │
-├─────────────────────────────┼──────────────────────────────────┤
-│ 单码元 ASCII：A, 1, 空格    │ 非 BMP emoji：😀, 🌍, 👍        │
-│ BMP CJK：中、日、韩         │ ZWJ 序列：👨‍👩‍👧‍👦              │
-│ BMP emoji：©, ®, ☺, ⚡, ⛪  │ 肤色修饰：👩🏽‍🦰                  │
-│ BMP 符号：€, £, ¥          │ 国旗序列：🇨🇳                    │
-│ 单码元空白符：\t, \n         │ 多字符 token："Hello", "World"   │
-│                             │ 所有超出 BMP 的字符（码位≥0x10000）│
-└─────────────────────────────┴──────────────────────────────────┘
+┌──────────────────────────────────┬──────────────────────────────────┐
+│ 返回 true（走缓存）               │ 返回 false（走直接测量）          │
+├──────────────────────────────────┼──────────────────────────────────┤
+│ 单码元 ASCII：A, 1, 空格         │ BMP emoji + VS16：☺️, ⚡️, ❤️    │
+│ BMP CJK：中、日、韩              │ 非 BMP emoji：😀, 🌍, 👍          │
+│ 单码元 BMP emoji（无 VS16）：     │ ZWJ 序列：👨‍👩‍👧‍👦                │
+│   ©, ®, ☺, ⚡, ⛪, ☕             │ 肤色修饰：👩🏽‍🦰                  │
+│ BMP 符号：€, £, ¥               │ Keycap：1️⃣, #️⃣                  │
+│ 单码元空白符：\t, \n              │ Tag 序列：🏴                      │
+│                                  │ 多字符 token："Hello", "World"    │
+└──────────────────────────────────┴──────────────────────────────────┘
 ```
 
-**结论**：`isSingleCharacter` 实际上等于 **"是否为单个 BMP 字符"**，而非注释中声称的 "single codepoint"。BMP emoji（约 120+ 个）会走缓存路径，非 BMP emoji 不会。
+**结论**：`isSingleCharacter` 实际上等于 **"token 是否为单码元字符"**，而非注释中声称的 "single codepoint"。BMP 不是分界线——BMP emoji 带 VS16 也不走缓存，关键是 token 是否只有一个 UTF-16 码元。
 
 ### 3.5 wrapWord 中的 emoji 特殊处理
 
@@ -364,11 +398,11 @@ const wrapWord = (word, font, maxWidth, wordStart) => {
 ```
 
 **关键逻辑**：
-- `getEmojiRegex()` 匹配的是多码位 emoji（非 BMP emoji、ZWJ 序列）
+- `getEmojiRegex()` 匹配的是多码元 emoji 序列（非 BMP emoji、ZWJ 序列、VS16 序列）
 - 匹配成功则整体保留，不进入逐字符循环，因此不会调用 `charWidth.calculate()`
-- **BMP emoji**（如 ©、®、☺、⚡）不会被 `getEmojiRegex()` 匹配
-- 因此 BMP emoji 会进入逐字符循环，调用 `charWidth.calculate()`，存入缓存
-- **非 BMP emoji** 被 `getEmojiRegex()` 匹配，整体保留，不进入缓存路径
+- **单码元 BMP emoji**（如 ©、®、☺、⚡，无 VS16）不会被 `getEmojiRegex()` 匹配
+- 因此单码元 BMP emoji 会进入逐字符循环，调用 `charWidth.calculate()`，存入缓存
+- **多码元 emoji 序列**（含 VS16、ZWJ、skin tone、keycap、tag）被 `getEmojiRegex()` 匹配，整体保留，不进入缓存路径
 
 ---
 
@@ -722,21 +756,25 @@ export type WrappedTextLine = {
 
 ### 6.5 emoji 测量场景（分类处理）
 
-**场景**：用户输入包含各类 emoji 的文本 "Hello © 😀 World ☺ ⛪ 👨‍👩‍👧‍👦"
+**场景**：用户输入包含各类 emoji 的文本 "Hello ©️ ☺ 😀 ☺️ ⚡ World ⛪ 👨‍👩‍👧‍👦"
 
-1. 分词后 tokens: ["Hello", " ", "©", " ", "😀", " ", "World", " ", "☺", " ", "⛪", " ", "👨‍👩‍👧‍👦"]
+1. 分词后 tokens: ["Hello", " ", "©️", " ", "☺", " ", "😀", " ", "☺️", " ", "⚡", " ", "World", " ", "⛪", " ", "👨‍👩‍👧‍👦"]
 2. 测量时：
    - "Hello" → 多字符，`isSingleCharacter` 返回 false → 调用 `getLineWidth()`
    - " " → 单码元空格，`isSingleCharacter` 返回 true → 走 `charWidth.calculate()`
-   - "©" → BMP emoji（U+00A9），`isSingleCharacter` 返回 true → 走 `charWidth.calculate()` ✓ 存入缓存
+   - "©️" → BMP emoji + VS16（U+00A9 U+FE0F），2 码元，`isSingleCharacter` 返回 false → 调用 `getLineWidth()`
+   - " " → 走缓存
+   - "☺" → 单码元 BMP emoji（U+263A），`isSingleCharacter` 返回 true → 走 `charWidth.calculate()` ✓ 存入缓存
    - " " → 走缓存
    - "😀" → 非 BMP emoji（U+1F600），代理对，`isSingleCharacter` 返回 false → 调用 `getLineWidth()`
    - " " → 走缓存
+   - "☺️" → BMP emoji + VS16（U+263A U+FE0F），2 码元，`isSingleCharacter` 返回 false → 调用 `getLineWidth()`
+   - " " → 走缓存
+   - "⚡" → 单码元 BMP emoji（U+26A1），`isSingleCharacter` 返回 true → 走 `charWidth.calculate()` ✓ 存入缓存
+   - " " → 走缓存
    - "World" → 多字符，调用 `getLineWidth()`
    - " " → 走缓存
-   - "☺" → BMP emoji（U+263A），`isSingleCharacter` 返回 true → 走 `charWidth.calculate()` ✓ 存入缓存
-   - " " → 走缓存
-   - "⛪" → BMP emoji（U+26EA），`isSingleCharacter` 返回 true → 走 `charWidth.calculate()` ✓ 存入缓存
+   - "⛪" → 单码元 BMP emoji（U+26EA），`isSingleCharacter` 返回 true → 走 `charWidth.calculate()` ✓ 存入缓存
    - " " → 走缓存
    - "👨‍👩‍👧‍👦" → ZWJ 序列，`isSingleCharacter` 返回 false → 调用 `getLineWidth()`
 
@@ -744,12 +782,17 @@ export type WrappedTextLine = {
    - `getEmojiRegex().test("👨‍👩‍👧‍👦")` 返回 true
    - 整体保留，不拆分，不调用 `charWidth.calculate()`
 
-4. 如果 "⛪"（BMP emoji）超过一行宽度进入 `wrapWord()`：
-   - `getEmojiRegex().test("⛪")` 返回 false（BMP emoji 不匹配）
+4. 如果 "☺️"（BMP emoji + VS16）超过一行宽度进入 `wrapWord()`：
+   - `getEmojiRegex().test("☺️")` 返回 true（VS16 序列被匹配）
+   - 整体保留，不拆分，不调用 `charWidth.calculate()`
+
+5. 如果 "⛪"（单码元 BMP emoji，无 VS16）超过一行宽度进入 `wrapWord()`：
+   - `getEmojiRegex().test("⛪")` 返回 false（单码元 BMP emoji 不匹配）
    - 进入逐字符循环，调用 `charWidth.calculate("⛪", font)` ✓ 存入缓存
 
 **关键**：
-- **BMP emoji**（©, ®, ☺, ⚡, ⛪ 等约 120+ 个）→ 走缓存路径
+- **单码元 BMP emoji（无 VS16）**（©, ®, ☺, ⚡, ⛪ 等）→ 走缓存路径
+- **BMP emoji + VS16**（©️, ☺️, ⚡️ 等）→ 不走缓存路径
 - **非 BMP emoji**（😀, 🌍, 👨‍👩‍👧‍👦 等）→ 不走缓存路径
 
 ### 6.6 NFD 输入场景（offset 错位）
@@ -893,7 +936,7 @@ const testLineWidth = isSingleCharacter(token)
 
 | 原错误理解 | 校正后事实 | 依据 |
 |------------|------------|------|
-| 所有 emoji 都不走缓存路径 | **BMP emoji（码位 < 0x10000）走缓存，非 BMP emoji 不走** | 测试 123 个 BMP emoji，`isSingleCharacter` 全部返回 `true` |
+| BMP emoji 统一走缓存路径 | **只有单码元 BMP emoji（无 VS16）走缓存；BMP emoji + VS16 不走缓存** | 测试 `☺`（length=1）走缓存，`☺️`（length=2）不走缓存 |
 | `charCodeAt(0)` 是 Unicode 码位 | `charCodeAt(0)` 是**第一个 UTF-16 码元**，仅 BMP 字符等于码位 | `'😀'.charCodeAt(0) = 55357` vs `codePointAt(0) = 128512` |
 | offset 统一基于归一化后文本 | **offset 语义分分支**：无需换行时基于原始文本，需换行时基于归一化文本 | 代码分支 `textWrapping.ts:464-469` 直接使用 `originalLine.length` |
 
@@ -905,13 +948,14 @@ const testLineWidth = isSingleCharacter(token)
 4. **异步触发**：字体加载是异步的，且有两条入口链路，缓存失效时机不直观
 5. **命名相似**：`loadedFontsCache` 和 `charWidth` 都是缓存，但层级和用途不同
 6. **两层索引**：`charWidth` 使用 FontString + UTF-16 首码元的两层结构，增加理解难度
-7. **注释与实现不符**：`isSingleCharacter` 注释说是 "single codepoint"，实际是 "single BMP codepoint"
+7. **注释与实现不符**：`isSingleCharacter` 注释说是 "single codepoint"，实际是 "single UTF-16 code unit"
 8. **隐藏前提**：NFC 归一化改变文本长度，offset 语义依赖输入为 NFC 形式
-9. **分支化语义**：`start`/`end` offset 语义不统一，取决于是否需要换行，增加心智负担大
+9. **分支化语义**：`start`/`end` offset 语义不统一，取决于是否需要换行
+10. **过度泛化陷阱**：以 BMP 维度概括 emoji 缓存路径会遗漏 VS16 变体选择符的影响
 
 理解这套机制的关键是抓住 **"字体加载 → 两条链路 → 缓存失效 → 重新测量"** 这条主线，以及区分：
 - **外层键**（FontString）vs **内层索引**（UTF-16 首码元）
-- **BMP 字符**（包括 BMP emoji）vs **非 BMP 字符**（包括非 BMP emoji）
-- **BMP emoji**（©, ®, ☺, ⚡, ⛪ 等，走缓存）vs **非 BMP emoji**（😀, 🌍, 👨‍👩‍👧‍👦 等，不走缓存）
+- **单码元字符**（走缓存）vs **多码元序列**（不走缓存）
+- **单码元 BMP emoji（无 VS16）**（©, ®, ☺, ⚡, ⛪ 等，走缓存）vs **含 VS16/ZWJ/修饰符的 emoji 序列**（☺️, 😀, 👨‍👩‍👧‍👦 等，不走缓存）
 - **主动加载**（速度快）vs **事件监听**（覆盖全）
 - **无需换行分支**（offset 基于原始文本）vs **需换行分支**（offset 基于归一化文本）
