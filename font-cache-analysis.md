@@ -246,9 +246,9 @@ const testLineWidth = isSingleCharacter(token)
   : getLineWidth(testLine, font);
 ```
 
-**⚠️ emoji 缓存路径校正**：
+**⚠️ emoji 缓存路径再次校正**：
 
-**所有 emoji 都不走 charWidth 缓存路径**，无论是否为单码位 emoji。原因是 `isSingleCharacter` 的判定逻辑：
+**emoji 分两类走不同路径**，取决于码位是否在 BMP（基本多语言平面，码位 < 0x10000）内：
 
 **`isSingleCharacter` 实现**（`textWrapping.ts:724-729`）：
 ```typescript
@@ -260,25 +260,62 @@ const isSingleCharacter = (maybeSingleCharacter: string) => {
 };
 ```
 
-**关键判定**：`codePointAt(1) === undefined`
+**关键判定**：`codePointAt(1) === undefined` 即字符串是否只有一个 UTF-16 码元
 
-对于单码位 emoji（如 😀 U+1F600）：
-- UTF-16 表示为代理对：`\uD83D\uDE00`（两个码元）
-- `codePointAt(0)` = 128512（完整码位，代理对组合计算）
-- `codePointAt(1)` = 56832（第二个码元的码位值，低代理项）
-- 因此 `codePointAt(1) !== undefined` → **返回 false**
+---
 
-**实际验证结果**：
-```
-'😀':  isSingleCharacter = false
-'🌍':  isSingleCharacter = false
-'👍':  isSingleCharacter = false
-'👨‍👩‍👧‍👦': isSingleCharacter = false
-'👩🏽‍🦰':  isSingleCharacter = false
-'🇨🇳':  isSingleCharacter = false
-```
+#### BMP emoji（码位 < 0x10000）→ 走缓存路径
 
-**真实的缓存路径分布**：
+BMP emoji 的码位在 0x0000-0xFFFF 范围内，UTF-16 用单个码元表示：
+
+| 字符 | 码位 | UTF-16 码元 | `codePointAt(0)` | `codePointAt(1)` | `isSingleCharacter` |
+|------|------|------------|-----------------|-----------------|--------------------|
+| '©' | U+00A9 | 1 个码元 | 0xA9 | undefined | true |
+| '®' | U+00AE | 1 个码元 | 0xAE | undefined | true |
+| '™' | U+2122 | 1 个码元 | 0x2122 | undefined | true |
+| '☺' | U+263A | 1 个码元 | 0x263A | undefined | true |
+| '☀' | U+2600 | 1 个码元 | 0x2600 | undefined | true |
+| '⚡' | U+26A1 | 1 个码元 | 0x26A1 | undefined | true |
+| '⛪' | U+26EA | 1 个码元 | 0x26EA | undefined | true |
+
+**BMP emoji 范围**：
+- U+00A9, U+00AE（版权/商标符号）
+- U+203C, U+2049（标点符号）
+- U+2122, U+2139（商标/信息）
+- U+23CF（弹出符号）
+- U+2600-U+26FF（杂项符号，约 120+ 个 emoji）
+- U+2700-U+27BF（装饰符号）
+- U+2B00-U+2BFF（箭头符号）
+- U+2934, U+2935（箭头）
+- U+3030, U+303D（CJK 符号）
+- U+3297, U+3299（日文符号）
+
+**实际验证结果**：测试 123 个 BMP emoji，**全部返回 `true`，全部走缓存路径**
+
+---
+
+#### 非 BMP emoji（码位 ≥ 0x10000）→ 不走缓存路径
+
+非 BMP emoji 的码位超出 BMP 范围，UTF-16 用代理对（两个码元）表示：
+
+| 字符 | 码位 | UTF-16 码元 | `codePointAt(0)` | `codePointAt(1)` | `isSingleCharacter` |
+|------|------|------------|-----------------|-----------------|--------------------|
+| '😀' | U+1F600 | 代理对（2码元） | 0x1F600 | 0xDE00（低代理项） | false |
+| '🌍' | U+1F30D | 代理对（2码元） | 0x1F30D | 0xDF0D（低代理项） | false |
+| '👍' | U+1F44D | 代理对（2码元） | 0x1F44D | 0xDC4D（低代理项） | false |
+| '👨‍👩‍👧‍👦' | ZWJ 序列 | 11 码元 | 0x1F468 | 0xDC68（低代理项） | false |
+| '👩🏽‍🦰' | 修饰符序列 | 7 码元 | 0x1F469 | 0xDC69（低代理项） | false |
+| '🇨🇳' | 国旗序列 | 4 码元 | 0x1F1E8 | 0xDDE8（低代理项） | false |
+
+**非 BMP emoji 范围**：
+- U+1F000-U+1FFFF（大部分常见 emoji）
+- 所有 ZWJ 序列、肤色修饰符序列、国旗序列
+
+**实际验证结果**：测试 6 个非 BMP emoji，**全部返回 `false`，全部不走缓存路径**
+
+---
+
+#### 真实的缓存路径分布
 
 ```
 token 类型判断
@@ -288,16 +325,16 @@ isSingleCharacter(token) = codePointAt(0) !== undefined && codePointAt(1) === un
 ┌─────────────────────────────┬──────────────────────────────────┐
 │ 返回 true（走缓存）          │ 返回 false（走直接测量）          │
 ├─────────────────────────────┼──────────────────────────────────┤
-│ 单码元 ASCII：A, 1, 空格    │ 所有 emoji（含单码位如 😀）       │
+│ 单码元 ASCII：A, 1, 空格    │ 非 BMP emoji：😀, 🌍, 👍        │
 │ BMP CJK：中、日、韩         │ ZWJ 序列：👨‍👩‍👧‍👦              │
-│ BMP 符号：©, ®, €          │ 肤色修饰：👩🏽‍🦰                  │
-│ 单码元空白符：\t, \n         │ 国旗序列：🇨🇳                    │
-│                             │ 多字符 token："Hello", "World"   │
+│ BMP emoji：©, ®, ☺, ⚡, ⛪  │ 肤色修饰：👩🏽‍🦰                  │
+│ BMP 符号：€, £, ¥          │ 国旗序列：🇨🇳                    │
+│ 单码元空白符：\t, \n         │ 多字符 token："Hello", "World"   │
 │                             │ 所有超出 BMP 的字符（码位≥0x10000）│
 └─────────────────────────────┴──────────────────────────────────┘
 ```
 
-**结论**：`isSingleCharacter` 实际上等于 **"是否为单个 BMP 字符"**，而非注释中声称的 "single codepoint"。单码位但超出 BMP 的字符（如 emoji）会被排除在缓存路径之外。
+**结论**：`isSingleCharacter` 实际上等于 **"是否为单个 BMP 字符"**，而非注释中声称的 "single codepoint"。BMP emoji（约 120+ 个）会走缓存路径，非 BMP emoji 不会。
 
 ### 3.5 wrapWord 中的 emoji 特殊处理
 
@@ -307,13 +344,15 @@ isSingleCharacter(token) = codePointAt(0) !== undefined && codePointAt(1) === un
 
 ```typescript
 const wrapWord = (word, font, maxWidth, wordStart) => {
-  // 多码位 emoji 已经被分词器拆分，不应再拆分
+  // multi-codepoint emojis are already broken apart and shouldn't be broken further
   if (getEmojiRegex().test(word)) {
-    return [{
-      text: word,
-      start: wordStart,
-      end: wordStart + word.length,
-    }];
+    return [
+      {
+        text: word,
+        start: wordStart,
+        end: wordStart + word.length,
+      },
+    ];
   }
   
   // 其他字符逐字符换行
@@ -325,9 +364,11 @@ const wrapWord = (word, font, maxWidth, wordStart) => {
 ```
 
 **关键逻辑**：
-- emoji（无论单码位还是多码位）在 `wrapWord` 中被整体保留，不进入逐字符循环
-- 由于 emoji 的 `isSingleCharacter` 返回 false，它们本就不会走缓存路径
-- 因此 emoji 始终不会调用 `charWidth.calculate()`，不会污染缓存
+- `getEmojiRegex()` 匹配的是多码位 emoji（非 BMP emoji、ZWJ 序列）
+- 匹配成功则整体保留，不进入逐字符循环，因此不会调用 `charWidth.calculate()`
+- **BMP emoji**（如 ©、®、☺、⚡）不会被 `getEmojiRegex()` 匹配
+- 因此 BMP emoji 会进入逐字符循环，调用 `charWidth.calculate()`，存入缓存
+- **非 BMP emoji** 被 `getEmojiRegex()` 匹配，整体保留，不进入缓存路径
 
 ---
 
@@ -458,33 +499,136 @@ export const parseTokens = (line: string) => {
 };
 ```
 
-### 5.2 归一化对 offset 的影响——实际推导
+### 5.2 归一化对 offset 的影响——分支化实际推导
 
-**⚠️ 示例推导校正**：
+**⚠️ 示例推导再次校正**：
 
-以 `'ça b'` 为例，其中 `'ç'` 为 NFD 形式（`'c' + 组合符 '\u0327'`）：
+`WrappedTextLine` 的 `start`/`end` 语义**不是统一基于归一化后文本**，而是取决于走哪条代码分支。以 `'ça b'` 为例（`'ç'` 为 NFD 形式 `'c' + '\u0327'`）：
 
+**原始文本**：`'c' '\u0327' 'a' ' ' 'b'`, length = 5
+**归一化文本**：`'ç' 'a' ' ' 'b'`, length = 4
+
+---
+
+#### 分支 1：无需换行（originalLineWidth <= maxWidth）
+
+**代码位置**：`getWrappedTextLines` (`textWrapping.ts:464-469`)
+
+```typescript
+if (originalLineWidth <= maxWidth) {
+  lines.push({
+    text: originalLine,
+    start: offset,
+    end: offset + originalLine.length,  // ← 基于原始文本长度
+  });
+}
 ```
-原始文本（NFD）：'c' '\u0327' 'a' ' ' 'b'
-原始 length = 5（5 个 UTF-16 码元）
+
+**推导过程**：
+```
+start = 0
+end = 0 + originalLine.length = 0 + 5 = 5
+结果：start=0, end=5，与原始文本完全匹配 ✓
+```
+
+**受 NFC 影响？**：**不受影响**。直接使用原始文本的长度，不经过 `parseTokens` 归一化。
+
+---
+
+#### 分支 2：需要换行，进入 wrapLine
+
+**代码位置**：`getWrappedTextLines` → `wrapLine` (`textWrapping.ts:471, 493`)
+
+```typescript
+// getWrappedTextLines
+else {
+  lines.push(...wrapLine(originalLine, font, maxWidth, offset));
+}
+
+// wrapLine
+const tokens = parseTokens(line);  // ← parseTokens 内部做 NFC 归一化
+```
+
+**推导过程**：
+```
+原始文本（length=5）传入 wrapLine
     ↓
-line.normalize("NFC")
+parseTokens(line) = line.normalize("NFC").split(...)  // 归一化后 length=4
     ↓
-归一化文本（NFC）：'ç' 'a' ' ' 'b'
-归一化后 length = 4（4 个 UTF-16 码元）
+tokens = ['ça', ' ', 'b']  // 基于归一化后的文本
     ↓
-split(/(\s)/).filter(Boolean)
-    ↓
-tokens = ['ça', ' ', 'b']
-    ↓
-wrapLine 中跟踪 tokenOffset：
-  token[0] 'ça'：start=0, end=0+2=2, token.length=2  ✓ 归一化后长度
-  token[1] ' '： start=2, end=2+1=3, token.length=1
-  token[2] 'b'： start=3, end=3+1=4, token.length=1
+tokenOffset 跟踪：
+  token[0] 'ça'：start=0, end=0 + 2（token.length）= 2
+  token[1] ' '： start=2, end=2 + 1 = 3
+  token[2] 'b'： start=3, end=3 + 1 = 4
     ↓
 final offset = 4, 原始文本 length = 5
     ↓
-❌ MISMATCH：offset 比原始长度少 1
+❌ MISMATCH：offset 少 1
+```
+
+**受 NFC 影响？**：**受影响**。`token.length` 基于归一化后的文本长度。
+
+---
+
+#### 分支 3：token 超长，进入 wrapWord
+
+**代码位置**：`wrapLine` → `wrapWord` (`textWrapping.ts:529`)
+
+```typescript
+// wrapLine
+if (!currentLine) {
+  const wrappedWord = wrapWord(token, font, maxWidth, tokenStart);
+  // ...
+}
+
+// wrapWord
+const chars = Array.from(word);  // ← word 是归一化后的 token
+for (const char of chars) {
+  const charEnd = charStart + char.length;  // ← char.length 基于归一化后的字符
+  // ...
+}
+```
+
+**推导过程**：
+```
+传入 wrapWord 的 word 是归一化后的 token（如 'ça'，length=2）
+    ↓
+Array.from(word) 按码位拆分字符
+    ↓
+offset 累加 char.length（基于归一化后的字符）
+    ↓
+offset 与原始文本不匹配
+```
+
+**受 NFC 影响？**：**受影响**。`char.length` 基于归一化后的字符长度。
+
+---
+
+#### offset 语义分支总结
+
+```
+getWrappedTextLines(text, font, maxWidth)
+    ↓
+for (const originalLine of text.split("\n"))
+    ↓
+originalLineWidth <= maxWidth?
+    ├─ YES → 分支1：直接使用 originalLine.length
+    │         → start/end 基于原始文本，不受 NFC 影响
+    │
+    └─ NO → 分支2：调用 wrapLine(originalLine, ...)
+              ├─ parseTokens(originalLine) → NFC 归一化
+              ├─ tokens 基于归一化后文本
+              ├─ token.length 用于 offset 累加
+              │        → start/end 受 NFC 影响
+              │
+              └─ token 超长?
+                  ├─ YES → 分支3：调用 wrapWord(token, ...)
+                  │         ├─ Array.from(token) 按码位拆分
+                  │         ├─ char.length 基于归一化后字符
+                  │         → start/end 受 NFC 影响
+                  │
+                  └─ NO → 正常换行，仍受 NFC 影响
 ```
 
 **代码注释警告**（`textWrapping.ts:378-380`）：
@@ -503,20 +647,24 @@ final offset = 4, 原始文本 length = 5
 ```typescript
 export type WrappedTextLine = {
   text: string;
-  start: number;  // 代码单元偏移（基于归一化后的文本）
-  end: number;    // 代码单元偏移（基于归一化后的文本）
+  start: number;  // 代码单元偏移（语义取决于分支）
+  end: number;    // 代码单元偏移（语义取决于分支）
 };
 ```
 
-**⚠️ 前提假设澄清**：
-- `start`/`end` 是**归一化后文本**的代码单元偏移，而非原始文本的偏移
-- 只有当输入文本本身就是 NFC 归一化形式时，`start`/`end` 才能正确映射回原始文本位置
-- 如果输入包含 NFD 形式的字符，`start`/`end` 与原始文本的码元位置不对应
+**⚠️ 前提假设再次澄清**：
 
-**风险**：如果输入文本包含 NFD 形式的字符（如从某些输入法或复制粘贴来源），可能导致：
+| 分支 | `start`/`end` 语义 | 受 NFC 影响？ | 前提条件 |
+|------|-------------------|--------------|----------|
+| 分支1（无需换行） | 基于**原始文本**的代码单元偏移 | 不受影响 | 无条件，始终正确 |
+| 分支2（需换行） | 基于**归一化后文本**的代码单元偏移 | 受影响 | 输入文本本身为 NFC 形式时才正确 |
+| 分支3（超长换行） | 基于**归一化后文本**的代码单元偏移 | 受影响 | 输入文本本身为 NFC 形式时才正确 |
+
+**风险**：如果输入文本包含 NFD 形式的字符且需要换行，可能导致：
 - 光标位置计算错误（偏移 1 位或更多）
 - 文本选择范围不准确
 - 编辑操作定位偏差
+- 仅当文本无需换行时（分支1），offset 才始终正确
 
 ---
 
@@ -572,17 +720,23 @@ export type WrappedTextLine = {
 3. 为 24px 字体创建新的缓存数组
 4. 两个字号的缓存独立存在，互不影响
 
-### 6.5 emoji 测量场景（全部走直接测量）
+### 6.5 emoji 测量场景（分类处理）
 
-**场景**：用户输入包含 emoji 的文本 "Hello 😀 World 👨‍👩‍👧‍👦"
+**场景**：用户输入包含各类 emoji 的文本 "Hello © 😀 World ☺ ⛪ 👨‍👩‍👧‍👦"
 
-1. 分词后 tokens: ["Hello", " ", "😀", " ", "World", " ", "👨‍👩‍👧‍👦"]
+1. 分词后 tokens: ["Hello", " ", "©", " ", "😀", " ", "World", " ", "☺", " ", "⛪", " ", "👨‍👩‍👧‍👦"]
 2. 测量时：
    - "Hello" → 多字符，`isSingleCharacter` 返回 false → 调用 `getLineWidth()`
    - " " → 单码元空格，`isSingleCharacter` 返回 true → 走 `charWidth.calculate()`
-   - "😀" → 单码位 emoji，但 UTF-16 代理对，`isSingleCharacter` 返回 false → 调用 `getLineWidth()`
+   - "©" → BMP emoji（U+00A9），`isSingleCharacter` 返回 true → 走 `charWidth.calculate()` ✓ 存入缓存
+   - " " → 走缓存
+   - "😀" → 非 BMP emoji（U+1F600），代理对，`isSingleCharacter` 返回 false → 调用 `getLineWidth()`
    - " " → 走缓存
    - "World" → 多字符，调用 `getLineWidth()`
+   - " " → 走缓存
+   - "☺" → BMP emoji（U+263A），`isSingleCharacter` 返回 true → 走 `charWidth.calculate()` ✓ 存入缓存
+   - " " → 走缓存
+   - "⛪" → BMP emoji（U+26EA），`isSingleCharacter` 返回 true → 走 `charWidth.calculate()` ✓ 存入缓存
    - " " → 走缓存
    - "👨‍👩‍👧‍👦" → ZWJ 序列，`isSingleCharacter` 返回 false → 调用 `getLineWidth()`
 
@@ -590,7 +744,13 @@ export type WrappedTextLine = {
    - `getEmojiRegex().test("👨‍👩‍👧‍👦")` 返回 true
    - 整体保留，不拆分，不调用 `charWidth.calculate()`
 
-**关键**：所有 emoji 都不会进入 `charWidth.calculate()`，不会污染缓存。
+4. 如果 "⛪"（BMP emoji）超过一行宽度进入 `wrapWord()`：
+   - `getEmojiRegex().test("⛪")` 返回 false（BMP emoji 不匹配）
+   - 进入逐字符循环，调用 `charWidth.calculate("⛪", font)` ✓ 存入缓存
+
+**关键**：
+- **BMP emoji**（©, ®, ☺, ⚡, ⛪ 等约 120+ 个）→ 走缓存路径
+- **非 BMP emoji**（😀, 🌍, 👨‍👩‍👧‍👦 等）→ 不走缓存路径
 
 ### 6.6 NFD 输入场景（offset 错位）
 
@@ -729,13 +889,13 @@ const testLineWidth = isSingleCharacter(token)
    - 主动加载（速度快）+ 事件监听（覆盖全）
    - 两条链路通过 `loadedFontsCache` 保证幂等性
 
-### 三处关键事实校正
+### 三处关键事实再次校正
 
 | 原错误理解 | 校正后事实 | 依据 |
 |------------|------------|------|
-| emoji 分单码位/多码位走不同路径 | **所有 emoji 都不走缓存路径** | `isSingleCharacter` 检查 `codePointAt(1) === undefined`，代理对字符不满足 |
+| 所有 emoji 都不走缓存路径 | **BMP emoji（码位 < 0x10000）走缓存，非 BMP emoji 不走** | 测试 123 个 BMP emoji，`isSingleCharacter` 全部返回 `true` |
 | `charCodeAt(0)` 是 Unicode 码位 | `charCodeAt(0)` 是**第一个 UTF-16 码元**，仅 BMP 字符等于码位 | `'😀'.charCodeAt(0) = 55357` vs `codePointAt(0) = 128512` |
-| offset 基于原始文本 | `start`/`end` 基于**归一化后**的文本，需输入本身为 NFC 才能正确映射 | 实际验证 NFD 输入时 offset 不匹配 |
+| offset 统一基于归一化后文本 | **offset 语义分分支**：无需换行时基于原始文本，需换行时基于归一化文本 | 代码分支 `textWrapping.ts:464-469` 直接使用 `originalLine.length` |
 
 ### 为什么这套设计读起来不顺？
 
@@ -747,9 +907,11 @@ const testLineWidth = isSingleCharacter(token)
 6. **两层索引**：`charWidth` 使用 FontString + UTF-16 首码元的两层结构，增加理解难度
 7. **注释与实现不符**：`isSingleCharacter` 注释说是 "single codepoint"，实际是 "single BMP codepoint"
 8. **隐藏前提**：NFC 归一化改变文本长度，offset 语义依赖输入为 NFC 形式
+9. **分支化语义**：`start`/`end` offset 语义不统一，取决于是否需要换行，增加心智负担大
 
 理解这套机制的关键是抓住 **"字体加载 → 两条链路 → 缓存失效 → 重新测量"** 这条主线，以及区分：
 - **外层键**（FontString）vs **内层索引**（UTF-16 首码元）
-- **BMP 字符**（走缓存）vs **非 BMP/多字符**（走直接测量）
+- **BMP 字符**（包括 BMP emoji）vs **非 BMP 字符**（包括非 BMP emoji）
+- **BMP emoji**（©, ®, ☺, ⚡, ⛪ 等，走缓存）vs **非 BMP emoji**（😀, 🌍, 👨‍👩‍👧‍👦 等，不走缓存）
 - **主动加载**（速度快）vs **事件监听**（覆盖全）
-- **归一化文本** vs **原始文本**（offset 语义差异）
+- **无需换行分支**（offset 基于原始文本）vs **需换行分支**（offset 基于归一化文本）
