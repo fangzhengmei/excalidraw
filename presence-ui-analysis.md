@@ -799,3 +799,612 @@ isSpeaking (说话中) > button === "down" (按下中) > isInactive (不活跃)
 > 1. `InteractiveCanvas.tsx` 中的 `useEffect` 转换层（无依赖数组）
 > 2. `CURSOR_SYNC_TIMEOUT` 实际是 33ms（~30fps），不是 50ms
 > 3. 渲染由 `AnimationController` 驱动，帧率取决于 React 版本和浏览器刷新率
+
+---
+
+## 十、房间成员变更到在线列表更新的完整链路
+
+### 10.1 服务端推送入口
+
+**文件**: `excalidraw-app/collab/Portal.tsx:56-58`
+
+```typescript
+this.socket.on("room-user-change", (clients: SocketId[]) => {
+  this.collab.setCollaborators(clients);
+});
+```
+
+当房间成员发生变化（有人加入/离开），服务端通过 Socket.IO 推送 `room-user-change` 事件，携带当前房间内所有 `SocketId[]`。
+
+### 10.2 setCollaborators 构建在线 Map
+
+**文件**: `excalidraw-app/collab/Collab.tsx:869-882`
+
+```typescript
+setCollaborators(sockets: SocketId[]) {
+  const collaborators: InstanceType<typeof Collab>["collaborators"] = new Map();
+  for (const socketId of sockets) {
+    collaborators.set(
+      socketId,
+      Object.assign({}, this.collaborators.get(socketId), {
+        isCurrentUser: socketId === this.portal.socket?.id,
+      }),
+    );
+  }
+  this.collaborators = collaborators;
+  this.excalidrawAPI.updateScene({ collaborators });
+}
+```
+
+> **容易混淆**: 这里不是增量更新，而是**全量重建** `collaborators` Map。但通过 `Object.assign({}, this.collaborators.get(socketId), ...)` 保留了已有用户的 `pointer`、`button`、`userState` 等字段。
+
+### 10.3 跟随模式的联动清理
+
+**文件**: `packages/excalidraw/components/App.tsx:3422-3424`
+
+```typescript
+const hasFollowedPersonLeft =
+  prevState.userToFollow &&
+  !this.state.collaborators.has(prevState.userToFollow.socketId);
+
+if (hasFollowedPersonLeft) {
+  this.maybeUnfollowRemoteUser();
+}
+```
+
+`componentDidUpdate` 中检测被跟随的用户是否离开，如果离开则自动取消跟随。
+
+### 10.4 UserList 在线列表渲染
+
+**文件**: `packages/excalidraw/components/UserList.tsx:50-82`
+
+```tsx
+export const UserList = ({ collaborators, userToFollow }) => {
+  const uniqueCollaborators = Array.from(collaborators.values()).filter(
+    (collaborator, index, self) => {
+      const firstIndex = self.findIndex(
+        (c) => c.id === collaborator.id || c.socketId === collaborator.socketId,
+      );
+      return firstIndex === index;
+    },
+  );
+
+  return (
+    <div className="excalidraw-user-list">
+      {uniqueCollaborators.map((collaborator) => {
+        const data = { collaborator, userToFollow };
+        return actionManager.renderAction("goToCollaborator", data);
+      })}
+    </div>
+  );
+};
+```
+
+### 10.5 完整链路图
+
+```
+服务端 room-user-change 事件 (SocketId[])
+      ↓
+Portal.socket.on("room-user-change")  [Portal.tsx:56]
+      ↓
+Collab.setCollaborators(clients)  [Collab.tsx:869]
+      │  ├─ 创建新 Map（全量重建）
+      │  ├─ 保留已有用户的 pointer/button/userState
+      │  └─ 标记 isCurrentUser
+      ↓
+excalidrawAPI.updateScene({ collaborators })
+      ↓
+App.setState({ collaborators })  [App.tsx:4617]
+      │
+      ├─────────────────────────────────────────┐
+      ↓                                         ↓
+App.componentDidUpdate                    LayerUI 渲染
+  ├─ 检查 followedPersonLeft?               ├─ userToFollow 存在?
+  └─ 离开则取消跟随                           └─ 渲染 FollowMode 组件
+                                                  │
+                                                  ↓
+                                            UserList 组件
+                                              ├─ 按 id/socketId 去重
+                                              └─ 渲染头像 + 用户名 + 状态
+```
+
+---
+
+## 十一、IDLE 状态消息到光标透明度变化的完整链路
+
+### 11.1 本地 IDLE 检测与上报
+
+**文件**: `excalidraw-app/collab/Collab.tsx:860-867`
+
+```typescript
+private reportIdle = () => {
+  this.onIdleStateChange(UserIdleState.IDLE);
+};
+
+private reportActive = () => {
+  this.onIdleStateChange(UserIdleState.ACTIVE);
+};
+```
+
+**空闲检测启动**（`Collab.tsx:810-850`）:
+
+```typescript
+onUserActivity = () => {
+  if (this.idleTimeoutId) {
+    window.clearTimeout(this.idleTimeoutId);
+    this.idleTimeoutId = null;
+  }
+  // 60秒后进入 IDLE
+  this.idleTimeoutId = window.setTimeout(this.reportIdle, IDLE_THRESHOLD);
+
+  if (!this.activeIntervalId) {
+    // 每3秒上报一次 ACTIVE（心跳）
+    this.activeIntervalId = window.setInterval(this.reportActive, ACTIVE_THRESHOLD);
+  }
+};
+```
+
+### 11.2 IDLE 消息通过 volatile 通道发送
+
+**文件**: `excalidraw-app/collab/Portal.tsx:185-199`
+
+```typescript
+broadcastIdleChange = (userState: UserIdleState) => {
+  if (this.socket?.id) {
+    const data: SocketUpdateDataSource["IDLE_STATUS"] = {
+      type: WS_SUBTYPES.IDLE_STATUS,
+      payload: {
+        socketId: this.socket.id as SocketId,
+        userState,
+        username: this.collab.state.username,
+      },
+    };
+    return this._broadcastSocketData(
+      data as SocketUpdateData,
+      true, // volatile — ⚠️ 这是 volatile 消息！
+    );
+  }
+};
+```
+
+### 11.3 远端接收 IDLE 状态
+
+**文件**: `excalidraw-app/collab/Collab.tsx:663-670`
+
+```typescript
+case WS_SUBTYPES.IDLE_STATUS: {
+  const { userState, socketId, username } = decryptedData.payload;
+  this.updateCollaborator(socketId, {
+    userState,
+    username,
+  });
+  break;
+}
+```
+
+### 11.4 updateCollaborator 更新 AppState
+
+**文件**: `excalidraw-app/collab/Collab.tsx:884-900`
+
+```typescript
+updateCollaborator = (socketId: SocketId, updates: Partial<Collaborator>) => {
+  const collaborators = new Map(this.collaborators);
+  const user: Mutable<Collaborator> = Object.assign(
+    {},
+    collaborators.get(socketId),
+    updates,  // { userState: "idle", username: "..." }
+    { isCurrentUser: socketId === this.portal.socket?.id },
+  );
+  collaborators.set(socketId, user);
+  this.collaborators = collaborators;
+  this.excalidrawAPI.updateScene({ collaborators });
+};
+```
+
+### 11.5 InteractiveCanvas 转换层提取 userState
+
+**文件**: `packages/excalidraw/components/canvases/InteractiveCanvas.tsx:120-121`
+
+```typescript
+if (user.userState) {
+  remotePointerUserStates.set(socketId, user.userState);
+}
+```
+
+### 11.6 renderRemoteCursors 应用透明度
+
+**文件**: `packages/excalidraw/clients.ts:209-215`
+
+```typescript
+const userState = renderConfig.remotePointerUserStates.get(socketId);
+const isInactive =
+  isOutOfBounds ||
+  userState === UserIdleState.IDLE ||    // ⬅️ IDLE 状态命中
+  userState === UserIdleState.AWAY;       // ⬅️ AWAY 状态也命中
+
+if (isInactive) {
+  context.globalAlpha = 0.3;  // 半透明显示
+}
+```
+
+### 11.7 完整链路图
+
+```
+本地: 60秒无操作
+      ↓
+Collab.reportIdle()  [Collab.tsx:860]
+      ↓
+Collab.onIdleStateChange(UserIdleState.IDLE)
+      ↓
+Portal.broadcastIdleChange(userState)  [Portal.tsx:185]
+      ↓
+_broadcastSocketData(data, volatile=true)  → WS_EVENTS.SERVER_VOLATILE
+      │
+      │  ⚠️ 注意：这是 volatile 消息，可能丢包！
+      │
+      ↓ (WebSocket 传输)
+远端: client-broadcast 事件
+      ↓
+Collab.handleSocketMessage()
+  └─ case WS_SUBTYPES.IDLE_STATUS  [Collab.tsx:663]
+      ↓
+Collab.updateCollaborator(socketId, { userState, username })
+      ↓
+excalidrawAPI.updateScene({ collaborators })
+      ↓
+App.setState({ collaborators })
+      ↓
+React 重渲染 → InteractiveCanvas.memo 比较 collaborators
+      ↓
+InteractiveCanvas.useEffect() 提取到 remotePointerUserStates
+      ↓
+AnimationController 驱动下一帧渲染
+      ↓
+renderRemoteCursors()
+  └─ isInactive = (userState === IDLE || AWAY)
+      └─ context.globalAlpha = 0.3  ← 光标半透明
+```
+
+---
+
+## 十二、Laser 轨迹与普通光标的分离渲染
+
+### 12.1 工具类型区分
+
+**文件**: `excalidraw-app/data/index.ts:95-104`
+
+```typescript
+MOUSE_LOCATION: {
+  type: WS_SUBTYPES.MOUSE_LOCATION;
+  payload: {
+    socketId: SocketId;
+    pointer: { x: number; y: number; tool: "pointer" | "laser" };  // ⬅️ 关键
+    button: "down" | "up";
+    selectedElementIds: AppState["selectedElementIds"];
+    username: string;
+  };
+};
+```
+
+### 12.2 LaserTrails：SVG 管线（独立于 Canvas）
+
+**文件**: `packages/excalidraw/laser-trails.ts:13-129`
+
+```typescript
+export class LaserTrails implements Trail {
+  public localTrail: AnimatedTrail;              // 本地激光轨迹
+  private collabTrails = new Map<SocketId, AnimatedTrail>();  // 远端激光轨迹
+  private container?: SVGSVGElement;              // SVG 容器
+
+  constructor(private animationFrameHandler: AnimationFrameHandler, private app: App) {
+    this.animationFrameHandler.register(this, this.onFrame.bind(this));
+    this.localTrail = new AnimatedTrail(animationFrameHandler, app, {
+      ...this.getTrailOptions(),
+      fill: () => DEFAULT_LASER_COLOR,
+    });
+  }
+```
+
+### 12.3 LaserTrails.updateCollabTrails 核心逻辑
+
+**文件**: `packages/excalidraw/laser-trails.ts:80-129`
+
+```typescript
+private updateCollabTrails() {
+  if (!this.container || this.app.state.collaborators.size === 0) {
+    return;
+  }
+
+  for (const [key, collaborator] of this.app.state.collaborators.entries()) {
+    let trail!: AnimatedTrail;
+
+    if (!this.collabTrails.has(key)) {
+      // 首次遇到该用户，创建 SVG 轨迹对象
+      trail = new AnimatedTrail(this.animationFrameHandler, this.app, {
+        ...this.getTrailOptions(),
+        fill: () =>
+          collaborator.pointer?.laserColor ||   // 优先使用远端指定颜色
+          getClientColor(key, collaborator),    // 否则使用哈希颜色
+      });
+      trail.start(this.container);
+      this.collabTrails.set(key, trail);
+    } else {
+      trail = this.collabTrails.get(key)!;
+    }
+
+    // 只在 laser 工具且按下时添加点
+    if (collaborator.pointer && collaborator.pointer.tool === "laser") {
+      if (collaborator.button === "down" && !trail.hasCurrentTrail) {
+        trail.startPath(collaborator.pointer.x, collaborator.pointer.y);
+      }
+      if (collaborator.button === "down" && trail.hasCurrentTrail &&
+          !trail.hasLastPoint(collaborator.pointer.x, collaborator.pointer.y)) {
+        trail.addPointToPath(collaborator.pointer.x, collaborator.pointer.y);
+      }
+      if (collaborator.button === "up" && trail.hasCurrentTrail) {
+        trail.addPointToPath(collaborator.pointer.x, collaborator.pointer.y);
+        trail.endPath();
+      }
+    }
+  }
+
+  // 清理已离开用户的轨迹
+  for (const key of this.collabTrails.keys()) {
+    if (!this.app.state.collaborators.has(key)) {
+      const trail = this.collabTrails.get(key)!;
+      trail.stop();
+      this.collabTrails.delete(key);
+    }
+  }
+}
+```
+
+### 12.4 Laser 轨迹衰减参数
+
+**文件**: `packages/excalidraw/laser-trails.ts:31-50`
+
+```typescript
+private getTrailOptions() {
+  return {
+    simplify: 0,
+    streamline: 0.4,
+    sizeMapping: (c) => {
+      const DECAY_TIME = 1000;   // 1秒内轨迹逐渐消失
+      const DECAY_LENGTH = 50;   // 轨迹最多保留50个点
+      const t = Math.max(0, 1 - (performance.now() - c.pressure) / DECAY_TIME);
+      const l = (DECAY_LENGTH - Math.min(DECAY_LENGTH, c.totalLength - c.currentIndex)) / DECAY_LENGTH;
+      return Math.min(easeOut(l), easeOut(t));
+    },
+  } as Partial<LaserPointerOptions>;
+}
+```
+
+> **关键**: 激光轨迹在 1 秒内会渐隐消失（`DECAY_TIME = 1000ms`），最多保留 50 个点。
+
+### 12.5 InteractiveCanvas 中 renderCursor 过滤
+
+**文件**: `packages/excalidraw/components/canvases/InteractiveCanvas.tsx:110-112`
+
+```typescript
+// 过滤：没有 pointer 或 renderCursor=false 则跳过光标渲染
+if (!user.pointer || user.pointer.renderCursor === false) {
+  return;
+}
+```
+
+> **分离渲染的关键**: 当 `tool === "laser"` 时，`renderCursor` 被设为 `false`，因此 Canvas 光标不会渲染，只有 SVG LaserTrails 会渲染轨迹。
+
+### 12.6 双管线架构对比
+
+| 特性 | 普通光标 (pointer) | 激光轨迹 (laser) |
+|------|---------------------|-------------------|
+| **渲染管线** | Canvas 2D (`renderRemoteCursors`) | SVG (`LaserTrails` → `AnimatedTrail`) |
+| **驱动方式** | `AnimationController` + `requestAnimationFrame` | `AnimationFrameHandler`（不同的动画控制器！） |
+| **坐标系统** | 视口坐标（已转换） | 场景坐标（直接使用） |
+| **渲染频率** | 60fps（由 AnimationController 控制） | 60fps（由 AnimationFrameHandler 控制） |
+| **可见性** | 始终可见（除非 IDLE/AWAY） | 按下时才绘制，松开后 1 秒内渐隐 |
+| **颜色来源** | `getClientColor()` 哈希 | `collaborator.pointer.laserColor` 或 `getClientColor()` |
+| **过滤条件** | `renderCursor !== false` | `pointer.tool === "laser"` |
+
+> **容易混淆**: 两者使用**不同的动画控制器**！Cursor 走 `AnimationController`（`animation.ts`），Laser 走 `AnimationFrameHandler`（`animation-frame-handler.ts`）。
+
+### 12.7 渲染来源对比图
+
+```
+appState.collaborators (Map<SocketId, Collaborator>)
+      │
+      ├─────────────────────────────────────────────┐
+      ↓                                             ↓
+InteractiveCanvas.useEffect()              LaserTrails.onFrame()
+  ├─ 遍历 collaborators                      ├─ 遍历 collaborators
+  ├─ 过滤: renderCursor === false?           ├─ 过滤: pointer.tool === "laser"?
+  ├─ 提取到 5 个渲染 Map                      ├─ button === "down" → 添加路径点
+  └─ 组装 renderConfig                        └─ button === "up" → 结束路径
+      ↓                                             ↓
+renderInteractiveScene()                 AnimatedTrail 绘制 SVG 路径
+  └─ renderRemoteCursors()                    └─ 1秒内渐隐消失
+      ↓                                             ↓
+Canvas 2D 绘制                            SVG 元素渲染
+  ├─ 箭头光标（3层叠加）
+  ├─ 用户名标签
+  └─ 状态指示（按下环/说话框）
+```
+
+---
+
+## 十三、Volatile 消息丢包对可见节奏的影响
+
+### 13.1 Volatile vs Non-Volatile 分发
+
+**文件**: `excalidraw-app/collab/Portal.tsx:85-101`
+
+```typescript
+async _broadcastSocketData(
+  data: SocketUpdateData,
+  volatile: boolean = false,
+  roomId?: string,
+) {
+  if (this.isOpen()) {
+    const json = JSON.stringify(data);
+    const encoded = new TextEncoder().encode(json);
+    const { encryptedBuffer, iv } = await encryptData(this.roomKey!, encoded);
+
+    this.socket?.emit(
+      volatile ? WS_EVENTS.SERVER_VOLATILE : WS_EVENTS.SERVER,  // ⬅️ 关键分发
+      roomId ?? this.roomId,
+      encryptedBuffer,
+      iv,
+    );
+  }
+}
+```
+
+### 13.2 各消息类型的 Volatile 属性
+
+| 消息类型 | Volatile? | 丢包影响 |
+|----------|-----------|----------|
+| `MOUSE_LOCATION` (指针位置) | ✅ **是** | 光标暂时冻结，下一帧恢复 |
+| `IDLE_STATUS` (空闲状态) | ✅ **是** | 状态短暂不一致，下次心跳修复 |
+| `USER_VISIBLE_SCENE_BOUNDS` (视口边界) | ✅ **是** | 跟随模式视口短暂不更新 |
+| `SCENE_INIT` (场景初始化) | ❌ **否** | 必须送达，否则无法加入协作 |
+| `SCENE_UPDATE` (元素更新) | ❌ **否** | 必须送达，否则画板不同步 |
+
+### 13.3 各 volatile 消息丢包的具体影响
+
+#### 13.3.1 MOUSE_LOCATION 丢包
+
+**场景**: 用户 A 移动光标，某一帧位置消息丢失
+
+```
+正常节奏:  [pos1] → [pos2] → [pos3] → [pos4] → ...  (每 33ms 一帧)
+丢包后:   [pos1] → [丢了] → [pos3] → [pos4] → ...
+                                                          ↑
+                                              A 的光标在 pos1 停留 33ms
+                                              然后跳到 pos3（用户感觉轻微卡顿）
+```
+
+**影响程度**: 低。每帧之间独立，丢一帧只会导致光标在旧位置多停留 33ms。
+
+**修复机制**: 下一帧自动修正。
+
+#### 13.3.2 IDLE_STATUS 丢包
+
+**场景**: 用户 A 进入 IDLE 状态，消息丢失
+
+```
+正常节奏:  A ACTIVE → [IDLE 消息] → 其他用户看到 A 光标半透明
+丢包后:   A ACTIVE → [IDLE 丢了] → 其他用户仍看到 A 光标正常明亮
+                                                              ↑
+                                              最多延迟 3 秒（下一次 ACTIVE 心跳后
+                                              A 重新确认 ACTIVE，但 IDLE 状态丢失）
+```
+
+**影响程度**: 中等。其他用户看到 A 的光标状态与实际不符，可能误导协作决策。
+
+**修复机制**: 依赖 `ACTIVE_THRESHOLD = 3000ms` 心跳，但心跳只上报 ACTIVE，IDLE 状态丢失后需要等到 A 再次活动才能恢复。
+
+#### 13.3.3 USER_VISIBLE_SCENE_BOUNDS 丢包
+
+**场景**: 用户 B 正在跟随用户 A，A 滚动视口，边界消息丢失
+
+```
+正常节奏:  A 滚动 → [bounds] → B 自动跟随滚动到新位置
+丢包后:   A 滚动 → [bounds 丢了] → B 视口停留在旧位置
+                                                    ↑
+                                          B 看到的内容与 A 不一致
+                                          直到下一次 bounds 消息（throttleRAF 限制频率）
+```
+
+**影响程度**: 中高。跟随模式下视口可能长时间不一致。
+
+**修复机制**: `throttleRAF`（requestAnimationFrame 节流）会在下一帧重新发送。
+
+### 13.4 为什么这些消息可以是 Volatile
+
+**设计考量**:
+
+1. **MOUSE_LOCATION**: 每帧独立，丢了下一帧自动修正，状态不累积
+2. **IDLE_STATUS**: 用户状态有心跳机制兜底，最坏情况是短暂显示错误
+3. **USER_VISIBLE_SCENE_BOUNDS**: 跟随模式下视口会持续刷新，丢一帧不致命
+
+**核心原则**:
+- **有状态累积的消息**（元素创建/删除）→ **Non-Volatile**，必须可靠送达
+- **瞬时状态消息**（位置/状态/视口）→ **Volatile**，允许丢包以换取带宽效率
+
+### 13.5 Volatile 消息对渲染节奏的整体影响
+
+```
+渲染帧率 (~60fps)
+    ↑
+    │  Canvas 每帧都在渲染
+    │  但 collaborators.pointer 只有收到新 MOUSE_LOCATION 才更新
+    │
+    │  ┌──── 33ms 节流窗口 ────┐
+    │  │                        │
+    │  │ 帧1: pointer 更新 ✓    │  帧2: pointer 未更新
+    │  │ 光标移动到新位置        │  光标停留在旧位置
+    │  │                        │
+    │  └────────────────────────┘
+    │
+    └────────────────────────────── 时间 →
+```
+
+**即使 MOUSE_LOCATION 以 30fps 发送**，Canvas 仍以 60fps 渲染，结果是：
+- 光标每 2 帧才移动一次（33ms/帧 × 2 = 66ms 两帧）
+- 在两帧之间光标位置不变（视觉上是 30fps 的光标）
+- 这是**正常的**，不是丢包
+
+**只有当连续多帧 MOUSE_LOCATION 都丢失**时，才会出现明显卡顿：
+- 连续丢 3 帧：光标停留 ~100ms（可感知的卡顿）
+- 连续丢 6 帧：光标停留 ~200ms（明显卡顿）
+
+### 13.6 完整的 Volatile 消息处理流程
+
+```
+发送端 (Portal.broadcastMouseLocation)
+      │
+      │  _broadcastSocketData(data, volatile=true)
+      │
+      ↓
+socket.emit("server-volatile-broadcast", roomId, encryptedBuffer, iv)
+      │
+      │  Socket.IO 的 volatile 标志:
+      │  - 若底层传输忙/缓冲区满 → 直接丢弃
+      │  - 不保证送达顺序
+      │  - 不重传
+      │
+      ↓ (WebSocket 传输)
+服务端: server-volatile-broadcast 事件
+      │  转发给房间内其他用户
+      │
+      ↓
+接收端: socket.on("client-broadcast", ...)
+      │  解密 → handleSocketMessage()
+      │
+      ↓
+Collab.handleSocketMessage()
+  └─ case WS_SUBTYPES.MOUSE_LOCATION
+      ↓
+updateCollaborator() → excalidrawAPI.updateScene()
+      ↓
+App.setState() → React 重渲染
+      │
+      ├─ UserList: 头像状态可能更新
+      └─ InteractiveCanvas: useEffect 提取新的 pointer
+          ↓
+      AnimationController 下一帧:
+          renderRemoteCursors() 绘制新位置
+```
+
+---
+
+## 十四、总结（完整链路速查表）
+
+| 链路 | 入口 | 出口 | 关键信号 |
+|------|------|------|----------|
+| 房间成员变更 | `room-user-change` 事件 | `UserList` 头像列表 | `setCollaborators` 全量重建 Map |
+| IDLE → 光标透明 | `IDLE_STATUS` volatile 消息 | `context.globalAlpha = 0.3` | `userState` → `isInactive` |
+| 指针位置同步 | `MOUSE_LOCATION` volatile 消息 | Canvas 光标位置 | 33ms 节流，~30fps 有效更新 |
+| 激光轨迹渲染 | `MOUSE_LOCATION` (tool=laser) | SVG 渐隐轨迹 | `LaserTrails` + `AnimatedTrail` |
+| 光标不渲染 laser | `renderCursor = false` | Canvas 跳过该用户 | InteractiveCanvas useEffect 过滤 |
+| Volatile 丢包 | 网络层丢弃 | 光标/状态短暂不一致 | 下一帧或心跳自动修复 |
